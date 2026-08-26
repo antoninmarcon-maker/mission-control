@@ -68,7 +68,7 @@ Result: **Pass for task-level resume.** Claude's adapter declares session resume
 
 ### 3. Draft PR via ship
 
-The isolated launcher, tests, spec, plan, and assessment are intended to be committed and pushed through `ship push` to an Antonin-owned fork. The PR must remain draft; no `ship ready`, merge, or deployment is authorized.
+`ship push` created commit `63ccaed` and opened [Antonin fork PR #1](https://github.com/antoninmarcon-maker/mission-control/pull/1). The PR is open, mergeable, and draft against the fork's `main`. No CI checks were registered on the fork PR at capture time. No `ship ready`, merge, or deployment was run.
 
 ## Policy gap matrix
 
