@@ -5,10 +5,10 @@ This one-shot adapter claims at most one Mission Control task, applies the v0 lo
 ## Safety boundary
 
 - Mission Control and Ollama must use loopback HTTP URLs (`127.0.0.1` or `::1`). HTTPS and non-loopback hosts are rejected before any request.
-- `ANTONIN_POLICY_STATE_DIR` must be an absolute directory outside this repository and outside the Mission Control runtime directory. Do not point it at `/`, the repository, or `MC_POC_STATE_DIR`.
+- `ANTONIN_POLICY_STATE_DIR` must be an absolute directory outside this repository and outside both Mission Control runtime directories. The canonical path, descendants, and symlink aliases of `MISSION_CONTROL_DATA_DIR` and `MC_POC_STATE_DIR` are rejected. Do not point it at `/` or the repository either.
 - The adapter only sends a text prompt to Ollama. It cannot execute shell commands, edit a repository, use Git/GitHub, deploy, merge, delete, or perform arbitrary network work.
 - The local prompt explicitly forbids filesystem, network, Git, deployment, shell, and other external side effects.
-- There is no cloud execution fallback. Policy rejection or execution failure moves the task to `awaiting_owner` when Mission Control is reachable.
+- There is no cloud execution fallback. Policy rejection or an execution failure before completion starts moves the task to `awaiting_owner` when Mission Control is reachable. A partially confirmed completion remains pending for safe reconciliation instead of being reclassified.
 - Receipts contain SHA-256 input/output hashes and execution metadata, never raw task text, model output, API keys, or subscription credentials.
 - One `process` invocation claims zero or one task and then exits. No daemon or scheduler is included.
 
@@ -18,7 +18,7 @@ Required environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTONIN_POLICY_STATE_DIR` | Absolute external directory for leases and the receipt ledger. |
+| `ANTONIN_POLICY_STATE_DIR` | Absolute external directory for leases, the completion journal, and the receipt ledger. |
 | `MC_URL` | Loopback Mission Control origin, for example `http://127.0.0.1:4318`. |
 | `MC_API_KEY` | Mission Control operator API key. It is sent as `x-api-key` and is never printed or persisted by the adapter. |
 
@@ -60,10 +60,22 @@ node ops/antonin-poc/policy-mvp/run-once.mjs process
 The external state directory contains:
 
 - `leases.json`, a mode-`600` registry with monotonic fencing tokens;
+- `completions.json`, a mode-`600` atomically replaced journal with deterministic completion and token-session IDs;
 - `receipts.jsonl`, a mode-`600` append-only hash chain;
 - short-lived lock directories while a state mutation is in progress.
 
-For an allowed task, receipt append, token accounting, reviewer assignment, and the transition to `review` run under the same fenced completion guard. The matching lease is released only after that guard exits. A stale owner cannot append a completion receipt, post tokens, or move the task to review.
+For an allowed task, the journal and all completion phases run under the same fenced completion guard:
+
+1. detect an existing deterministic token record, or post it and confirm it;
+2. detect an already-completed task update, or assign the reviewer, move to `review`, and confirm the returned status and reviewer;
+3. append the hash-only success receipt after both Mission Control mutations are confirmed;
+4. mark the receipt phase confirmed, leave the guard, and release the matching lease as a separate cleanup.
+
+Before the task mutation is confirmed, the mode-`600` journal temporarily keeps the local model resolution needed for a process restart. It never stores the API key or raw task prompt, and clears the resolution as soon as Mission Control confirms the task phase. Completed receipts remain hash-only.
+
+If a token or task response is ambiguous, the adapter checks Mission Control before retrying. A later `process` invocation resumes the first unconfirmed journal phase without re-running Ollama or claiming another task. If the final receipt cannot be appended (for example because ledger verification fails), the confirmed Mission Control mutations stay in `review` and the journal remains pending. Repair or restore the ledger, then run `process` again while the original lease is still current.
+
+A stale owner exits without a receipt, token POST, task PUT, or release attempt. A release failure after a confirmed completion is reported as `cleanupWarning`; it never creates a failure receipt or moves the task to `awaiting_owner`.
 
 The configured cloud reviewer performs the existing Mission Control review flow. The adapter does not call the reviewer or any cloud model itself.
 

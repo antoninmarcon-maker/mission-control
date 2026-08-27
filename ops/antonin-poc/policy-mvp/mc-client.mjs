@@ -103,7 +103,46 @@ export class MissionControlClient {
         throw new TypeError(`unsupported task update field: ${field}`);
       }
     }
-    return this.#request(taskPath(taskId), { method: "PUT", body: update });
+    const response = await this.#request(taskPath(taskId), {
+      method: "PUT",
+      body: update,
+    });
+    if (
+      response?.task === null ||
+      typeof response?.task !== "object" ||
+      Array.isArray(response.task)
+    ) {
+      throw new Error("Mission Control returned an invalid task mutation response");
+    }
+    if (
+      update.status !== undefined &&
+      response.task.status !== update.status
+    ) {
+      throw new Error(
+        `Mission Control did not confirm status ${String(update.status)}`,
+      );
+    }
+    if (
+      update.assigned_to !== undefined &&
+      response.task.assigned_to !== update.assigned_to
+    ) {
+      throw new Error(
+        `Mission Control did not confirm reviewer ${String(update.assigned_to)}`,
+      );
+    }
+    return response;
+  }
+
+  async getTask(taskId) {
+    const response = await this.#request(taskPath(taskId));
+    if (
+      response?.task === null ||
+      typeof response?.task !== "object" ||
+      Array.isArray(response.task)
+    ) {
+      throw new Error("Mission Control returned an invalid task response");
+    }
+    return response.task;
   }
 
   async addComment(taskId, content) {
@@ -131,7 +170,32 @@ export class MissionControlClient {
         .filter((field) => record[field] !== undefined)
         .map((field) => [field, record[field]]),
     );
-    return this.#request("/api/tokens", { method: "POST", body: payload });
+    const response = await this.#request("/api/tokens", {
+      method: "POST",
+      body: payload,
+    });
+    if (
+      response?.success !== true ||
+      response.record === null ||
+      typeof response.record !== "object" ||
+      Array.isArray(response.record)
+    ) {
+      throw new Error("Mission Control returned an invalid token mutation response");
+    }
+    return response;
+  }
+
+  async findTokenRecord(sessionId) {
+    requireNonEmptyString(sessionId, "sessionId");
+    const response = await this.#request(
+      "/api/tokens?action=list&timeframe=all",
+    );
+    if (!Array.isArray(response?.usage)) {
+      throw new Error("Mission Control returned an invalid token list response");
+    }
+    return (
+      response.usage.find((record) => record?.sessionId === sessionId) ?? null
+    );
   }
 
   async #request(pathname, options = {}) {
