@@ -929,3 +929,16 @@ test("the cost estimator ignores failure receipts and reads a bounded tail", asy
   const missing = new ReceiptLedger(await temporaryStateDirectory(t));
   assert.deepEqual(await missing.recentSuccessCosts("ollama/qwen2.5-coder:7b"), []);
 });
+
+test("an executor route this engine tracks no window for is refused", () => {
+  for (const executorRoute of [
+    "gemini/pro",
+    "qwen2.5-coder:7b",
+    "/leading",
+    "trailing/",
+  ]) {
+    const decision = admission({ executorRoute });
+    assert.equal(decision.decision, "awaiting_owner", executorRoute);
+    assert.equal(decision.reasonCode, "unknown_executor_route", executorRoute);
+  }
+});

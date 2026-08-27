@@ -346,7 +346,12 @@ export function admitAttempt({
   }
 
   const executor = parseRoute(executorRoute);
-  if (executor === null) {
+  if (
+    executor === null ||
+    catalogWindowsForProvider(executor.provider).length === 0
+  ) {
+    // An executor this engine has no window for cannot be admitted: only the
+    // reviewer may sit on an untracked route (§7).
     return refusal("awaiting_owner", "unknown_executor_route");
   }
   const reviewer = parseRoute(reviewerRoute);

@@ -2353,3 +2353,30 @@ test("the quota-status CLI command emits non-secret JSON", async (t) => {
   assert.equal(result.stderr, "");
   assert.equal(/sessionId|session_id|\/Users\//.test(result.stdout), false);
 });
+
+test("a broken quota store hands the lease back instead of holding it", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await deferralServers(t);
+  await mkdir(state.stateDirectory, { recursive: true });
+  await writeFile(
+    path.join(state.stateDirectory, "quotas.json"),
+    "{ not json\n",
+    "utf8",
+  );
+
+  await assert.rejects(
+    processOne(
+      processConfig(state, {
+        mcUrl: servers.mcUrl,
+        localEndpoint: servers.localEndpoint,
+      }),
+    ),
+    /Unexpected token|JSON/,
+  );
+  assert.deepEqual(servers.ollamaRequests, []);
+  assert.equal(
+    servers.mcRequests.filter((request) => request.method !== "GET").length,
+    0,
+  );
+  await assertLeaseReleased(state);
+});

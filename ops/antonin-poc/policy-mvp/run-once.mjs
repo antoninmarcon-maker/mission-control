@@ -1188,13 +1188,26 @@ export async function processOne(config, dependencies = {}) {
     throw new Error(`lease is unavailable for task ${taskId}`);
   }
 
-  const admission = await resolveAdmission({
-    decision,
-    normalized,
-    quotaStore,
-    receiptLedger,
-    now: now(),
-  });
+  let admission;
+  try {
+    admission = await resolveAdmission({
+      decision,
+      normalized,
+      quotaStore,
+      receiptLedger,
+      now: now(),
+    });
+  } catch (error) {
+    // Admission runs before any provider call, so nothing has been executed:
+    // hand the lease back rather than holding it until the TTL expires.
+    await releaseLeaseForCleanup(
+      leaseStore,
+      taskId,
+      normalized.agent,
+      lease.fencing_token,
+    );
+    throw new Error(safeErrorMessage(error, normalized.mcApiKey));
+  }
   if (admission.decision !== "execute") {
     const deferredUntil =
       admission.decision === "defer"
