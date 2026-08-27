@@ -13,6 +13,7 @@ const ALLOW_TERMS = [
 
 const DENY_TERMS = [
   "deploy",
+  "deployment",
   "production",
   "migration",
   "database",

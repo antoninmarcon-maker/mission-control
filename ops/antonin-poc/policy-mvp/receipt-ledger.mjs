@@ -1,13 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
+  appendFile,
   chmod,
   mkdir,
   readFile,
-  rename,
   rm,
-  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+
+import { resolveExternalStateDirectory } from "./lease-store.mjs";
 
 export const RECEIPT_SCHEMA_VERSION = "antonin-receipt-v0";
 
@@ -93,11 +94,67 @@ function assertNoSensitiveFields(value, parentField = null) {
 }
 
 function assertExactFields(record, allowedFields) {
-  for (const key of Object.keys(record)) {
-    if (!allowedFields.has(key)) {
-      throw new TypeError(`unsupported or sensitive receipt field: ${key}`);
+  for (const key of Reflect.ownKeys(record)) {
+    if (typeof key !== "string" || !allowedFields.has(key)) {
+      throw new TypeError(`unsupported or sensitive receipt field: ${String(key)}`);
     }
   }
+}
+
+function assertBoundedString(value, field, maximumLength) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > maximumLength
+  ) {
+    throw new TypeError(`invalid receipt field: ${field}`);
+  }
+}
+
+function assertNonNegativeInteger(value, field) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`invalid receipt field: ${field}`);
+  }
+}
+
+function assertSha256(value, field) {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new TypeError(`invalid receipt field: ${field}`);
+  }
+}
+
+function assertReceiptValues(receipt) {
+  assertBoundedString(receipt.task_id, "task_id", 256);
+  if (receipt.task_version !== null) {
+    assertNonNegativeInteger(receipt.task_version, "task_version");
+  }
+  assertBoundedString(receipt.policy_version, "policy_version", 128);
+  assertBoundedString(receipt.route, "route", 512);
+  assertBoundedString(receipt.reviewer, "reviewer", 512);
+  assertBoundedString(receipt.lease_id, "lease_id", 512);
+  assertNonNegativeInteger(receipt.fencing_token, "fencing_token");
+  if (receipt.fencing_token === 0) {
+    throw new TypeError("invalid receipt field: fencing_token");
+  }
+  assertSha256(receipt.input_hash, "input_hash");
+  assertSha256(receipt.output_hash, "output_hash");
+  if (
+    receipt.token_usage === null ||
+    typeof receipt.token_usage !== "object" ||
+    Array.isArray(receipt.token_usage)
+  ) {
+    throw new TypeError("invalid receipt field: token_usage");
+  }
+  assertExactFields(receipt.token_usage, new Set(["input", "output"]));
+  if (
+    !Object.hasOwn(receipt.token_usage, "input") ||
+    !Object.hasOwn(receipt.token_usage, "output")
+  ) {
+    throw new TypeError("invalid receipt field: token_usage");
+  }
+  assertNonNegativeInteger(receipt.token_usage.input, "token_usage.input");
+  assertNonNegativeInteger(receipt.token_usage.output, "token_usage.output");
+  assertBoundedString(receipt.outcome, "outcome", 128);
 }
 
 function assertReceiptInput(receipt) {
@@ -111,6 +168,7 @@ function assertReceiptInput(receipt) {
       throw new TypeError(`receipt is missing required field: ${field}`);
     }
   }
+  assertReceiptValues(receipt);
 }
 
 function assertStoredRecord(record, lineNumber) {
@@ -127,18 +185,21 @@ function assertStoredRecord(record, lineNumber) {
   if (record.schema_version !== RECEIPT_SCHEMA_VERSION) {
     throw new Error(`unsupported schema version at line ${lineNumber}`);
   }
+  assertBoundedString(record.timestamp, "timestamp", 64);
+  if (record.previous_hash !== null) {
+    assertSha256(record.previous_hash, "previous_hash");
+  }
+  assertSha256(record.record_hash, "record_hash");
+  assertReceiptValues(
+    Object.fromEntries(
+      [...RECEIPT_FIELDS].map((field) => [field, record[field]]),
+    ),
+  );
 }
 
 export class ReceiptLedger {
   constructor(stateDirectory, options = {}) {
-    if (!path.isAbsolute(stateDirectory)) {
-      throw new TypeError("receipt state directory must be an absolute path");
-    }
-    if (path.resolve(stateDirectory) === path.parse(stateDirectory).root) {
-      throw new TypeError("receipt state directory cannot be the filesystem root");
-    }
-
-    this.stateDirectory = path.resolve(stateDirectory);
+    this.stateDirectory = resolveExternalStateDirectory(stateDirectory, options);
     this.filePath = path.join(this.stateDirectory, "receipts.jsonl");
     this.lockPath = path.join(this.stateDirectory, ".receipts.lock");
     this.now = options.now ?? Date.now;
@@ -166,8 +227,7 @@ export class ReceiptLedger {
         }),
       );
 
-      records.push(record);
-      await this.#writeRecords(records);
+      await this.#appendRecord(record);
       return record;
     });
   }
@@ -259,19 +319,12 @@ export class ReceiptLedger {
     }
   }
 
-  async #writeRecords(records) {
-    const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    const contents = `${records.map(canonicalJson).join("\n")}\n`;
-    try {
-      await writeFile(temporaryPath, contents, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      await rename(temporaryPath, this.filePath);
-      await chmod(this.filePath, 0o600);
-    } finally {
-      await rm(temporaryPath, { force: true });
-    }
+  async #appendRecord(record) {
+    await appendFile(this.filePath, `${canonicalJson(record)}\n`, {
+      encoding: "utf8",
+      flag: "a",
+      mode: 0o600,
+    });
+    await chmod(this.filePath, 0o600);
   }
 }

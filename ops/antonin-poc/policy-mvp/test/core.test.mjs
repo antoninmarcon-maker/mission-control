@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,6 +29,16 @@ async function temporaryStateDirectory(t) {
   const directory = await mkdtemp(path.join(tmpdir(), "antonin-policy-core-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 test("policy routes a medium-priority simple local sort to Ollama and a distinct cloud reviewer", () => {
@@ -90,6 +109,17 @@ test("policy denies every sensitive vocabulary term", () => {
     assert.equal(decision.status, "awaiting_owner", term);
     assert.equal(decision.reasonCode, "sensitive_keyword_requires_owner", term);
   }
+});
+
+test("policy denies deployment even when the title also looks mechanical", () => {
+  const decision = evaluateTask({
+    title: "Simple deployment",
+    description: "Routine packaging",
+    priority: "medium",
+  });
+
+  assert.equal(decision.status, "awaiting_owner");
+  assert.equal(decision.reasonCode, "sensitive_keyword_requires_owner");
 });
 
 test("policy denies tasks outside the exact mechanical vocabulary", () => {
@@ -208,6 +238,46 @@ test("lease expired takeover increments the token and fences stale completion", 
   );
 });
 
+test("lease completion guard blocks an expired takeover until completion finishes", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let now = 1_000;
+  const holder = new LeaseStore(stateDirectory, { now: () => now });
+  await holder.acquire("task-1", "owner-a", { ttlMs: 100 });
+  const completionEntered = deferred();
+  const finishCompletion = deferred();
+
+  const completion = holder.withCompletionGuard(
+    "task-1",
+    "owner-a",
+    1,
+    async (lease) => {
+      completionEntered.resolve();
+      await finishCompletion.promise;
+      return lease.fencing_token;
+    },
+  );
+  await completionEntered.promise;
+
+  now = 1_101;
+  const retryObserved = deferred();
+  const allowRetry = deferred();
+  const contender = new LeaseStore(stateDirectory, {
+    now: () => now,
+    lockMaxAttempts: 3,
+    sleep: async () => {
+      retryObserved.resolve();
+      await allowRetry.promise;
+    },
+  });
+  const takeover = contender.acquire("task-1", "owner-b", { ttlMs: 500 });
+
+  await retryObserved.promise;
+  finishCompletion.resolve();
+  assert.equal(await completion, 1);
+  allowRetry.resolve();
+  assert.equal((await takeover).fencing_token, 2);
+});
+
 test("lease release removes only a matching owner and fencing token", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   const store = new LeaseStore(stateDirectory, { now: () => 1_000 });
@@ -227,6 +297,50 @@ test("lease store rejects non-absolute and filesystem-root state paths", () => {
   assert.throws(() => new LeaseStore(path.parse(process.cwd()).root), /filesystem root/);
 });
 
+test("state stores reject repository and Mission Control runtime paths through descendants and symlinks", async (t) => {
+  const sandbox = await temporaryStateDirectory(t);
+  const repositoryRoot = path.join(sandbox, "repository");
+  const runtimeDirectory = path.join(sandbox, "runtime");
+  const externalDirectory = path.join(sandbox, "external");
+  const repositoryAlias = path.join(sandbox, "repository-alias");
+  const runtimeAlias = path.join(sandbox, "runtime-alias");
+  await Promise.all([
+    mkdir(repositoryRoot),
+    mkdir(runtimeDirectory),
+    mkdir(externalDirectory),
+  ]);
+  await Promise.all([
+    symlink(repositoryRoot, repositoryAlias),
+    symlink(runtimeDirectory, runtimeAlias),
+  ]);
+  const options = { repositoryRoot, runtimeDirectory };
+  const forbiddenDirectories = [
+    repositoryRoot,
+    path.join(repositoryRoot, "new", "state"),
+    runtimeDirectory,
+    path.join(runtimeDirectory, "new", "state"),
+    repositoryAlias,
+    path.join(repositoryAlias, "new", "state"),
+    runtimeAlias,
+    path.join(runtimeAlias, "new", "state"),
+  ];
+
+  for (const Store of [LeaseStore, ReceiptLedger]) {
+    assert.throws(
+      () => new Store(process.cwd()),
+      /external to the repository and Mission Control runtime/,
+    );
+    for (const directory of forbiddenDirectories) {
+      assert.throws(
+        () => new Store(directory, options),
+        /external to the repository and Mission Control runtime/,
+        `${Store.name}: ${directory}`,
+      );
+    }
+    assert.doesNotThrow(() => new Store(externalDirectory, options));
+  }
+});
+
 function receipt(overrides = {}) {
   return {
     task_id: "task-1",
@@ -236,8 +350,8 @@ function receipt(overrides = {}) {
     reviewer: "poc-aegis-cloud",
     lease_id: "task-1:1",
     fencing_token: 1,
-    input_hash: "input-sha256",
-    output_hash: "output-sha256",
+    input_hash: "a".repeat(64),
+    output_hash: "b".repeat(64),
     token_usage: { output: 3, input: 2 },
     outcome: "success",
     ...overrides,
@@ -252,7 +366,7 @@ test("receipt genesis append is canonical, hash-linked, compact, and mode 600", 
 
   const record = await ledger.append(receipt());
   const canonicalWithoutHash =
-    '{"fencing_token":1,"input_hash":"input-sha256","lease_id":"task-1:1","outcome":"success","output_hash":"output-sha256","policy_version":"antonin-policy-v0","previous_hash":null,"reviewer":"poc-aegis-cloud","route":"ollama/qwen2.5-coder:7b","schema_version":"antonin-receipt-v0","task_id":"task-1","task_version":7,"timestamp":"2026-08-27T10:00:00.000Z","token_usage":{"input":2,"output":3}}';
+    `{"fencing_token":1,"input_hash":"${"a".repeat(64)}","lease_id":"task-1:1","outcome":"success","output_hash":"${"b".repeat(64)}","policy_version":"antonin-policy-v0","previous_hash":null,"reviewer":"poc-aegis-cloud","route":"ollama/qwen2.5-coder:7b","schema_version":"antonin-receipt-v0","task_id":"task-1","task_version":7,"timestamp":"2026-08-27T10:00:00.000Z","token_usage":{"input":2,"output":3}}`;
   const expectedHash = createHash("sha256")
     .update(canonicalWithoutHash)
     .digest("hex");
@@ -277,7 +391,7 @@ test("receipt second append links to the first hash and the full chain verifies"
       task_id: "task-2",
       task_version: 2,
       lease_id: "task-2:1",
-      output_hash: "second-output-sha256",
+      output_hash: "c".repeat(64),
     }),
   );
 
@@ -287,6 +401,30 @@ test("receipt second append links to the first hash and the full chain verifies"
     records: 2,
     lastHash: second.record_hash,
   });
+});
+
+test("receipt append extends the existing ledger inode instead of replacing it", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const ledger = new ReceiptLedger(stateDirectory, { now: () => 1_000 });
+  await ledger.append(receipt());
+  const firstContents = await readFile(ledger.filePath, "utf8");
+  const originalHandle = await open(ledger.filePath, "r");
+  t.after(() => originalHandle.close());
+
+  await ledger.append(
+    receipt({
+      task_id: "task-2",
+      lease_id: "task-2:1",
+      input_hash: "c".repeat(64),
+      output_hash: "d".repeat(64),
+    }),
+  );
+
+  const currentContents = await readFile(ledger.filePath, "utf8");
+  const contentsThroughOriginalHandle = await originalHandle.readFile("utf8");
+  assert.ok(currentContents.startsWith(firstContents));
+  assert.equal(contentsThroughOriginalHandle, currentContents);
+  assert.equal(currentContents.trimEnd().split("\n").length, 2);
 });
 
 test("receipt verification detects tampering", async (t) => {
@@ -320,6 +458,31 @@ test("receipt append refuses raw input, raw output, and API-key fields", async (
     await assert.rejects(
       ledger.append(receipt(forbidden)),
       /unsupported or sensitive receipt field/,
+    );
+  }
+
+  await assert.rejects(readFile(ledger.filePath, "utf8"), { code: "ENOENT" });
+});
+
+test("receipt append rejects raw values disguised as hashes or token counts and invalid JSON schema values", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const ledger = new ReceiptLedger(stateDirectory, { now: () => 1_000 });
+  const invalidOverrides = [
+    { input_hash: "raw prompt" },
+    { output_hash: "raw result" },
+    { token_usage: { input: "raw prompt", output: 2 } },
+    { token_usage: { input: 2, output: -1 } },
+    { token_usage: { input: 1.5, output: 2 } },
+    { token_usage: { input: 1, output: undefined } },
+    { route: undefined },
+    { reviewer: "x".repeat(513) },
+    { task_version: 1n },
+  ];
+
+  for (const overrides of invalidOverrides) {
+    await assert.rejects(
+      ledger.append(receipt(overrides)),
+      /invalid receipt field/,
     );
   }
 

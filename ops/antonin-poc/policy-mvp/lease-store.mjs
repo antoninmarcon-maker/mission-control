@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -8,8 +9,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const STATE_VERSION = 1;
+const DEFAULT_REPOSITORY_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../..",
+);
 
 function defaultSleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -39,16 +45,75 @@ function ownValue(object, key) {
   return Object.hasOwn(object, key) ? object[key] : undefined;
 }
 
+function resolveThroughNearestExistingParent(value) {
+  let current = path.resolve(value);
+  const missingSegments = [];
+
+  while (true) {
+    try {
+      return path.join(realpathSync(current), ...missingSegments);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function isWithin(baseDirectory, candidate) {
+  const relative = path.relative(baseDirectory, candidate);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative))
+  );
+}
+
+export function resolveExternalStateDirectory(stateDirectory, options = {}) {
+  if (typeof stateDirectory !== "string" || !path.isAbsolute(stateDirectory)) {
+    throw new TypeError("state directory must be an absolute path");
+  }
+  if (path.resolve(stateDirectory) === path.parse(stateDirectory).root) {
+    throw new TypeError("state directory cannot be the filesystem root");
+  }
+
+  const configuredRepositoryRoot =
+    options.repositoryRoot ?? DEFAULT_REPOSITORY_ROOT;
+  const repositoryRoot = resolveThroughNearestExistingParent(
+    path.resolve(configuredRepositoryRoot),
+  );
+  const configuredRuntimeDirectory =
+    options.runtimeDirectory ??
+    process.env.MISSION_CONTROL_DATA_DIR ??
+    path.join(repositoryRoot, ".data");
+  const runtimeDirectory = resolveThroughNearestExistingParent(
+    path.isAbsolute(configuredRuntimeDirectory)
+      ? configuredRuntimeDirectory
+      : path.resolve(repositoryRoot, configuredRuntimeDirectory),
+  );
+  const resolvedStateDirectory = resolveThroughNearestExistingParent(stateDirectory);
+
+  if (
+    isWithin(repositoryRoot, resolvedStateDirectory) ||
+    isWithin(runtimeDirectory, resolvedStateDirectory)
+  ) {
+    throw new TypeError(
+      "state directory must be external to the repository and Mission Control runtime",
+    );
+  }
+  return resolvedStateDirectory;
+}
+
 export class LeaseStore {
   constructor(stateDirectory, options = {}) {
-    if (!path.isAbsolute(stateDirectory)) {
-      throw new TypeError("lease state directory must be an absolute path");
-    }
-    if (path.resolve(stateDirectory) === path.parse(stateDirectory).root) {
-      throw new TypeError("lease state directory cannot be the filesystem root");
-    }
-
-    this.stateDirectory = path.resolve(stateDirectory);
+    this.stateDirectory = resolveExternalStateDirectory(stateDirectory, options);
     this.filePath = path.join(this.stateDirectory, "leases.json");
     this.lockPath = path.join(this.stateDirectory, ".leases.lock");
     this.now = options.now ?? Date.now;
@@ -135,6 +200,26 @@ export class LeaseStore {
       throw new Error(`lease is not current for task ${taskId}`);
     }
     return current;
+  }
+
+  async withCompletionGuard(taskId, owner, fencingToken, operation) {
+    if (typeof operation !== "function") {
+      throw new TypeError("completion operation must be a function");
+    }
+
+    return this.#withLock(async () => {
+      const state = await this.#readState();
+      const current = ownValue(state.leases, taskId);
+      if (
+        !current ||
+        current.owner !== owner ||
+        current.fencing_token !== fencingToken ||
+        current.expires_at <= this.now()
+      ) {
+        throw new Error(`lease is not current for task ${taskId}`);
+      }
+      return operation(current);
+    });
   }
 
   async release(taskId, owner, fencingToken) {
