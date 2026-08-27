@@ -62,6 +62,13 @@ class TokenReconciliationRequiredError extends Error {
   }
 }
 
+class CompletionContendedError extends Error {
+  constructor(completionId) {
+    super(`completion ${completionId} is already claimed by a live invocation`);
+    this.name = "CompletionContendedError";
+  }
+}
+
 class CompletionJournal {
   constructor(stateDirectory, options = {}) {
     this.filePath = path.join(stateDirectory, "completions.json");
@@ -476,6 +483,27 @@ async function receiptAlreadyStored(receiptLedger, expectedReceipt) {
   return null;
 }
 
+function contendedResult(completionId, taskApiId) {
+  return {
+    outcome: "contended",
+    processed: 0,
+    taskId: taskApiId,
+    completionId,
+  };
+}
+
+// A completion whose receipt phase is confirmed is durably finished. Reaching a
+// failure after that point means a concurrent invocation committed the same
+// completion first, which is contention rather than an incident.
+async function settledByPeer(completionJournal, completionId) {
+  try {
+    const stored = await completionJournal.get(completionId);
+    return stored?.phases?.receipt_confirmed === true;
+  } catch {
+    return false;
+  }
+}
+
 function withLocalCompletionGuard(leaseStore, entry, operation) {
   return leaseStore.withCompletionGuard(
     entry.task_id,
@@ -538,8 +566,26 @@ async function reconcileCompletion({
       );
       current = tokenAttempt.entry;
       if (!tokenAttempt.claimed) {
-        await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
+        // Reaching the compare-and-set means this invocation observed neither a
+        // token record nor an earlier attempt, so a lost claim can only come
+        // from a concurrent live claimant. This invocation never posted, so it
+        // must not persist an ambiguity it did not create nor mutate a
+        // completion another invocation is committing: it yields. A genuinely
+        // unaccounted attempt is still detected by the `token_attempted` check
+        // above on the next invocation.
+        throw new CompletionContendedError(current.completion_id);
+      }
+      try {
+        await missionControl.recordTokens(current.token_record);
+      } catch (error) {
+        if (
+          error instanceof MissionControlRequestError &&
+          error.ambiguous === false
+        ) {
+          throw error;
+        }
         try {
+          await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
           existingToken = await missionControl.findTokenRecord(
             current.token_session_id,
           );
@@ -551,31 +597,6 @@ async function reconcileCompletion({
         if (existingToken === null) {
           await markTokenAmbiguous(completionJournal, leaseStore, current);
           throw new TokenReconciliationRequiredError(current.token_session_id);
-        }
-      } else {
-        try {
-          await missionControl.recordTokens(current.token_record);
-        } catch (error) {
-          if (
-            error instanceof MissionControlRequestError &&
-            error.ambiguous === false
-          ) {
-            throw error;
-          }
-          try {
-            await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
-            existingToken = await missionControl.findTokenRecord(
-              current.token_session_id,
-            );
-          } catch (readbackError) {
-            if (isStaleLeaseError(readbackError)) throw readbackError;
-            await markTokenAmbiguous(completionJournal, leaseStore, current);
-            throw new TokenReconciliationRequiredError(current.token_session_id);
-          }
-          if (existingToken === null) {
-            await markTokenAmbiguous(completionJournal, leaseStore, current);
-            throw new TokenReconciliationRequiredError(current.token_session_id);
-          }
         }
       }
     }
@@ -913,6 +934,15 @@ export async function processOne(config, dependencies = {}) {
         recoveryLeaseTtlMs,
       });
     } catch (error) {
+      if (
+        error instanceof CompletionContendedError ||
+        (await settledByPeer(completionJournal, pendingCompletion.completion_id))
+      ) {
+        return contendedResult(
+          pendingCompletion.completion_id,
+          pendingCompletion.task_api_id,
+        );
+      }
       throw new CompletionPendingError(error);
     }
     const cleanupWarning = await releaseLeaseForCleanup(
@@ -1004,6 +1034,12 @@ export async function processOne(config, dependencies = {}) {
         recoveryLeaseTtlMs,
       });
     } catch (error) {
+      if (
+        error instanceof CompletionContendedError ||
+        (await settledByPeer(completionJournal, entry.completion_id))
+      ) {
+        return contendedResult(entry.completion_id, task.id);
+      }
       if (await completionJournal.get(entry.completion_id)) {
         throw new CompletionPendingError(error);
       }

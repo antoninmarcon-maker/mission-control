@@ -854,6 +854,113 @@ test("overlapping same-owner invocations elect exactly one token POST winner", a
   assert.equal((await ledger.verify()).records, 1);
 });
 
+test("the losing token claimant yields instead of inventing an ambiguity", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const counts = { queue: 0, tokenList: 0, tokenPost: 0, ollama: 0 };
+  let releaseQueueClaims;
+  const queueClaimsMayFinish = new Promise((resolve) => {
+    releaseQueueClaims = resolve;
+  });
+  let releaseInitialTokenLists;
+  const initialTokenListsMayFinish = new Promise((resolve) => {
+    releaseInitialTokenLists = resolve;
+  });
+  let taskState = {
+    ...queuedTask(),
+    status: "in_progress",
+    assigned_to: "antonin-policy-engine",
+  };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      counts.queue += 1;
+      if (counts.queue === 2) releaseQueueClaims();
+      await queueClaimsMayFinish;
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tokens?action=list&timeframe=all") {
+      counts.tokenList += 1;
+      if (counts.tokenList <= 2) {
+        if (counts.tokenList === 2) releaseInitialTokenLists();
+        await initialTokenListsMayFinish;
+      }
+      // The posted session never becomes visible in the bounded window, so a
+      // read-back can only ever report absence here.
+      sendJson(response, 200, { usage: [], total: 0, timeframe: "all" });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      counts.tokenPost += 1;
+      const body = await readJson(request);
+      sendJson(response, 200, {
+        success: true,
+        record: { id: `token-contended-${counts.tokenPost}`, ...body },
+      });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    if (request.method === "PUT" && request.url === "/api/tasks/42") {
+      taskState = { ...taskState, ...(await readJson(request)) };
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    counts.ollama += 1;
+    sendJson(response, 200, {
+      choices: [{ message: { content: "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+  const config = processConfig(state, {
+    mcUrl,
+    localEndpoint: `${localEndpoint}/v1`,
+  });
+
+  const results = await Promise.allSettled([
+    processOne(config),
+    processOne(config),
+  ]);
+
+  assert.equal(
+    results.every((result) => result.status === "fulfilled"),
+    true,
+    `both invocations must settle without an operator alarm: ${results
+      .map((result) => result.reason?.message ?? result.value?.outcome)
+      .join(" | ")}`,
+  );
+  assert.deepEqual(
+    results.map((result) => result.value.outcome).sort(),
+    ["contended", "review"],
+  );
+  const contended = results.find(
+    (result) => result.value.outcome === "contended",
+  ).value;
+  assert.equal(contended.processed, 0);
+  assert.equal(contended.taskId, 42);
+  assert.match(contended.completionId, /^[a-f0-9]{64}$/);
+  // The loser stops at the compare-and-set: no read-back, no post, no mutation.
+  assert.deepEqual(counts, { queue: 2, tokenList: 2, tokenPost: 1, ollama: 2 });
+  assert.equal(taskState.status, "review");
+  assert.equal(taskState.assigned_to, "poc-aegis-cloud");
+  const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
+  assert.equal((await ledger.verify()).records, 1);
+  const journal = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  const entries = Object.values(journal.entries);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].completion_id, contended.completionId);
+  assert.equal(entries[0].token_attempted, true);
+  assert.equal(entries[0].token_ambiguous, false);
+  assert.equal(entries[0].phases.receipt_confirmed, true);
+  await assertLeaseReleased(state);
+});
+
 test("an unrelated review cannot confirm this completion and the exact metadata is preserved", async (t) => {
   const state = await temporaryPolicyState(t);
   let tokenRecord = null;
