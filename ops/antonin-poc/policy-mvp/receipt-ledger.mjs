@@ -52,11 +52,11 @@ function canonicalize(value) {
   return value;
 }
 
-function canonicalJson(value) {
+export function canonicalJson(value) {
   return JSON.stringify(canonicalize(value));
 }
 
-function sha256(value) {
+export function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
