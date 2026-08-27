@@ -3,6 +3,7 @@ import {
   appendFile,
   chmod,
   mkdir,
+  open,
   readFile,
   rm,
 } from "node:fs/promises";
@@ -25,6 +26,9 @@ const RECEIPT_FIELDS = new Set([
   "token_usage",
   "outcome",
 ]);
+
+const DEFAULT_COST_TAIL_BYTES = 262_144;
+const DEFAULT_COST_SAMPLES = 200;
 
 const STORED_FIELDS = new Set([
   ...RECEIPT_FIELDS,
@@ -230,6 +234,60 @@ export class ReceiptLedger {
       await this.#appendRecord(record);
       return record;
     });
+  }
+
+  /**
+   * §2.7 the cost estimator reads the evidence we already have. It is
+   * deliberately tolerant and bounded: it reads only the tail of the ledger,
+   * skips anything it cannot parse, and never verifies the chain, because a
+   * routing hint must not be able to fail an execution. Failure receipts are
+   * excluded — they measure a crash, not a route.
+   */
+  async recentSuccessCosts(route, options = {}) {
+    const maximumBytes = options.maximumBytes ?? DEFAULT_COST_TAIL_BYTES;
+    const maximumSamples = options.maximumSamples ?? DEFAULT_COST_SAMPLES;
+    let handle;
+    try {
+      handle = await open(this.filePath, "r");
+    } catch (error) {
+      if (error?.code === "ENOENT") return [];
+      throw error;
+    }
+
+    let text;
+    try {
+      const { size } = await handle.stat();
+      const length = Math.min(size, maximumBytes);
+      const position = size - length;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, position);
+      text = buffer.toString("utf8");
+      if (position > 0) {
+        // The byte window may start mid-record; that partial line is dropped.
+        text = text.slice(text.indexOf("\n") + 1);
+      }
+    } finally {
+      await handle.close();
+    }
+
+    const costs = [];
+    for (const line of text.split("\n")) {
+      if (line === "") continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record?.outcome !== "success" || record.route !== route) continue;
+      const input = record.token_usage?.input;
+      const output = record.token_usage?.output;
+      if (!Number.isSafeInteger(input) || !Number.isSafeInteger(output)) {
+        continue;
+      }
+      costs.push(input + output);
+    }
+    return costs.slice(-maximumSamples);
   }
 
   async verify() {

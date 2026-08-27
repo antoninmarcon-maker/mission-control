@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   mkdir,
   mkdtemp,
@@ -10,16 +11,25 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import {
+  FAILURE_KINDS,
   POLICY_VERSION,
+  admitAttempt,
+  classifyFailure,
   evaluateTask,
+  isFallbackEligible,
+  percentile90,
   validateLoopbackHttpUrl,
 } from "../policy-core.mjs";
 import { LeaseStore } from "../lease-store.mjs";
+import { MissionControlClient } from "../mc-client.mjs";
+import { OllamaClient } from "../ollama-client.mjs";
+import { QUOTA_WINDOW_CATALOG, resolveQuotaPolicy } from "../quota-config.mjs";
 import {
   RECEIPT_SCHEMA_VERSION,
   ReceiptLedger,
@@ -487,4 +497,435 @@ test("receipt append rejects raw values disguised as hashes or token counts and 
   }
 
   await assert.rejects(readFile(ledger.filePath, "utf8"), { code: "ENOENT" });
+});
+
+const QUOTA_BASE_INSTANT = 1_800_000_000_000;
+
+async function fakeLocalServer(t, handler) {
+  const server = http.createServer(handler);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(async () => {
+    server.close();
+    await once(server, "close");
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+function quotaSnapshot(states = {}, overrides = {}) {
+  const windows = QUOTA_WINDOW_CATALOG.map((entry) => {
+    const key = `${entry.provider}/${entry.window_id}`;
+    const state = entry.metered ? (states[key] ?? "ok") : "ok";
+    return {
+      ...entry,
+      used_fraction: state === "ok" ? 0.1 : 0.9,
+      remaining_fraction: state === "ok" ? 0.9 : 0.1,
+      resets_at: QUOTA_BASE_INSTANT + 3_600_000,
+      observed_at: QUOTA_BASE_INSTANT,
+      source: "operator_declaration",
+      confidence: "declarative",
+      exhausted_until: state === "exhausted" ? QUOTA_BASE_INSTANT + 3_600_000 : null,
+      last_canary_at: null,
+      state,
+      canary_available: state === "unknown",
+      ...(overrides[key] ?? {}),
+    };
+  });
+  return { snapshot_id: "x".repeat(64), taken_at: QUOTA_BASE_INSTANT, windows };
+}
+
+function admission(overrides = {}) {
+  return admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "external/poc-aegis-cloud",
+    snapshot: quotaSnapshot(),
+    policy: resolveQuotaPolicy(),
+    now: QUOTA_BASE_INSTANT,
+    ...overrides,
+  });
+}
+
+test("failure classification maps the errors the existing clients really produce", async (t) => {
+  const refused = await new OllamaClient({
+    endpoint: "http://127.0.0.1:9/v1",
+    model: "qwen2.5-coder:7b",
+    timeoutMs: 2_000,
+  })
+    .complete("hello")
+    .catch((error) => error);
+  assert.equal(classifyFailure(refused), "local_daemon_unreachable");
+
+  const silent = await fakeLocalServer(t, () => {});
+  const timedOut = await new OllamaClient({
+    endpoint: `${silent}/v1`,
+    model: "qwen2.5-coder:7b",
+    timeoutMs: 100,
+  })
+    .complete("hello")
+    .catch((error) => error);
+  assert.equal(classifyFailure(timedOut), "local_transient");
+
+  const modelMissing = await fakeLocalServer(t, (_request, response) => {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "model not found" } }));
+  });
+  const notFound = await new OllamaClient({
+    endpoint: `${modelMissing}/v1`,
+    model: "qwen2.5-coder:7b",
+    timeoutMs: 2_000,
+  })
+    .complete("hello")
+    .catch((error) => error);
+  assert.equal(classifyFailure(notFound), "local_model_error");
+
+  const broken = await fakeLocalServer(t, (_request, response) => {
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "local model unavailable" }));
+  });
+  const serverError = await new OllamaClient({
+    endpoint: `${broken}/v1`,
+    model: "qwen2.5-coder:7b",
+    timeoutMs: 2_000,
+  })
+    .complete("hello")
+    .catch((error) => error);
+  assert.equal(classifyFailure(serverError), "local_transient");
+
+  const truncated = await fakeLocalServer(t, (_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ choices: [{ message: {} }] }));
+  });
+  const invalidOutput = await new OllamaClient({
+    endpoint: `${truncated}/v1`,
+    model: "qwen2.5-coder:7b",
+    timeoutMs: 2_000,
+  })
+    .complete("hello")
+    .catch((error) => error);
+  assert.equal(classifyFailure(invalidOutput), "local_output_invalid");
+
+  const ambiguous = await fakeLocalServer(t, (_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ task: { id: 42, status: "assigned" } }));
+  });
+  const ambiguousMutation = await new MissionControlClient({
+    baseUrl: ambiguous,
+    apiKey: "secret",
+  })
+    .updateTask(42, { status: "review" })
+    .catch((error) => error);
+  assert.equal(classifyFailure(ambiguousMutation), "control_plane_ambiguous");
+
+  const directory = await temporaryStateDirectory(t);
+  const leaseStore = new LeaseStore(directory);
+  const staleLease = await leaseStore
+    .renew("42", "antonin-policy-engine", 1, 1_000)
+    .catch((error) => error);
+  assert.equal(classifyFailure(staleLease), "lease_lost");
+});
+
+test("the completion boundary never yields a fallback route", () => {
+  const contended = new Error("completion abc is already claimed");
+  contended.name = "CompletionContendedError";
+  assert.equal(classifyFailure(contended), "lease_lost");
+
+  const disguised = new Error("lease is not current for task 42");
+  disguised.failureKind = "local_transient";
+  assert.equal(classifyFailure(disguised), "lease_lost");
+
+  const ambiguous = new Error("Mission Control returned an invalid response");
+  ambiguous.name = "MissionControlRequestError";
+  ambiguous.ambiguous = true;
+  ambiguous.failureKind = "cloud_transient";
+  assert.equal(classifyFailure(ambiguous), "control_plane_ambiguous");
+
+  assert.equal(isFallbackEligible("lease_lost"), false);
+  assert.equal(isFallbackEligible("control_plane_ambiguous"), false);
+});
+
+test("an unclassified error fails closed and the taxonomy is total", () => {
+  assert.equal(classifyFailure(new Error("something new happened")), "unknown");
+  assert.equal(classifyFailure(null), "unknown");
+  assert.equal(classifyFailure(undefined, {}), "unknown");
+  assert.equal(isFallbackEligible("unknown"), false);
+  assert.equal(isFallbackEligible("policy_reject"), false);
+  assert.equal(classifyFailure(new Error("x"), { policyRejected: true }), "policy_reject");
+
+  for (const kind of FAILURE_KINDS) {
+    assert.equal(typeof isFallbackEligible(kind), "boolean");
+  }
+  assert.equal(FAILURE_KINDS.filter(isFallbackEligible).length, 7);
+
+  const declared = new Error("cloud runner refused");
+  declared.failureKind = "cloud_quota_exhausted";
+  assert.equal(classifyFailure(declared), "cloud_quota_exhausted");
+  const rateLimited = new Error("Codex request failed (429)");
+  rateLimited.status = 429;
+  assert.equal(
+    classifyFailure(rateLimited, { provider: "codex" }),
+    "cloud_quota_exhausted",
+  );
+  assert.equal(classifyFailure(rateLimited, { provider: "ollama" }), "unknown");
+});
+
+test("admission is pure: it performs no I/O and is deterministic", () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => {
+    throw new Error("admission must not perform I/O");
+  };
+  try {
+    const first = admission();
+    const second = admission();
+    assert.deepEqual(first, second);
+    assert.equal(first.decision, "execute");
+    assert.deepEqual(first.canaryClaims, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a sensitive task stays with the owner at every quota state", () => {
+  for (const state of ["ok", "warn", "critical", "exhausted", "unknown"]) {
+    const decision = admission({
+      riskClass: "sensitive",
+      reviewerRoute: "codex/pro",
+      snapshot: quotaSnapshot({
+        "codex/weekly": state,
+        "codex/session_5h": state,
+      }),
+    });
+    assert.equal(decision.decision, "awaiting_owner");
+    assert.equal(decision.reasonCode, "sensitive_requires_owner");
+    assert.deepEqual(decision.canaryClaims, []);
+  }
+});
+
+test("admission enumerates exactly one decision for every risk and window state", () => {
+  const decisions = new Set(["execute", "defer", "awaiting_owner"]);
+  for (const riskClass of ["mechanical", "sensitive"]) {
+    for (const weekly of ["ok", "warn", "critical", "exhausted", "unknown"]) {
+      for (const session of ["ok", "warn", "critical", "exhausted", "unknown"]) {
+        const outcome = admission({
+          riskClass,
+          reviewerRoute: "codex/pro",
+          snapshot: quotaSnapshot({
+            "codex/weekly": weekly,
+            "codex/session_5h": session,
+          }),
+        });
+        assert.equal(
+          decisions.has(outcome.decision),
+          true,
+          `${riskClass}/${weekly}/${session}`,
+        );
+        assert.equal(typeof outcome.reasonCode, "string");
+        assert.notEqual(outcome.reasonCode, "");
+        assert.equal(Array.isArray(outcome.canaryClaims), true);
+        if (outcome.decision === "defer") {
+          assert.equal(Number.isSafeInteger(outcome.deferredUntil), true);
+        } else {
+          assert.equal(outcome.deferredUntil, null);
+        }
+      }
+    }
+  }
+});
+
+test("executor capacity alone does not admit a task without reviewer capacity", () => {
+  const executorFine = admission({
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot({ "codex/weekly": "critical" }),
+  });
+  assert.equal(executorFine.decision, "defer");
+  assert.equal(executorFine.reasonCode, "review_window_critical");
+  assert.equal(executorFine.deferredUntil, QUOTA_BASE_INSTANT + 3_600_000);
+
+  const exhausted = admission({
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot({ "codex/session_5h": "exhausted" }),
+  });
+  assert.equal(exhausted.decision, "defer");
+  assert.equal(exhausted.reasonCode, "review_window_exhausted");
+
+  const warnBandKeepsReviews = admission({
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot({
+      "codex/weekly": "warn",
+      "codex/session_5h": "warn",
+    }),
+  });
+  assert.equal(warnBandKeepsReviews.decision, "execute");
+});
+
+test("an untracked reviewer route carries no window to evaluate", () => {
+  const decision = admission({ reviewerRoute: "external/poc-aegis-cloud" });
+  assert.equal(decision.decision, "execute");
+  assert.deepEqual(decision.canaryClaims, []);
+});
+
+test("a reviewer on the executor provider is refused instead of grading itself", () => {
+  const decision = admission({
+    executorRoute: "codex/pro",
+    reviewerRoute: "codex/pro",
+  });
+  assert.equal(decision.decision, "awaiting_owner");
+  assert.equal(decision.reasonCode, "reviewer_must_be_distinct");
+});
+
+test("cloud execution stays refused while the subprocess gate is closed", () => {
+  const decision = admission({
+    executorRoute: "claude-code/max",
+    reviewerRoute: "codex/pro",
+  });
+  assert.equal(decision.decision, "awaiting_owner");
+  assert.equal(decision.reasonCode, "cloud_subprocess_not_allowed");
+  assert.equal(resolveQuotaPolicy().cloudSubprocessAllowed, false);
+});
+
+test("an unknown window spends one canary and then defers", () => {
+  const unknown = quotaSnapshot({ "codex/session_5h": "unknown" });
+  const admitted = admission({ reviewerRoute: "codex/pro", snapshot: unknown });
+  assert.equal(admitted.decision, "execute");
+  assert.deepEqual(admitted.canaryClaims, [
+    { provider: "codex", plan: "pro", window_id: "session_5h" },
+  ]);
+
+  const spent = admission({
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot(
+      { "codex/session_5h": "unknown" },
+      { "codex/session_5h": { canary_available: false } },
+    ),
+  });
+  assert.equal(spent.decision, "defer");
+  assert.equal(spent.reasonCode, "review_window_unknown_canary_spent");
+  assert.equal(
+    spent.deferredUntil,
+    QUOTA_BASE_INSTANT + resolveQuotaPolicy().canaryIntervalMs,
+  );
+});
+
+test("the 5 h inequality defers a job whose p90 cost exceeds the remaining window", () => {
+  const policy = resolveQuotaPolicy({
+    admissionAppliesToReviews: true,
+    tokensPerWindow: { "codex:pro": 100_000 },
+  });
+  const snapshot = quotaSnapshot(
+    {},
+    { "codex/session_5h": { remaining_fraction: 0.5, used_fraction: 0.5 } },
+  );
+
+  const fits = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "codex/pro",
+    snapshot,
+    reviewerCostTokens: 33_000,
+    policy,
+    now: QUOTA_BASE_INSTANT,
+  });
+  assert.equal(fits.decision, "execute");
+
+  const doesNotFit = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "codex/pro",
+    snapshot,
+    reviewerCostTokens: 34_000,
+    policy,
+    now: QUOTA_BASE_INSTANT,
+  });
+  assert.equal(doesNotFit.decision, "defer");
+  assert.equal(doesNotFit.reasonCode, "review_session_window_too_small");
+
+  const unmetered = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "codex/pro",
+    snapshot,
+    reviewerCostTokens: 10,
+    policy: resolveQuotaPolicy({ admissionAppliesToReviews: true }),
+    now: QUOTA_BASE_INSTANT,
+  });
+  assert.equal(unmetered.decision, "defer");
+  assert.equal(unmetered.reasonCode, "review_session_window_unmetered");
+
+  const reviewsNotGated = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "codex/pro",
+    snapshot,
+    reviewerCostTokens: 10_000_000,
+    policy: resolveQuotaPolicy(),
+    now: QUOTA_BASE_INSTANT,
+  });
+  assert.equal(reviewsNotGated.decision, "execute");
+});
+
+test("a reset beyond the maximum deferral becomes an owner decision", () => {
+  const decision = admission({
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot(
+      { "codex/weekly": "exhausted" },
+      {
+        "codex/weekly": {
+          exhausted_until: QUOTA_BASE_INSTANT + 7 * 24 * 3_600_000,
+        },
+      },
+    ),
+  });
+  assert.equal(decision.decision, "awaiting_owner");
+  assert.equal(
+    decision.reasonCode,
+    "review_window_exhausted_beyond_max_defer",
+  );
+});
+
+test("the cost estimator ignores failure receipts and reads a bounded tail", async (t) => {
+  const directory = await temporaryStateDirectory(t);
+  const ledger = new ReceiptLedger(directory);
+
+  for (const [index, outcome] of [
+    "success",
+    "failure",
+    "success",
+    "success",
+  ].entries()) {
+    await ledger.append(
+      receipt({
+        task_id: `task-${index}`,
+        outcome,
+        token_usage: { input: 100 * (index + 1), output: 10 },
+      }),
+    );
+  }
+  await ledger.append(
+    receipt({
+      task_id: "other-route",
+      route: "ollama/qwen3:14b",
+      token_usage: { input: 9_000, output: 9_000 },
+    }),
+  );
+
+  const costs = await ledger.recentSuccessCosts("ollama/qwen2.5-coder:7b");
+  assert.deepEqual(costs, [110, 310, 410]);
+  assert.equal(percentile90(costs), 410);
+  assert.equal(percentile90([]), null);
+  assert.equal(percentile90([5]), 5);
+  assert.equal(percentile90([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 9);
+
+  const tail = await ledger.recentSuccessCosts("ollama/qwen2.5-coder:7b", {
+    maximumBytes: 900,
+  });
+  assert.equal(tail.length < costs.length, true);
+  assert.equal(
+    await ledger
+      .recentSuccessCosts("ollama/qwen2.5-coder:7b", { maximumSamples: 1 })
+      .then((values) => values.length),
+    1,
+  );
+
+  const missing = new ReceiptLedger(await temporaryStateDirectory(t));
+  assert.deepEqual(await missing.recentSuccessCosts("ollama/qwen2.5-coder:7b"), []);
 });
