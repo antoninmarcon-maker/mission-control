@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { LeaseStore } from "../lease-store.mjs";
 import { MissionControlClient } from "../mc-client.mjs";
 import { OllamaClient } from "../ollama-client.mjs";
+import { QuotaStore } from "../quota-store.mjs";
 import { ReceiptLedger } from "../receipt-ledger.mjs";
 import { configFromEnvironment, processOne } from "../run-once.mjs";
 
@@ -2057,4 +2058,298 @@ test("the process, status, and verify-ledger CLI commands emit non-secret JSON",
     outcome: "no_task",
     processed: 0,
   });
+});
+
+async function deferralServers(t, options = {}) {
+  const mcRequests = [];
+  const tokenRecords = [];
+  let taskState = { ...queuedTask() };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    const body = request.method === "GET" ? null : await readJson(request);
+    mcRequests.push({ method: request.method, url: request.url, body });
+    if (
+      request.method === "GET" &&
+      request.url?.startsWith("/api/tasks/queue?")
+    ) {
+      sendJson(response, 200, queueResponse(taskState));
+      return;
+    }
+    if (
+      request.method === "GET" &&
+      request.url === "/api/tokens?action=list&timeframe=all"
+    ) {
+      sendJson(response, 200, {
+        usage: tokenRecords,
+        total: tokenRecords.length,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      const record = { id: `token-${tokenRecords.length + 1}`, ...body };
+      tokenRecords.push(record);
+      sendJson(response, 200, { success: true, record });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    taskState = { ...taskState, ...body };
+    sendJson(response, 200, { task: taskState });
+  });
+  const ollamaRequests = [];
+  const localEndpoint = await fakeHttpServer(t, async (request, response) => {
+    ollamaRequests.push(await readJson(request));
+    sendJson(response, 200, {
+      choices: [{ message: { content: options.completion ?? "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+  return {
+    mcRequests,
+    ollamaRequests,
+    mcUrl,
+    localEndpoint: `${localEndpoint}/v1`,
+    task: () => taskState,
+  };
+}
+
+test("an exhausted reviewer window defers the task without reaching a provider", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const resetAt = Date.now() + 3_600_000;
+  await new QuotaStore(state.stateDirectory, state.stateStoreOptions).observe({
+    provider: "codex",
+    plan: "pro",
+    window_id: "weekly",
+    source: "refusal_observed",
+    observed_at: Date.now(),
+    remaining_fraction: 0,
+    exhausted_until: resetAt,
+  });
+  const servers = await deferralServers(t);
+
+  const result = await processOne({
+    ...processConfig(state, {
+      mcUrl: servers.mcUrl,
+      localEndpoint: servers.localEndpoint,
+    }),
+    reviewerProvider: "codex",
+  });
+
+  assert.equal(result.outcome, "deferred");
+  assert.equal(result.processed, 0);
+  assert.equal(result.taskId, 42);
+  assert.equal(result.reasonCode, "review_window_exhausted");
+  assert.equal(result.deferredUntil, new Date(resetAt).toISOString());
+  assert.deepEqual(servers.ollamaRequests, []);
+  assert.equal(
+    servers.mcRequests.some((request) => request.url === "/api/tokens"),
+    false,
+  );
+
+  const mutation = servers.mcRequests.at(-1);
+  assert.equal(mutation.method, "PUT");
+  assert.equal(mutation.url, "/api/tasks/42");
+  assert.deepEqual(mutation.body, {
+    status: "assigned",
+    assigned_to: "antonin-policy-engine",
+    metadata: {
+      policy_mvp: {
+        deferred_until: new Date(resetAt).toISOString(),
+        deferred_reason: "review_window_exhausted",
+      },
+    },
+    error_message: `Policy deferred this task until ${new Date(resetAt).toISOString()}: review_window_exhausted`,
+  });
+
+  await assert.rejects(
+    readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8"),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(
+    readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+    { code: "ENOENT" },
+  );
+  await assertLeaseReleased(state);
+});
+
+test("a deferred task claimed again is deferred again before any provider call", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const resetAt = Date.now() + 3_600_000;
+  await new QuotaStore(state.stateDirectory, state.stateStoreOptions).observe({
+    provider: "codex",
+    plan: "pro",
+    window_id: "session_5h",
+    source: "refusal_observed",
+    observed_at: Date.now(),
+    remaining_fraction: 0,
+    exhausted_until: resetAt,
+  });
+  const servers = await deferralServers(t);
+  const config = {
+    ...processConfig(state, {
+      mcUrl: servers.mcUrl,
+      localEndpoint: servers.localEndpoint,
+    }),
+    reviewerProvider: "codex",
+  };
+
+  const first = await processOne(config);
+  const second = await processOne(config);
+
+  assert.equal(first.outcome, "deferred");
+  assert.equal(second.outcome, "deferred");
+  assert.equal(second.reasonCode, "review_window_exhausted");
+  assert.deepEqual(servers.ollamaRequests, []);
+  assert.equal(
+    servers.task().metadata.policy_mvp.deferred_until,
+    new Date(resetAt).toISOString(),
+  );
+  await assertLeaseReleased(state, "42");
+});
+
+test("an unknown reviewer window spends one canary and then defers", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await deferralServers(t);
+  const config = {
+    ...processConfig(state, {
+      mcUrl: servers.mcUrl,
+      localEndpoint: servers.localEndpoint,
+    }),
+    reviewerProvider: "codex",
+  };
+
+  const first = await processOne(config);
+  assert.equal(first.outcome, "review");
+  assert.equal(servers.ollamaRequests.length, 1);
+
+  const quotas = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "quotas.json"), "utf8"),
+  );
+  assert.equal(
+    Object.keys(quotas.windows).sort().join(","),
+    "codex:pro:session_5h,codex:pro:weekly",
+  );
+  for (const window of Object.values(quotas.windows)) {
+    assert.equal(Number.isSafeInteger(window.last_canary_at), true);
+    assert.equal(window.remaining_fraction, null);
+  }
+
+  const second = await processOne(config);
+  assert.equal(second.outcome, "deferred");
+  assert.equal(second.reasonCode, "review_window_unknown_canary_spent");
+  assert.equal(servers.ollamaRequests.length, 1);
+
+  const observations = (
+    await readFile(
+      path.join(state.stateDirectory, "quota-observations.jsonl"),
+      "utf8",
+    )
+  )
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(observations.length, 2);
+  assert.match(observations[0].snapshot_id, /^[a-f0-9]{64}$/);
+  assert.equal(observations[0].windows.length, 5);
+});
+
+test("an untracked reviewer keeps the delivered behaviour and claims no canary", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await deferralServers(t);
+
+  const result = await processOne(
+    processConfig(state, {
+      mcUrl: servers.mcUrl,
+      localEndpoint: servers.localEndpoint,
+    }),
+  );
+
+  assert.equal(result.outcome, "review");
+  assert.equal(result.reviewer, "poc-aegis-cloud");
+  await assert.rejects(
+    readFile(path.join(state.stateDirectory, "quotas.json"), "utf8"),
+    { code: "ENOENT" },
+  );
+  assert.equal(
+    (
+      await readFile(
+        path.join(state.stateDirectory, "quota-observations.jsonl"),
+        "utf8",
+      )
+    )
+      .trimEnd()
+      .split("\n").length,
+    1,
+  );
+});
+
+test("an unusable reviewer provider fails closed before claiming a task", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let requests = 0;
+  const mcUrl = await fakeHttpServer(t, (_request, response) => {
+    requests += 1;
+    sendJson(response, 200, queueResponse(queuedTask()));
+  });
+
+  await assert.rejects(
+    processOne({
+      ...processConfig(state, { mcUrl }),
+      reviewerProvider: "gemini",
+    }),
+    /ANTONIN_REVIEWER_PROVIDER must be one of claude-code, codex/,
+  );
+  await assert.rejects(
+    processOne({
+      ...processConfig(state, { mcUrl }),
+      quotaPolicyOverrides: { weeklyReserveFraction: 0.9 },
+    }),
+    /warnThreshold must be greater than weeklyReserveFraction/,
+  );
+  assert.equal(requests, 0);
+});
+
+test("the quota-status CLI command emits non-secret JSON", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const apiKey = "quota-cli-secret-must-not-print";
+  const env = {
+    ...process.env,
+    ANTONIN_POLICY_STATE_DIR: state.stateDirectory,
+    MC_URL: "http://127.0.0.1:4318",
+    MC_API_KEY: apiKey,
+    MISSION_CONTROL_DATA_DIR: "",
+    LOCAL_LLM_ENDPOINT: "http://127.0.0.1:11434/v1",
+    ANTONIN_REVIEWER_PROVIDER: "codex",
+  };
+
+  const result = await execFile(
+    process.execPath,
+    [runOncePath, "quota-status"],
+    { cwd: repositoryRoot, env },
+  );
+
+  const json = JSON.parse(result.stdout);
+  assert.equal(json.command, "quota-status");
+  assert.equal(json.reviewerRoute, "codex/pro");
+  assert.match(json.snapshotId, /^[a-f0-9]{64}$/);
+  assert.equal(json.windows.length, 5);
+  assert.deepEqual(
+    json.windows.map((window) => window.state).sort(),
+    ["ok", "unknown", "unknown", "unknown", "unknown"],
+  );
+  assert.equal(json.policy.cloudSubprocessAllowed, false);
+  assert.deepEqual(json.policy.tokensPerWindow, {
+    "claude-code:max": null,
+    "codex:pro": null,
+  });
+  assert.equal(
+    json.ownerDecisionsPending.every(
+      (decision) => decision.status === "DÉCISION ANTONIN EN ATTENTE",
+    ),
+    true,
+  );
+  assert.equal(result.stdout.includes(apiKey), false);
+  assert.equal(result.stderr, "");
+  assert.equal(/sessionId|session_id|\/Users\//.test(result.stdout), false);
 });

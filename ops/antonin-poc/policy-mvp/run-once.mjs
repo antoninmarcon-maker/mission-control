@@ -18,7 +18,20 @@ import {
   MissionControlRequestError,
 } from "./mc-client.mjs";
 import { OllamaClient } from "./ollama-client.mjs";
-import { evaluateTask, validateLoopbackHttpUrl } from "./policy-core.mjs";
+import {
+  admitAttempt,
+  evaluateTask,
+  percentile90,
+  validateLoopbackHttpUrl,
+} from "./policy-core.mjs";
+import {
+  CLOUD_PROVIDERS,
+  OWNER_DECISION_PLACEHOLDERS,
+  PROVIDER_PLANS,
+  planKey,
+  resolveQuotaPolicy,
+} from "./quota-config.mjs";
+import { QuotaStore } from "./quota-store.mjs";
 import { ReceiptLedger } from "./receipt-ledger.mjs";
 
 const DEFAULT_AGENT = "antonin-policy-engine";
@@ -666,6 +679,118 @@ async function reconcileCompletion({
   return current;
 }
 
+function normalizeReviewerProvider(value) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    // §7 leaves reviewer routing open: with no declared provider the reviewer
+    // is an ordinary Mission Control agent and this engine tracks no window
+    // for it. Declaring one turns on the §4.4 reviewer capacity check.
+    return null;
+  }
+  const provider = String(value).trim();
+  if (!CLOUD_PROVIDERS.includes(provider)) {
+    throw new TypeError(
+      `ANTONIN_REVIEWER_PROVIDER must be one of ${CLOUD_PROVIDERS.join(", ")}`,
+    );
+  }
+  return provider;
+}
+
+function reviewerRouteOf(normalized) {
+  return normalized.reviewerProvider === null
+    ? `external/${normalized.reviewer}`
+    : `${normalized.reviewerProvider}/${PROVIDER_PLANS[normalized.reviewerProvider]}`;
+}
+
+async function estimateRouteCost(receiptLedger, route) {
+  try {
+    return percentile90(await receiptLedger.recentSuccessCosts(route));
+  } catch {
+    // §2.7 the estimator is a routing hint built from evidence we already
+    // have. An unreadable ledger makes the cost unknown; it never fails a run.
+    return null;
+  }
+}
+
+/**
+ * §4.4-§4.5 admission. The pure decision comes from `admitAttempt`; claiming
+ * the canaries it asks for is done here, because that claim is a
+ * compare-and-set on persistent state (§2.6).
+ */
+async function resolveAdmission({
+  decision,
+  normalized,
+  quotaStore,
+  receiptLedger,
+  now,
+}) {
+  const snapshot = await quotaStore.snapshot(now);
+  await quotaStore.recordSnapshot(snapshot);
+  const reviewerRoute = reviewerRouteOf(normalized);
+  const admission = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: decision.route,
+    reviewerRoute,
+    snapshot,
+    executorCostTokens: await estimateRouteCost(receiptLedger, decision.route),
+    reviewerCostTokens: await estimateRouteCost(receiptLedger, reviewerRoute),
+    policy: normalized.quotaPolicy,
+    now,
+  });
+  if (admission.decision !== "execute") return admission;
+
+  for (const claim of admission.canaryClaims) {
+    const claimed = await quotaStore.claimCanary(claim.provider, claim.window_id, {
+      plan: claim.plan,
+      now,
+    });
+    if (!claimed) {
+      // A concurrent invocation took the canary between the snapshot and the
+      // compare-and-set. Nothing has been spent here, so this one waits.
+      return {
+        decision: "defer",
+        reasonCode: "canary_claimed_by_a_concurrent_invocation",
+        deferredUntil: now + normalized.quotaPolicy.canaryIntervalMs,
+        canaryClaims: [],
+      };
+    }
+  }
+  return admission;
+}
+
+/**
+ * §4.6 a deferral is not work: no completion journal entry, no token record
+ * and no receipt. The task goes back to the policy agent with an
+ * operator-visible instant, merged into metadata read moments ago by the queue
+ * claim so a concurrent operator edit is not clobbered.
+ */
+function deferredTaskUpdate({ task, agent, deferredUntil, reasonCode }) {
+  const freshMetadata =
+    task?.metadata !== null &&
+    typeof task?.metadata === "object" &&
+    !Array.isArray(task.metadata)
+      ? task.metadata
+      : {};
+  const freshPolicyMetadata =
+    freshMetadata.policy_mvp !== null &&
+    typeof freshMetadata.policy_mvp === "object" &&
+    !Array.isArray(freshMetadata.policy_mvp)
+      ? freshMetadata.policy_mvp
+      : {};
+  return {
+    status: "assigned",
+    assigned_to: agent,
+    metadata: {
+      ...freshMetadata,
+      policy_mvp: {
+        ...freshPolicyMetadata,
+        deferred_until: deferredUntil,
+        deferred_reason: reasonCode,
+      },
+    },
+    error_message: `Policy deferred this task until ${deferredUntil}: ${reasonCode}`,
+  };
+}
+
 function validateProcessConfig(config = {}) {
   if (config === null || typeof config !== "object" || Array.isArray(config)) {
     throw new TypeError("config must be an object");
@@ -725,6 +850,9 @@ function validateProcessConfig(config = {}) {
     throw new TypeError("reviewer must be distinct from the local model");
   }
 
+  const reviewerProvider = normalizeReviewerProvider(config.reviewerProvider);
+  const quotaPolicy = resolveQuotaPolicy(config.quotaPolicyOverrides ?? {});
+
   return {
     stateDirectory,
     stateStoreOptions,
@@ -732,10 +860,67 @@ function validateProcessConfig(config = {}) {
     mcApiKey,
     agent,
     reviewer,
+    reviewerProvider,
     localEndpoint,
     localModel,
     leaseTtlMs,
+    quotaPolicy,
     pocRuntimeDirectory,
+  };
+}
+
+function environmentNumber(environment, name) {
+  const raw = environment[name];
+  if (raw === undefined || String(raw).trim() === "") return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    throw new TypeError(`${name} must be a number`);
+  }
+  return value;
+}
+
+function environmentBoolean(environment, name) {
+  const raw = environment[name];
+  if (raw === undefined || String(raw).trim() === "") return undefined;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new TypeError(`${name} must be true or false`);
+}
+
+function quotaPolicyOverridesFromEnvironment(environment) {
+  return {
+    warnThreshold: environmentNumber(environment, "ANTONIN_QUOTA_WARN_THRESHOLD"),
+    weeklyReserveFraction: environmentNumber(
+      environment,
+      "ANTONIN_QUOTA_WEEKLY_RESERVE",
+    ),
+    sessionSafetyFactor: environmentNumber(
+      environment,
+      "ANTONIN_QUOTA_SAFETY_FACTOR",
+    ),
+    admissionAppliesToReviews: environmentBoolean(
+      environment,
+      "ANTONIN_QUOTA_ADMIT_REVIEWS",
+    ),
+    maxStalenessMs: environmentNumber(
+      environment,
+      "ANTONIN_QUOTA_MAX_STALENESS_MS",
+    ),
+    canaryIntervalMs: environmentNumber(
+      environment,
+      "ANTONIN_QUOTA_CANARY_INTERVAL_MS",
+    ),
+    maxDeferMs: environmentNumber(environment, "ANTONIN_MAX_DEFER_MS"),
+    tokensPerWindow: {
+      [planKey("claude-code", PROVIDER_PLANS["claude-code"])]: environmentNumber(
+        environment,
+        "ANTONIN_QUOTA_TOKENS_PER_WINDOW_CLAUDE_CODE",
+      ),
+      [planKey("codex", PROVIDER_PLANS.codex)]: environmentNumber(
+        environment,
+        "ANTONIN_QUOTA_TOKENS_PER_WINDOW_CODEX",
+      ),
+    },
   };
 }
 
@@ -756,10 +941,12 @@ export function configFromEnvironment(environment = process.env) {
     mcApiKey: environment.MC_API_KEY,
     agent: environment.ANTONIN_POLICY_AGENT ?? DEFAULT_AGENT,
     reviewer: environment.ANTONIN_CLOUD_REVIEWER ?? DEFAULT_REVIEWER,
+    reviewerProvider: environment.ANTONIN_REVIEWER_PROVIDER,
     localEndpoint: environment.LOCAL_LLM_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT,
     localModel: environment.LOCAL_LLM_MODEL ?? DEFAULT_LOCAL_MODEL,
     leaseTtlMs:
       environment.ANTONIN_LEASE_TTL_MS ?? DEFAULT_LEASE_TTL_MS,
+    quotaPolicyOverrides: quotaPolicyOverridesFromEnvironment(environment),
   });
 }
 
@@ -902,6 +1089,13 @@ export async function processOne(config, dependencies = {}) {
       normalized.stateStoreOptions,
     );
   const now = dependencies.now ?? Date.now;
+  const quotaStore =
+    dependencies.quotaStore ??
+    new QuotaStore(normalized.stateDirectory, {
+      ...normalized.stateStoreOptions,
+      now,
+      policy: normalized.quotaPolicy,
+    });
   const completionJournal =
     dependencies.completionJournal ??
     new CompletionJournal(normalized.stateDirectory, { now });
@@ -992,6 +1186,58 @@ export async function processOne(config, dependencies = {}) {
   });
   if (lease === null) {
     throw new Error(`lease is unavailable for task ${taskId}`);
+  }
+
+  const admission = await resolveAdmission({
+    decision,
+    normalized,
+    quotaStore,
+    receiptLedger,
+    now: now(),
+  });
+  if (admission.decision !== "execute") {
+    const deferredUntil =
+      admission.decision === "defer"
+        ? new Date(admission.deferredUntil).toISOString()
+        : null;
+    let mutationError = null;
+    try {
+      if (deferredUntil === null) {
+        await moveToAwaitingOwner(
+          missionControl,
+          task.id,
+          `Policy ${decision.policyVersion} requires owner: ${admission.reasonCode}`,
+        );
+      } else {
+        await missionControl.updateTask(
+          task.id,
+          deferredTaskUpdate({
+            task,
+            agent: normalized.agent,
+            deferredUntil,
+            reasonCode: admission.reasonCode,
+          }),
+        );
+      }
+    } catch (error) {
+      mutationError = error;
+    }
+    const cleanupWarning = await releaseLeaseForCleanup(
+      leaseStore,
+      taskId,
+      normalized.agent,
+      lease.fencing_token,
+    );
+    if (mutationError !== null) {
+      throw new Error(safeErrorMessage(mutationError, normalized.mcApiKey));
+    }
+    return {
+      ...(deferredUntil === null
+        ? { outcome: "awaiting_owner", processed: 1, taskId: task.id }
+        : { outcome: "deferred", processed: 0, taskId: task.id, deferredUntil }),
+      reasonCode: admission.reasonCode,
+      ...(cleanupWarning ? { cleanupWarning } : {}),
+    };
   }
 
   const prompt = localPrompt(task);
@@ -1104,13 +1350,30 @@ export async function runCommand(command, environment = process.env) {
       stateDirectory: config.stateDirectory,
       leaseFile: path.join(config.stateDirectory, "leases.json"),
       receiptLedgerFile: path.join(config.stateDirectory, "receipts.jsonl"),
+      quotaFile: path.join(config.stateDirectory, "quotas.json"),
       mcUrl: config.mcUrl,
       agent: config.agent,
       reviewer: config.reviewer,
+      reviewerProvider: config.reviewerProvider,
       localEndpoint: config.localEndpoint,
       localModel: config.localModel,
       leaseTtlMs: config.leaseTtlMs,
       apiKeyConfigured: true,
+    };
+  }
+  if (command === "quota-status") {
+    const snapshot = await new QuotaStore(config.stateDirectory, {
+      ...config.stateStoreOptions,
+      policy: config.quotaPolicy,
+    }).snapshot();
+    return {
+      command,
+      snapshotId: snapshot.snapshot_id,
+      takenAt: new Date(snapshot.taken_at).toISOString(),
+      reviewerRoute: reviewerRouteOf(config),
+      windows: snapshot.windows,
+      policy: config.quotaPolicy,
+      ownerDecisionsPending: OWNER_DECISION_PLACEHOLDERS,
     };
   }
   if (command === "verify-ledger") {
@@ -1123,7 +1386,9 @@ export async function runCommand(command, environment = process.env) {
   if (command === "process") {
     return { command, ...(await processOne(config)) };
   }
-  throw new Error("usage: run-once.mjs process|status|verify-ledger");
+  throw new Error(
+    "usage: run-once.mjs process|status|quota-status|verify-ledger",
+  );
 }
 
 async function main() {
