@@ -30,6 +30,21 @@ const DEFAULT_NETWORK_TIMEOUT_MS = 120_000;
 const NETWORK_LEASE_MARGIN_MS = 1_000;
 const MAX_ERROR_LENGTH = 320;
 const COMPLETION_JOURNAL_VERSION = 1;
+const COMPLETION_METADATA_FIELDS = [
+  "completion_id",
+  "input_hash",
+  "output_hash",
+  "policy_version",
+];
+const STABLE_RECEIPT_FIELDS = [
+  "task_id",
+  "policy_version",
+  "route",
+  "reviewer",
+  "input_hash",
+  "output_hash",
+  "outcome",
+];
 
 class CompletionPendingError extends Error {
   constructor(error) {
@@ -122,9 +137,20 @@ class CompletionJournal {
     });
   }
 
-  async markTokenAttempted(completionId) {
-    return this.#updateEntry(completionId, (entry) => {
+  async claimTokenAttempt(completionId) {
+    return this.#withLock(async () => {
+      const state = await this.#readState();
+      const entry = state.entries[completionId];
+      if (!entry) {
+        throw new Error(`completion journal entry not found: ${completionId}`);
+      }
+      if (entry.token_attempted) {
+        return { claimed: false, entry };
+      }
       entry.token_attempted = true;
+      entry.updated_at = this.now();
+      await this.#writeState(state);
+      return { claimed: true, entry };
     });
   }
 
@@ -135,11 +161,16 @@ class CompletionJournal {
     });
   }
 
-  async rebindLease(completionId, lease) {
+  async adoptLease(completionId, lease, existingReceiptHash = null) {
     return this.#updateEntry(completionId, (entry) => {
       entry.fencing_token = lease.fencing_token;
-      entry.receipt.fencing_token = lease.fencing_token;
-      entry.receipt.lease_id = `${entry.task_id}:${lease.fencing_token}`;
+      if (existingReceiptHash === null) {
+        entry.receipt.fencing_token = lease.fencing_token;
+        entry.receipt.lease_id = `${entry.task_id}:${lease.fencing_token}`;
+      } else {
+        entry.phases.receipt_confirmed = true;
+        entry.receipt_hash = existingReceiptHash;
+      }
     });
   }
 
@@ -387,10 +418,41 @@ function taskConfirmsCompletion(task, entry) {
     actualPolicyMetadata !== null &&
     typeof actualPolicyMetadata === "object" &&
     !Array.isArray(actualPolicyMetadata) &&
-    Object.entries(expectedPolicyMetadata).every(
-      ([field, value]) => actualPolicyMetadata[field] === value,
+    COMPLETION_METADATA_FIELDS.every(
+      (field) => actualPolicyMetadata[field] === expectedPolicyMetadata[field],
     )
   );
+}
+
+function taskUpdateWithFreshMetadata(entry, task) {
+  const freshMetadata =
+    task?.metadata !== null &&
+    typeof task?.metadata === "object" &&
+    !Array.isArray(task.metadata)
+      ? task.metadata
+      : {};
+  const freshPolicyMetadata =
+    freshMetadata.policy_mvp !== null &&
+    typeof freshMetadata.policy_mvp === "object" &&
+    !Array.isArray(freshMetadata.policy_mvp)
+      ? freshMetadata.policy_mvp
+      : {};
+  const completionMetadata = entry.task_update.metadata.policy_mvp;
+  return {
+    ...entry.task_update,
+    metadata: {
+      ...freshMetadata,
+      policy_mvp: {
+        ...freshPolicyMetadata,
+        ...Object.fromEntries(
+          COMPLETION_METADATA_FIELDS.map((field) => [
+            field,
+            completionMetadata[field],
+          ]),
+        ),
+      },
+    },
+  };
 }
 
 async function receiptAlreadyStored(receiptLedger, expectedReceipt) {
@@ -405,14 +467,9 @@ async function receiptAlreadyStored(receiptLedger, expectedReceipt) {
   for (const line of contents.split("\n")) {
     if (line === "") continue;
     const record = JSON.parse(line);
-    if (
-      record.task_id === expectedReceipt.task_id &&
-      record.lease_id === expectedReceipt.lease_id &&
-      record.fencing_token === expectedReceipt.fencing_token &&
-      record.input_hash === expectedReceipt.input_hash &&
-      record.output_hash === expectedReceipt.output_hash &&
-      record.outcome === expectedReceipt.outcome
-    ) {
+    if (STABLE_RECEIPT_FIELDS.every(
+      (field) => record[field] === expectedReceipt[field],
+    )) {
       return record;
     }
   }
@@ -474,20 +531,15 @@ async function reconcileCompletion({
 
     if (existingToken === null) {
       await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
-      current = await withLocalCompletionGuard(leaseStore, current, () =>
-        completionJournal.markTokenAttempted(current.completion_id),
+      const tokenAttempt = await withLocalCompletionGuard(
+        leaseStore,
+        current,
+        () => completionJournal.claimTokenAttempt(current.completion_id),
       );
-      try {
-        await missionControl.recordTokens(current.token_record);
-      } catch (error) {
-        if (
-          error instanceof MissionControlRequestError &&
-          error.ambiguous === false
-        ) {
-          throw error;
-        }
+      current = tokenAttempt.entry;
+      if (!tokenAttempt.claimed) {
+        await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
         try {
-          await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
           existingToken = await missionControl.findTokenRecord(
             current.token_session_id,
           );
@@ -500,6 +552,31 @@ async function reconcileCompletion({
           await markTokenAmbiguous(completionJournal, leaseStore, current);
           throw new TokenReconciliationRequiredError(current.token_session_id);
         }
+      } else {
+        try {
+          await missionControl.recordTokens(current.token_record);
+        } catch (error) {
+          if (
+            error instanceof MissionControlRequestError &&
+            error.ambiguous === false
+          ) {
+            throw error;
+          }
+          try {
+            await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
+            existingToken = await missionControl.findTokenRecord(
+              current.token_session_id,
+            );
+          } catch (readbackError) {
+            if (isStaleLeaseError(readbackError)) throw readbackError;
+            await markTokenAmbiguous(completionJournal, leaseStore, current);
+            throw new TokenReconciliationRequiredError(current.token_session_id);
+          }
+          if (existingToken === null) {
+            await markTokenAmbiguous(completionJournal, leaseStore, current);
+            throw new TokenReconciliationRequiredError(current.token_session_id);
+          }
+        }
       }
     }
 
@@ -509,19 +586,16 @@ async function reconcileCompletion({
   }
 
   if (!current.phases.task_confirmed) {
-    let task = null;
+    let task;
     await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
-    try {
-      task = await missionControl.getTask(current.task_api_id);
-    } catch {
-      // PUT is idempotent and its exact completion identity is read back below.
-    }
+    task = await missionControl.getTask(current.task_api_id);
     if (!taskConfirmsCompletion(task, current)) {
       await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
+      const taskUpdate = taskUpdateWithFreshMetadata(current, task);
       try {
         const response = await missionControl.updateTask(
           current.task_api_id,
-          current.task_update,
+          taskUpdate,
         );
         task = response.task;
       } catch (error) {
@@ -700,6 +774,7 @@ async function adoptPendingCompletion({
   entry,
   completionJournal,
   leaseStore,
+  receiptLedger,
   recoveryLeaseTtlMs,
 }) {
   const lease = await leaseStore.acquire(entry.task_id, entry.owner, {
@@ -712,9 +787,16 @@ async function adoptPendingCompletion({
   if (lease.fencing_token === entry.fencing_token) {
     return entry;
   }
+  const storedReceipt = entry.phases.receipt_confirmed
+    ? null
+    : await receiptAlreadyStored(receiptLedger, entry.receipt);
   const rebound = { ...entry, fencing_token: lease.fencing_token };
   return withLocalCompletionGuard(leaseStore, rebound, () =>
-    completionJournal.rebindLease(entry.completion_id, lease),
+    completionJournal.adoptLease(
+      entry.completion_id,
+      lease,
+      storedReceipt?.record_hash ?? null,
+    ),
   );
 }
 
@@ -819,6 +901,7 @@ export async function processOne(config, dependencies = {}) {
         entry: pendingCompletion,
         completionJournal,
         leaseStore,
+        receiptLedger,
         recoveryLeaseTtlMs,
       });
       reconciled = await reconcileCompletion({
