@@ -40,3 +40,7 @@ bash ops/antonin-poc/test-mc-poc.sh
 ```
 
 The tests exercise the `4317` guard, loopback-only guard, dedicated SQLite path, secret-file permissions, redacted output, stopped status, and recoverable rollback.
+
+## External policy adapter
+
+The optional one-shot local policy adapter is documented in [policy-mvp/README.md](policy-mvp/README.md). It uses a separate external state directory, runs at most one harmless text task through loopback Ollama, and always returns successful output to Mission Control for distinct review.
