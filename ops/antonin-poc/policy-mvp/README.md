@@ -64,18 +64,22 @@ The external state directory contains:
 - `receipts.jsonl`, a mode-`600` append-only hash chain;
 - short-lived lock directories while a state mutation is in progress.
 
-For an allowed task, the journal and all completion phases run under the same fenced completion guard:
+For an allowed task, the adapter uses a stable completion ID derived from the task ID and the input/output hashes. That ID is independent of the current fencing token and is copied into `metadata.policy_mvp` with the hashes and policy version. Existing task metadata is preserved.
 
-1. detect an existing deterministic token record, or post it and confirm it;
-2. detect an already-completed task update, or assign the reviewer, move to `review`, and confirm the returned status and reviewer;
+Remote calls never run while the global lease lock is held. Before each bounded Ollama or Mission Control call, the adapter renews the lease to a TTL strictly longer than the client timeout. The fenced completion guard is used only for short local journal and receipt mutations:
+
+1. detect an existing deterministic token record, or atomically record `token_attempted` before posting it once;
+2. detect this exact completed task update, or assign the reviewer, move to `review`, and confirm the status, reviewer, resolution, and completion metadata;
 3. append the hash-only success receipt after both Mission Control mutations are confirmed;
-4. mark the receipt phase confirmed, leave the guard, and release the matching lease as a separate cleanup.
+4. mark the receipt phase confirmed and release the matching lease as a separate cleanup.
 
 Before the task mutation is confirmed, the mode-`600` journal temporarily keeps the local model resolution needed for a process restart. It never stores the API key or raw task prompt, and clears the resolution as soon as Mission Control confirms the task phase. Completed receipts remain hash-only.
 
-If a token or task response is ambiguous, the adapter checks Mission Control before retrying. A later `process` invocation resumes the first unconfirmed journal phase without re-running Ollama or claiming another task. If the final receipt cannot be appended (for example because ledger verification fails), the confirmed Mission Control mutations stay in `review` and the journal remains pending. Repair or restore the ledger, then run `process` again while the original lease is still current.
+Mission Control exposes only the latest 100 token records and has no server-side idempotency key. The adapter therefore provides safe at-most-once token posting, not distributed exactly-once accounting: after an ambiguous or lost POST response it checks that visible window for the deterministic session. If the session is absent, it atomically records `token_ambiguous=true`, leaves the completion pending for manual reconciliation, and never posts that session again automatically. This can undercount a token record whose POST definitely failed, but it cannot double-post an ambiguous attempt. Inspect the mode-`600` journal and Mission Control records before resolving such an entry manually; do not clear `token_attempted` merely to force a retry.
 
-A stale owner exits without a receipt, token POST, task PUT, or release attempt. A release failure after a confirmed completion is reported as `cleanupWarning`; it never creates a failure receipt or moves the task to `awaiting_owner`.
+Task updates are idempotent and are retried only until the exact resolution and `metadata.policy_mvp.completion_id` are observed. A later `process` invocation resumes the first unconfirmed journal phase without re-running Ollama or claiming another task. If its lease expired, the same owner reacquires the task with a new fencing token and atomically rebinds the pending receipt while keeping the completion ID and token session stable. If another owner currently holds the lease, the adapter performs no compensating Mission Control mutation. If the final receipt cannot be appended (for example because ledger verification fails), the confirmed Mission Control mutations stay in `review`; repair or restore the ledger, then run `process` again.
+
+A stale owner exits without a receipt, token POST, task PUT, compensating `awaiting_owner`, or release attempt. Failure recovery renews before the guarded failure receipt and again immediately before its bounded `awaiting_owner` request; a takeover between those phases blocks the compensation and matching-token release. A release failure after a confirmed completion is reported as `cleanupWarning`; it never creates a failure receipt or moves the task to `awaiting_owner`.
 
 The configured cloud reviewer performs the existing Mission Control review flow. The adapter does not call the reviewer or any cloud model itself.
 

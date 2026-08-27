@@ -65,6 +65,33 @@ function taskPath(taskId, suffix = "") {
   return `/api/tasks/${encodeURIComponent(normalized)}${suffix}`;
 }
 
+export class MissionControlRequestError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "MissionControlRequestError";
+    this.ambiguous = options.ambiguous === true;
+    this.status = options.status ?? null;
+  }
+}
+
+function mutationResponseError(message) {
+  return new MissionControlRequestError(message, { ambiguous: true });
+}
+
+function completionMetadataMatches(actual, expected) {
+  if (expected === undefined) return true;
+  if (
+    actual === null ||
+    typeof actual !== "object" ||
+    Array.isArray(actual)
+  ) {
+    return false;
+  }
+  return Object.entries(expected).every(
+    ([field, value]) => actual[field] === value,
+  );
+}
+
 export class MissionControlClient {
   constructor(options = {}) {
     const validatedUrl = validateLoopbackHttpUrl(options.baseUrl, "MC_URL");
@@ -112,13 +139,15 @@ export class MissionControlClient {
       typeof response?.task !== "object" ||
       Array.isArray(response.task)
     ) {
-      throw new Error("Mission Control returned an invalid task mutation response");
+      throw mutationResponseError(
+        "Mission Control returned an invalid task mutation response",
+      );
     }
     if (
       update.status !== undefined &&
       response.task.status !== update.status
     ) {
-      throw new Error(
+      throw mutationResponseError(
         `Mission Control did not confirm status ${String(update.status)}`,
       );
     }
@@ -126,8 +155,24 @@ export class MissionControlClient {
       update.assigned_to !== undefined &&
       response.task.assigned_to !== update.assigned_to
     ) {
-      throw new Error(
+      throw mutationResponseError(
         `Mission Control did not confirm reviewer ${String(update.assigned_to)}`,
+      );
+    }
+    if (
+      update.resolution !== undefined &&
+      response.task.resolution !== update.resolution
+    ) {
+      throw mutationResponseError("Mission Control did not confirm resolution");
+    }
+    if (
+      !completionMetadataMatches(
+        response.task.metadata?.policy_mvp,
+        update.metadata?.policy_mvp,
+      )
+    ) {
+      throw mutationResponseError(
+        "Mission Control did not confirm completion metadata",
       );
     }
     return response;
@@ -178,9 +223,12 @@ export class MissionControlClient {
       response?.success !== true ||
       response.record === null ||
       typeof response.record !== "object" ||
-      Array.isArray(response.record)
+      Array.isArray(response.record) ||
+      response.record.sessionId !== payload.sessionId
     ) {
-      throw new Error("Mission Control returned an invalid token mutation response");
+      throw mutationResponseError(
+        "Mission Control returned an invalid token mutation response",
+      );
     }
     return response;
   }
@@ -200,10 +248,12 @@ export class MissionControlClient {
 
   async #request(pathname, options = {}) {
     const url = new URL(pathname, this.baseUrl);
+    const method = options.method ?? "GET";
+    const isMutation = method !== "GET";
     let response;
     try {
       response = await fetch(url, {
-        method: options.method ?? "GET",
+        method,
         headers: {
           accept: "application/json",
           "x-api-key": this.apiKey,
@@ -217,7 +267,10 @@ export class MissionControlClient {
       });
     } catch (error) {
       const detail = sanitizeErrorDetail(error?.message, this.apiKey);
-      throw new Error(`Mission Control request failed: ${detail}`);
+      throw new MissionControlRequestError(
+        `Mission Control request failed: ${detail}`,
+        { ambiguous: isMutation },
+      );
     }
 
     if (response.status === 204) {
@@ -231,8 +284,9 @@ export class MissionControlClient {
     try {
       raw = await readBoundedText(response, maximumBytes);
     } catch (error) {
-      throw new Error(
+      throw new MissionControlRequestError(
         `Mission Control request failed (${response.status}): ${error.message}`,
+        { ambiguous: response.ok && isMutation, status: response.status },
       );
     }
 
@@ -240,15 +294,17 @@ export class MissionControlClient {
     try {
       data = raw === "" ? {} : JSON.parse(raw);
     } catch {
-      throw new Error(
+      throw new MissionControlRequestError(
         `Mission Control request failed (${response.status}): invalid JSON response`,
+        { ambiguous: response.ok && isMutation, status: response.status },
       );
     }
 
     if (!response.ok) {
       const detail = sanitizeErrorDetail(data?.error, this.apiKey);
-      throw new Error(
+      throw new MissionControlRequestError(
         `Mission Control request failed (${response.status}): ${detail}`,
+        { ambiguous: false, status: response.status },
       );
     }
     return data;

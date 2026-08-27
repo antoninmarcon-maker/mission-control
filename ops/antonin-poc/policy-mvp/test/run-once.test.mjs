@@ -152,7 +152,10 @@ test("Mission Control client uses the exact queue, task, comment, and token cont
       return;
     }
     if (request.url === "/api/tokens") {
-      sendJson(response, 200, { success: true, record: { id: "token-1" } });
+      sendJson(response, 200, {
+        success: true,
+        record: { id: "token-1", sessionId: requests.at(-1).body.sessionId },
+      });
       return;
     }
     sendJson(response, 200, {
@@ -160,6 +163,8 @@ test("Mission Control client uses the exact queue, task, comment, and token cont
         id: 42,
         status: "review",
         assigned_to: "poc-aegis-cloud",
+        resolution: "Sorted result",
+        metadata: { policy_version: "antonin-policy-v0" },
       },
     });
   });
@@ -312,6 +317,36 @@ test("Mission Control client rejects semantically invalid 2xx mutation responses
     }),
     /did not confirm status review/,
   );
+});
+
+test("Mission Control task mutations require exact resolution and completion metadata", async (t) => {
+  let requestCount = 0;
+  const baseUrl = await fakeHttpServer(t, async (request, response) => {
+    const body = await readJson(request);
+    requestCount += 1;
+    sendJson(response, 200, {
+      task: {
+        id: 42,
+        status: body.status,
+        assigned_to: body.assigned_to,
+        resolution: requestCount === 1 ? "some other completion" : body.resolution,
+        metadata:
+          requestCount === 1
+            ? body.metadata
+            : { policy_mvp: { completion_id: "some-other-id" } },
+      },
+    });
+  });
+  const client = new MissionControlClient({ baseUrl, apiKey: "secret" });
+  const update = {
+    status: "review",
+    assigned_to: "poc-aegis-cloud",
+    resolution: "exact completion",
+    metadata: { policy_mvp: { completion_id: "expected-id" } },
+  };
+
+  await assert.rejects(client.updateTask(42, update), /confirm resolution/i);
+  await assert.rejects(client.updateTask(42, update), /confirm completion/i);
 });
 
 test("Mission Control errors are bounded and redact the API key", async (t) => {
@@ -539,7 +574,15 @@ test("processOne completes an allowed task under a lease and leaves a hash-only 
   assert.equal(tokenRequest.model, "qwen2.5-coder:7b");
   assert.equal(
     tokenRequest.sessionId,
-    "antonin-policy-engine:policy-mvp:task-42:fence-1",
+    `antonin-policy-engine:policy-mvp:completion-${createHash("sha256")
+      .update(
+        [
+          "42",
+          createHash("sha256").update(ollamaRequest.messages[0].content).digest("hex"),
+          createHash("sha256").update("alpha\nbeta").digest("hex"),
+        ].join("\0"),
+      )
+      .digest("hex")}`,
   );
   assert.equal(tokenRequest.inputTokens, 19);
   assert.equal(tokenRequest.outputTokens, 5);
@@ -547,10 +590,27 @@ test("processOne completes an allowed task under a lease and leaves a hash-only 
   assert.equal(tokenRequest.taskId, 42);
   assert.ok(Number.isFinite(tokenRequest.duration));
 
+  const expectedInputHash = createHash("sha256")
+    .update(ollamaRequest.messages[0].content)
+    .digest("hex");
+  const expectedOutputHash = createHash("sha256")
+    .update("alpha\nbeta")
+    .digest("hex");
+  const expectedCompletionId = createHash("sha256")
+    .update(["42", expectedInputHash, expectedOutputHash].join("\0"))
+    .digest("hex");
   assert.deepEqual(events[5].body, {
     status: "review",
     assigned_to: "poc-aegis-cloud",
     resolution: "alpha\nbeta",
+    metadata: {
+      policy_mvp: {
+        completion_id: expectedCompletionId,
+        input_hash: expectedInputHash,
+        output_hash: expectedOutputHash,
+        policy_version: "antonin-policy-v0",
+      },
+    },
     error_message: "",
   });
   const ledgerText = await readFile(
@@ -626,8 +686,10 @@ test("processOne reconciles ambiguous token and task mutations before appending 
   assert.equal(result.outcome, "review");
   assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 1 });
   assert.equal(
-    tokenRecord.sessionId,
-    "antonin-policy-engine:policy-mvp:task-42:fence-1",
+    tokenRecord.sessionId.startsWith(
+      "antonin-policy-engine:policy-mvp:completion-",
+    ),
+    true,
   );
   assert.equal(taskState.status, "review");
   assert.equal(taskState.assigned_to, "poc-aegis-cloud");
@@ -646,10 +708,222 @@ test("processOne reconciles ambiguous token and task mutations before appending 
   assert.equal(entry.task_update.resolution, null);
 });
 
+test("an ambiguous token attempt outside the visible 100 is never posted again", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const counts = { queue: 0, tokenPost: 0, ollama: 0 };
+  const lateRecords = Array.from({ length: 100 }, (_, index) => ({
+    id: `newer-${index}`,
+    sessionId: `unrelated-session-${index}`,
+  }));
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      counts.queue += 1;
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tokens?action=list&timeframe=all") {
+      sendJson(response, 200, {
+        usage: lateRecords,
+        total: lateRecords.length + 1,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      counts.tokenPost += 1;
+      await readJson(request);
+      response.socket.destroy();
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    counts.ollama += 1;
+    sendJson(response, 200, {
+      choices: [{ message: { content: "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+  const config = processConfig(state, {
+    mcUrl,
+    localEndpoint: `${localEndpoint}/v1`,
+  });
+
+  await assert.rejects(processOne(config), /completion pending reconciliation/);
+  await assert.rejects(processOne(config), /completion pending reconciliation/);
+
+  assert.deepEqual(counts, { queue: 1, tokenPost: 1, ollama: 1 });
+  const journal = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  const [entry] = Object.values(journal.entries);
+  assert.equal(entry.token_attempted, true);
+  assert.equal(entry.token_ambiguous, true);
+  assert.equal(entry.phases.token_confirmed, false);
+  assert.equal((await stat(path.join(state.stateDirectory, "completions.json"))).mode & 0o777, 0o600);
+});
+
+test("an unrelated review cannot confirm this completion and the exact metadata is preserved", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let tokenRecord = null;
+  let taskPut = null;
+  let taskState = {
+    ...queuedTask({ metadata: { existing: "keep", policy_mvp: { previous: "keep" } } }),
+    status: "review",
+    assigned_to: "poc-aegis-cloud",
+    resolution: "unrelated result",
+    metadata: {
+      existing: "keep",
+      policy_mvp: { completion_id: "unrelated", previous: "keep" },
+    },
+  };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      sendJson(
+        response,
+        200,
+        queueResponse(
+          queuedTask({ metadata: { existing: "keep", policy_mvp: { previous: "keep" } } }),
+        ),
+      );
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tokens?action=list&timeframe=all") {
+      sendJson(response, 200, {
+        usage: tokenRecord === null ? [] : [tokenRecord],
+        total: tokenRecord === null ? 0 : 1,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      const body = await readJson(request);
+      tokenRecord = { id: "token-exact", ...body };
+      sendJson(response, 200, { success: true, record: tokenRecord });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    if (request.method === "PUT" && request.url === "/api/tasks/42") {
+      taskPut = await readJson(request);
+      taskState = { ...taskState, ...taskPut };
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    sendJson(response, 200, {
+      choices: [{ message: { content: "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+
+  const result = await processOne(
+    processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+  );
+  const journal = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  const [entry] = Object.values(journal.entries);
+
+  assert.equal(result.outcome, "review");
+  assert.equal(taskPut.resolution, "alpha\nbeta");
+  assert.equal(taskPut.metadata.existing, "keep");
+  assert.equal(taskPut.metadata.policy_mvp.previous, "keep");
+  assert.deepEqual(taskPut.metadata.policy_mvp, {
+    previous: "keep",
+    completion_id: entry.completion_id,
+    input_hash: entry.receipt.input_hash,
+    output_hash: entry.receipt.output_hash,
+    policy_version: entry.receipt.policy_version,
+  });
+  assert.equal(taskState.metadata.policy_mvp.completion_id, entry.completion_id);
+});
+
+test("a delayed Mission Control request does not hold the global lease lock", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let announceTokenList;
+  const tokenListStarted = new Promise((resolve) => {
+    announceTokenList = resolve;
+  });
+  let releaseTokenList;
+  const tokenListMayFinish = new Promise((resolve) => {
+    releaseTokenList = resolve;
+  });
+  let tokenRecord = null;
+  let taskState = {
+    ...queuedTask(),
+    status: "in_progress",
+    assigned_to: "antonin-policy-engine",
+  };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tokens?action=list&timeframe=all") {
+      announceTokenList();
+      await tokenListMayFinish;
+      sendJson(response, 200, {
+        usage: tokenRecord === null ? [] : [tokenRecord],
+        total: tokenRecord === null ? 0 : 1,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      const body = await readJson(request);
+      tokenRecord = { id: "token-delayed", ...body };
+      sendJson(response, 200, { success: true, record: tokenRecord });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    if (request.method === "PUT" && request.url === "/api/tasks/42") {
+      taskState = { ...taskState, ...(await readJson(request)) };
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    sendJson(response, 200, {
+      choices: [{ message: { content: "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+
+  const processing = processOne(
+    processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+  );
+  await tokenListStarted;
+  const contender = new LeaseStore(state.stateDirectory, {
+    ...state.stateStoreOptions,
+    lockRetryMs: 1,
+    lockMaxAttempts: 3,
+  });
+  const attempt = await contender
+    .acquire("independent-task", "independent-owner", {
+      ttlMs: 10_000,
+      taskVersion: 1,
+    })
+    .then((lease) => ({ lease }), (error) => ({ error }));
+  releaseTokenList();
+  await processing;
+
+  assert.equal(attempt.error, undefined);
+  assert.equal(attempt.lease.task_id, "independent-task");
+});
+
 test("processOne resumes the first unconfirmed completion phase without re-running Ollama", async (t) => {
   const state = await temporaryPolicyState(t);
   const counts = { queue: 0, tokenPost: 0, taskPut: 0, ollama: 0 };
-  let allowTokenPost = false;
+  let allowTaskPut = false;
   let tokenRecord = null;
   let taskState = {
     ...queuedTask(),
@@ -673,10 +947,6 @@ test("processOne resumes the first unconfirmed completion phase without re-runni
     if (request.method === "POST" && request.url === "/api/tokens") {
       counts.tokenPost += 1;
       const body = await readJson(request);
-      if (!allowTokenPost) {
-        sendJson(response, 503, { error: "temporarily unavailable" });
-        return;
-      }
       tokenRecord = { id: "token-resumed", ...body };
       sendJson(response, 200, { success: true, record: tokenRecord });
       return;
@@ -688,6 +958,10 @@ test("processOne resumes the first unconfirmed completion phase without re-runni
     if (request.method === "PUT" && request.url === "/api/tasks/42") {
       counts.taskPut += 1;
       const body = await readJson(request);
+      if (!allowTaskPut) {
+        sendJson(response, 503, { error: "temporarily unavailable" });
+        return;
+      }
       taskState = { ...taskState, ...body };
       sendJson(response, 200, { task: taskState });
       return;
@@ -707,15 +981,15 @@ test("processOne resumes the first unconfirmed completion phase without re-runni
   });
 
   await assert.rejects(processOne(config), /completion pending reconciliation/);
-  assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 0, ollama: 1 });
+  assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 1, ollama: 1 });
   const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
   assert.equal((await ledger.verify()).records, 0);
 
-  allowTokenPost = true;
+  allowTaskPut = true;
   const result = await processOne(config);
 
   assert.equal(result.outcome, "review");
-  assert.deepEqual(counts, { queue: 1, tokenPost: 2, taskPut: 1, ollama: 1 });
+  assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 2, ollama: 1 });
   assert.equal((await ledger.verify()).records, 1);
   await assertLeaseReleased(state);
 });
@@ -779,15 +1053,15 @@ test("confirmed Mission Control mutations remain pending when the receipt ledger
     /completion pending reconciliation.*malformed JSON/i,
   );
 
-  assert.equal(tokenRecord.sessionId.endsWith(":fence-1"), true);
-  assert.deepEqual(updates, [
-    {
-      status: "review",
-      assigned_to: "poc-aegis-cloud",
-      resolution: "alpha\nbeta",
-      error_message: "",
-    },
-  ]);
+  assert.match(
+    tokenRecord.sessionId,
+    /^antonin-policy-engine:policy-mvp:completion-[a-f0-9]{64}$/,
+  );
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].status, "review");
+  assert.equal(updates[0].assigned_to, "poc-aegis-cloud");
+  assert.equal(updates[0].resolution, "alpha\nbeta");
+  assert.match(updates[0].metadata.policy_mvp.completion_id, /^[a-f0-9]{64}$/);
   const journal = JSON.parse(
     await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
   );
@@ -852,6 +1126,7 @@ test("a release cleanup failure cannot reclassify a confirmed completion", async
   );
   const leaseStore = {
     acquire: realLeaseStore.acquire.bind(realLeaseStore),
+    renew: realLeaseStore.renew.bind(realLeaseStore),
     withCompletionGuard:
       realLeaseStore.withCompletionGuard.bind(realLeaseStore),
     release: async () => {
@@ -866,14 +1141,11 @@ test("a release cleanup failure cannot reclassify a confirmed completion", async
 
   assert.equal(result.outcome, "review");
   assert.match(result.cleanupWarning, /release cleanup failure/);
-  assert.deepEqual(updates, [
-    {
-      status: "review",
-      assigned_to: "poc-aegis-cloud",
-      resolution: "alpha\nbeta",
-      error_message: "",
-    },
-  ]);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].status, "review");
+  assert.equal(updates[0].assigned_to, "poc-aegis-cloud");
+  assert.equal(updates[0].resolution, "alpha\nbeta");
+  assert.match(updates[0].metadata.policy_mvp.completion_id, /^[a-f0-9]{64}$/);
   const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
   assert.equal((await ledger.verify()).records, 1);
   const [receipt] = (await readFile(ledger.filePath, "utf8"))
@@ -931,8 +1203,118 @@ test("processOne records a guarded failure, attempts awaiting_owner, and release
   await assertLeaseReleased(state);
 });
 
+test("lease acquisition contention causes no compensating Mission Control mutation", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const holder = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
+  await holder.acquire("42", "replacement-owner", {
+    ttlMs: 60_000,
+    taskVersion: 7,
+  });
+  const counts = { queue: 0, taskPut: 0, ollama: 0 };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      counts.queue += 1;
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "PUT") {
+      counts.taskPut += 1;
+      await readJson(request);
+      sendJson(response, 200, { task: { id: 42, status: "awaiting_owner" } });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    counts.ollama += 1;
+    sendJson(response, 500, { error: "must not run" });
+  });
+
+  await assert.rejects(
+    processOne(
+      processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+    ),
+    /lease is unavailable/,
+  );
+
+  assert.deepEqual(counts, { queue: 1, taskPut: 0, ollama: 0 });
+  assert.equal(
+    (await holder.assertCurrent("42", "replacement-owner", 1)).fencing_token,
+    1,
+  );
+});
+
+test("takeover between failure receipt and recovery blocks compensation and release", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let clock = 10;
+  const leaseOptions = { ...state.stateStoreOptions, now: () => clock };
+  const holder = new LeaseStore(state.stateDirectory, leaseOptions);
+  const contender = new LeaseStore(state.stateDirectory, leaseOptions);
+  let releaseCalls = 0;
+  let injectedTakeover = null;
+  const leaseStore = {
+    acquire: holder.acquire.bind(holder),
+    renew: holder.renew.bind(holder),
+    withCompletionGuard: async (...arguments_) => {
+      const result = await holder.withCompletionGuard(...arguments_);
+      if (injectedTakeover === null) {
+        clock += 1_000_000;
+        injectedTakeover = await contender.acquire("42", "replacement-owner", {
+          ttlMs: 60_000,
+          taskVersion: 7,
+        });
+      }
+      return result;
+    },
+    release: async (...arguments_) => {
+      releaseCalls += 1;
+      return holder.release(...arguments_);
+    },
+  };
+  const taskUpdates = [];
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "PUT") {
+      taskUpdates.push(await readJson(request));
+      sendJson(response, 200, { task: { id: 42, status: "awaiting_owner" } });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    sendJson(response, 500, { error: "local model unavailable" });
+  });
+
+  await assert.rejects(
+    processOne(
+      processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+      { leaseStore, now: () => clock, networkTimeoutMs: 20 },
+    ),
+    /lease is not current/,
+  );
+
+  assert.equal(injectedTakeover.fencing_token, 2);
+  assert.deepEqual(taskUpdates, []);
+  assert.equal(releaseCalls, 0);
+  const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
+  const [receipt] = (await readFile(ledger.filePath, "utf8"))
+    .trimEnd()
+    .split("\n")
+    .map(JSON.parse);
+  assert.equal(receipt.outcome, "failure");
+  assert.equal(
+    (await contender.assertCurrent("42", "replacement-owner", 2)).fencing_token,
+    2,
+  );
+});
+
 test("a replaced fencing token blocks receipt, token post, and review completion", async (t) => {
   const state = await temporaryPolicyState(t);
+  let clock = 10;
+  const leaseOptions = { ...state.stateStoreOptions, now: () => clock };
   const mcRequests = [];
   const mcUrl = await fakeHttpServer(t, async (request, response) => {
     const body = request.method === "GET" ? null : await readJson(request);
@@ -943,19 +1325,20 @@ test("a replaced fencing token blocks receipt, token post, and review completion
     }
     sendJson(response, 200, { task: { id: 42, status: "awaiting_owner" } });
   });
-  const holder = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
+  const holder = new LeaseStore(state.stateDirectory, leaseOptions);
   let releaseCalls = 0;
   const leaseStore = {
     acquire: holder.acquire.bind(holder),
+    renew: holder.renew.bind(holder),
     withCompletionGuard: holder.withCompletionGuard.bind(holder),
     release: async (...arguments_) => {
       releaseCalls += 1;
       return holder.release(...arguments_);
     },
   };
-  const contender = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
+  const contender = new LeaseStore(state.stateDirectory, leaseOptions);
   const localEndpoint = await fakeHttpServer(t, async (_request, response) => {
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    clock += 1_000_000;
     const takeover = await contender.acquire("42", "replacement-owner", {
       ttlMs: 10_000,
       taskVersion: 7,
@@ -974,7 +1357,7 @@ test("a replaced fencing token blocks receipt, token post, and review completion
         localEndpoint: `${localEndpoint}/v1`,
         leaseTtlMs: 5,
       }),
-      { leaseStore },
+      { leaseStore, now: () => clock, networkTimeoutMs: 20 },
     ),
     /lease is not current/,
   );
@@ -997,6 +1380,103 @@ test("a replaced fencing token blocks receipt, token post, and review completion
     (await contender.assertCurrent("42", "replacement-owner", 2)).fencing_token,
     2,
   );
+});
+
+test("an expired pending completion is rebound to fencing token 2 and resumed", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let clock = 100;
+  const leaseStore = new LeaseStore(state.stateDirectory, {
+    ...state.stateStoreOptions,
+    now: () => clock,
+  });
+  const counts = { queue: 0, tokenPost: 0, taskPut: 0, ollama: 0 };
+  let allowTaskUpdate = false;
+  let tokenRecord = null;
+  let taskState = {
+    ...queuedTask(),
+    status: "in_progress",
+    assigned_to: "antonin-policy-engine",
+  };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      counts.queue += 1;
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tokens?action=list&timeframe=all") {
+      sendJson(response, 200, {
+        usage: tokenRecord === null ? [] : [tokenRecord],
+        total: tokenRecord === null ? 0 : 1,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      counts.tokenPost += 1;
+      tokenRecord = { id: "token-before-expiry", ...(await readJson(request)) };
+      sendJson(response, 200, { success: true, record: tokenRecord });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    if (request.method === "PUT" && request.url === "/api/tasks/42") {
+      counts.taskPut += 1;
+      const body = await readJson(request);
+      if (!allowTaskUpdate) {
+        sendJson(response, 503, { error: "temporarily unavailable" });
+        return;
+      }
+      taskState = { ...taskState, ...body };
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    sendJson(response, 404, { error: "unexpected route" });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    counts.ollama += 1;
+    sendJson(response, 200, {
+      choices: [{ message: { content: "alpha\nbeta" } }],
+      usage: { prompt_tokens: 19, completion_tokens: 5 },
+    });
+  });
+  const config = processConfig(state, {
+    mcUrl,
+    localEndpoint: `${localEndpoint}/v1`,
+    leaseTtlMs: 25,
+  });
+  const dependencies = { leaseStore, now: () => clock, networkTimeoutMs: 20 };
+
+  await assert.rejects(
+    processOne(config, dependencies),
+    /completion pending reconciliation/,
+  );
+  const before = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  const [pending] = Object.values(before.entries);
+  assert.equal(pending.fencing_token, 1);
+  assert.equal(pending.phases.token_confirmed, true);
+
+  clock += 1_000_000;
+  allowTaskUpdate = true;
+  const result = await processOne(config, dependencies);
+  const after = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  const [completed] = Object.values(after.entries);
+
+  assert.equal(result.outcome, "review");
+  assert.equal(result.reconciled, true);
+  assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 2, ollama: 1 });
+  assert.equal(completed.completion_id, pending.completion_id);
+  assert.equal(completed.token_session_id, pending.token_session_id);
+  assert.equal(completed.fencing_token, 2);
+  assert.equal(completed.receipt.fencing_token, 2);
+  assert.equal(completed.receipt.lease_id, "42:2");
+  assert.equal(completed.phases.receipt_confirmed, true);
+  await assertLeaseReleased(state);
 });
 
 test("processOne validates all configuration before claiming a task", async (t) => {
