@@ -37,6 +37,16 @@ if MC_POC_STATE_DIR="$TEST_ROOT/blocked-host" MC_POC_HOST=0.0.0.0 bash "$LAUNCHE
 fi
 assert_contains "$blocked_host_out" "127.0.0.1"
 
+blocked_extra_out="$TEST_ROOT/blocked-extra.out"
+if MC_POC_STATE_DIR="$TEST_ROOT/blocked-extra" MC_POC_EXTRA_ALLOWED_HOSTS='mac.ts.net evil.example' bash "$LAUNCHER" init >"$blocked_extra_out" 2>&1; then
+  fail "extra hosts with spaces must be refused"
+fi
+assert_contains "$blocked_extra_out" "MC_POC_EXTRA_ALLOWED_HOSTS"
+if MC_POC_STATE_DIR="$TEST_ROOT/blocked-extra" MC_POC_EXTRA_ALLOWED_HOSTS='*' bash "$LAUNCHER" init >"$blocked_extra_out" 2>&1; then
+  fail "wildcard extra host must be refused"
+fi
+assert_contains "$blocked_extra_out" "MC_POC_EXTRA_ALLOWED_HOSTS"
+
 state_dir="$TEST_ROOT/runtime"
 init_out="$TEST_ROOT/init.out"
 MC_POC_STATE_DIR="$state_dir" bash "$LAUNCHER" init >"$init_out"
@@ -67,6 +77,29 @@ assert_contains "$config_out" "http://127.0.0.1:4318"
 assert_contains "$config_out" "$state_dir/data"
 if grep -Fq -- "$api_key" "$config_out" || grep -Fq -- "$auth_pass" "$config_out"; then
   fail "config output leaked a credential"
+fi
+
+hosts_state_dir="$TEST_ROOT/runtime-hosts"
+MC_POC_STATE_DIR="$hosts_state_dir" MC_POC_EXTRA_ALLOWED_HOSTS='mac.tailnet-test.ts.net' bash "$LAUNCHER" init >"$TEST_ROOT/hosts-init.out"
+hosts_env_file="$hosts_state_dir/runtime.env"
+assert_contains "$hosts_env_file" "MC_ALLOWED_HOSTS=localhost,127.0.0.1,::1,mac.tailnet-test.ts.net"
+assert_contains "$hosts_env_file" "MC_POC_HOST=127.0.0.1"
+
+hosts_api_key=$(awk -F= '$1=="API_KEY" {print $2}' "$hosts_env_file")
+update_out="$TEST_ROOT/update-hosts.out"
+MC_POC_STATE_DIR="$hosts_state_dir" MC_POC_EXTRA_ALLOWED_HOSTS='other.tailnet-test.ts.net' bash "$LAUNCHER" update-hosts >"$update_out"
+assert_contains "$update_out" "MC_ALLOWED_HOSTS=localhost,127.0.0.1,::1,other.tailnet-test.ts.net"
+assert_contains "$hosts_env_file" "MC_ALLOWED_HOSTS=localhost,127.0.0.1,::1,other.tailnet-test.ts.net"
+[[ "$(stat -f '%Lp' "$hosts_env_file")" == "600" ]] || fail "update-hosts must preserve mode 600"
+[[ "$(awk -F= '$1=="API_KEY" {print $2}' "$hosts_env_file")" == "$hosts_api_key" ]] || fail "update-hosts must not touch credentials"
+if grep -Fq -- "$hosts_api_key" "$update_out"; then
+  fail "update-hosts output leaked a credential"
+fi
+
+MC_POC_STATE_DIR="$hosts_state_dir" bash "$LAUNCHER" update-hosts >"$update_out"
+assert_contains "$hosts_env_file" "MC_ALLOWED_HOSTS=localhost,127.0.0.1,::1"
+if grep -Fq -- "ts.net" "$hosts_env_file"; then
+  fail "update-hosts without extra hosts must reset to the loopback allowlist"
 fi
 
 fake_bin="$TEST_ROOT/fake-bin"

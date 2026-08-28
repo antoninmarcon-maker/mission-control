@@ -33,6 +33,28 @@ ops/antonin-poc/mc-poc.sh rollback
 
 `stop` preserves the active state. `rollback` archives it next to the configured state directory, making restoration a simple directory move after confirming Mission Control is stopped.
 
+## Remote access (private tailnet only)
+
+Decision of 2026-08-28: remote iPhone access goes through a **private Tailscale
+tailnet** (`tailscale serve`, never Funnel). The proxy connects to
+`127.0.0.1:4318` locally, so the loopback-only bind above is unchanged; the
+port is never exposed on any other interface, and `runtime.env` stays local.
+
+The only contract change is the host allowlist. To let Mission Control accept
+the tailnet hostname:
+
+```bash
+export MC_POC_EXTRA_ALLOWED_HOSTS=<mac-name>.<tailnet>.ts.net
+ops/antonin-poc/mc-poc.sh update-hosts
+ops/antonin-poc/mc-poc.sh stop && ops/antonin-poc/mc-poc.sh start
+```
+
+`update-hosts` rewrites only the `MC_ALLOWED_HOSTS` line (secrets untouched,
+mode 600 preserved); running it without the variable resets the allowlist to
+loopback only, which is the application-level kill switch. Operational runbook
+and network kill switch live in the ops repo
+(`runbooks/mission-control-acces-distant.md`).
+
 ## Tests
 
 ```bash

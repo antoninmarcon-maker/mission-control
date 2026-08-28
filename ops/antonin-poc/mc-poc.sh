@@ -6,6 +6,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 STATE_DIR=${MC_POC_STATE_DIR:-}
 PORT=${MC_POC_PORT:-4318}
 HOST=${MC_POC_HOST:-127.0.0.1}
+EXTRA_HOSTS=${MC_POC_EXTRA_ALLOWED_HOSTS:-}
 
 die() {
   echo "ERROR: $*" >&2
@@ -20,6 +21,15 @@ validate_scope() {
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "MC_POC_PORT must be numeric"
   (( PORT >= 1 && PORT <= 65535 )) || die "MC_POC_PORT must be between 1 and 65535"
   [[ "$PORT" != "4317" ]] || die "port 4317 is reserved for the existing Dash"
+  if [[ -n "$EXTRA_HOSTS" ]]; then
+    [[ "$EXTRA_HOSTS" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || die "MC_POC_EXTRA_ALLOWED_HOSTS must be comma-separated hostnames (no spaces, no wildcards)"
+  fi
+}
+
+allowed_hosts() {
+  local hosts='localhost,127.0.0.1,::1'
+  [[ -z "$EXTRA_HOSTS" ]] || hosts="$hosts,$EXTRA_HOSTS"
+  printf '%s\n' "$hosts"
 }
 
 env_file() { printf '%s/runtime.env\n' "$STATE_DIR"; }
@@ -37,7 +47,7 @@ write_runtime_env() {
   {
     printf 'PORT=%q\n' "$PORT"
     printf 'MC_POC_HOST=%q\n' "$HOST"
-    printf 'MC_ALLOWED_HOSTS=%s\n' 'localhost,127.0.0.1,::1'
+    printf 'MC_ALLOWED_HOSTS=%s\n' "$(allowed_hosts)"
     printf 'NEXT_PUBLIC_GATEWAY_OPTIONAL=%q\n' 'true'
     printf 'MISSION_CONTROL_DATA_DIR=%q\n' "$STATE_DIR/data"
     printf 'MISSION_CONTROL_TOKENS_PATH=%q\n' "$STATE_DIR/data/mission-control-tokens.json"
@@ -180,8 +190,22 @@ rollback_state() {
   echo "Archived POC state to: $archive"
 }
 
+update_hosts() {
+  validate_scope
+  local runtime_env tmp
+  runtime_env=$(env_file)
+  [[ -f "$runtime_env" ]] || die "runtime state is not initialized"
+  umask 077
+  tmp="$STATE_DIR/runtime.env.tmp"
+  awk -v line="MC_ALLOWED_HOSTS=$(allowed_hosts)" '/^MC_ALLOWED_HOSTS=/ {print line; next} {print}' "$runtime_env" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$runtime_env"
+  echo "MC_ALLOWED_HOSTS=$(allowed_hosts)"
+  echo "Restart Mission Control (stop, then start) to apply the new host allowlist."
+}
+
 usage() {
-  echo "Usage: MC_POC_STATE_DIR=/absolute/path $0 init|start|status|stop|rollback|config"
+  echo "Usage: MC_POC_STATE_DIR=/absolute/path $0 init|start|status|stop|rollback|config|update-hosts"
 }
 
 command=${1:-}
@@ -192,5 +216,6 @@ case "$command" in
   stop) stop_server ;;
   rollback) rollback_state ;;
   config) show_config ;;
+  update-hosts) update_hosts ;;
   *) usage; exit 2 ;;
 esac
