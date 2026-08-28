@@ -19,17 +19,25 @@ import {
 } from "./mc-client.mjs";
 import { OllamaClient } from "./ollama-client.mjs";
 import {
-  admitAttempt,
+  FAILURE_KINDS,
+  buildRouteLadder,
+  classifyFailure,
   completionIdentityFields,
   evaluateTask,
+  isFallbackEligible,
   percentile90,
+  resolveNextAttempt,
   validateLoopbackHttpUrl,
 } from "./policy-core.mjs";
+import { CloudSubprocessRunner } from "./cloud-runner.mjs";
 import {
   CLOUD_PROVIDERS,
+  CLOUD_RUNNER_DEFAULTS,
+  DEFAULT_LOCAL_LADDER_MODELS,
   OWNER_DECISIONS_TAKEN,
   OWNER_DECISION_PLACEHOLDERS,
   PROVIDER_PLANS,
+  parseRoute,
   planKey,
   resolveQuotaPolicy,
 } from "./quota-config.mjs";
@@ -41,6 +49,10 @@ const DEFAULT_REVIEWER = "poc-aegis-cloud";
 const DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:11434/v1";
 const DEFAULT_LOCAL_MODEL = "qwen2.5-coder:7b";
 const DEFAULT_LEASE_TTL_MS = 120_000;
+const DEFAULT_CLOUD_TIMEOUT_MS = 180_000;
+const CLOUD_RUNNER_WORKING_DIRECTORY = "runner-cwd";
+const ATTEMPT_LOG_LIMIT = 5;
+const MAX_RESOLUTION_LENGTH = 5_000;
 const DEFAULT_NETWORK_TIMEOUT_MS = 120_000;
 const NETWORK_LEASE_MARGIN_MS = 1_000;
 const MAX_ERROR_LENGTH = 320;
@@ -74,6 +86,21 @@ class TokenReconciliationRequiredError extends Error {
       `token accounting requires manual reconciliation for session ${sessionId}`,
     );
     this.name = "TokenReconciliationRequiredError";
+  }
+}
+
+/**
+ * Raised when an invocation ends outside the execution path — planning failed,
+ * or the deferral/owner hand-off failed — *after* the lease has already been
+ * handed back. The message is preserved verbatim so an operator sees the real
+ * cause (a corrupt `quotas.json`, a refused PUT) rather than a wrapper; the
+ * class only tells the caller that the failure-recovery path must not run
+ * again on a lease this invocation no longer holds.
+ */
+class AttemptHandoffError extends Error {
+  constructor(error) {
+    super(error?.message ?? "unknown failure");
+    this.name = "AttemptHandoffError";
   }
 }
 
@@ -449,6 +476,45 @@ function completionEntry({
   };
 }
 
+/**
+ * §4.7 `route_chain` is bounded to 512 characters by the receipt validator, so
+ * it is built from the most recent rungs that fit. Truncating here rather than
+ * failing keeps a long history from breaking a completion that already
+ * happened — and the chain is a summary, with the attempt log carrying the
+ * detail.
+ */
+function buildRouteChain(routes, limit = 512) {
+  const kept = [];
+  for (const route of [...routes].reverse()) {
+    const candidate = [route, ...kept].join(">");
+    if (candidate.length > limit) break;
+    kept.unshift(route);
+  }
+  return kept.length === 0 ? routes.at(-1).slice(0, limit) : kept.join(">");
+}
+
+function routeModelName(route) {
+  const parsed = parseRoute(route);
+  return parsed?.provider === "ollama" ? parsed.detail : route;
+}
+
+/**
+ * The local resolution cap applies to every rung. The message names the
+ * provider whose answer was too long, and `failureKind` is declared only for a
+ * local rung: §3 has no cloud output kind, so an oversized cloud answer stays
+ * `unknown` and fails closed to the owner.
+ */
+function resolutionLimitError(provider) {
+  if (provider === "ollama") {
+    return new Error("Ollama response exceeds the task resolution limit");
+  }
+  const error = new Error(
+    `${provider} response exceeds the task resolution limit`,
+  );
+  error.provider = provider;
+  return error;
+}
+
 function taskConfirmsCompletion(task, entry) {
   const expectedPolicyMetadata = entry.task_update.metadata?.policy_mvp;
   const actualPolicyMetadata = task?.metadata?.policy_mvp;
@@ -734,35 +800,64 @@ async function estimateRouteCost(receiptLedger, route) {
 }
 
 /**
- * §4.4-§4.5 admission. The pure decision comes from `admitAttempt`; claiming
- * the canaries it asks for is done here, because that claim is a
- * compare-and-set on persistent state (§2.6).
+ * A route cost is read from the evidence already on disk (§2.7). The lookup
+ * handed to the pure planner has to be synchronous, so the tail of the ledger
+ * is read once per route per invocation and memoised here.
  */
-async function resolveAdmission({
-  decision,
+async function routeCostLookup(receiptLedger, routes, cache) {
+  for (const route of routes) {
+    if (!cache.has(route)) {
+      cache.set(route, await estimateRouteCost(receiptLedger, route));
+    }
+  }
+  return (route) => cache.get(route) ?? null;
+}
+
+/**
+ * §4.1-§4.5 one attempt: choose the rung, admit it, and claim the canaries the
+ * admission asked for. Everything that decides is pure (`resolveNextAttempt`);
+ * everything here is the state it needs — the snapshot, the cost history, and
+ * the compare-and-set that stops two invocations both believing they are the
+ * canary (§2.6).
+ */
+async function resolveAttempt({
   normalized,
+  ladder,
+  failureKind,
+  attemptedRoutes,
   quotaStore,
   receiptLedger,
+  costCache,
   now,
 }) {
   const snapshot = await quotaStore.snapshot(now);
   await quotaStore.recordSnapshot(snapshot);
   const reviewerRoute = reviewerRouteOf(normalized);
-  const admission = admitAttempt({
+  const costForRoute = await routeCostLookup(
+    receiptLedger,
+    [
+      ...ladder.local.map((entry) => entry.route),
+      ...ladder.cloud.map((entry) => entry.route),
+      reviewerRoute,
+    ],
+    costCache,
+  );
+  const outcome = resolveNextAttempt({
     riskClass: "mechanical",
-    executorRoute: decision.route,
+    failureKind,
+    attemptedRoutes,
+    ladder,
     reviewerRoute,
     snapshot,
-    executorCostTokens: await estimateRouteCost(receiptLedger, decision.route),
-    reviewerCostTokens: await estimateRouteCost(receiptLedger, reviewerRoute),
     policy: normalized.quotaPolicy,
     now,
+    costForRoute,
   });
-  if (admission.decision !== "execute") {
-    return { ...admission, snapshotId: snapshot.snapshot_id };
+  if (outcome.decision !== "execute") {
+    return { ...outcome, snapshotId: snapshot.snapshot_id };
   }
 
-  for (const claim of admission.canaryClaims) {
+  for (const claim of outcome.canaryClaims) {
     const claimed = await quotaStore.claimCanary(claim.provider, claim.window_id, {
       plan: claim.plan,
       now,
@@ -772,6 +867,9 @@ async function resolveAdmission({
       // compare-and-set. Nothing has been spent here, so this one waits.
       return {
         decision: "defer",
+        route: null,
+        kind: null,
+        attempt: outcome.attempt,
         reasonCode: "canary_claimed_by_a_concurrent_invocation",
         deferredUntil: now + normalized.quotaPolicy.canaryIntervalMs,
         canaryClaims: [],
@@ -779,16 +877,40 @@ async function resolveAdmission({
       };
     }
   }
-  return { ...admission, snapshotId: snapshot.snapshot_id };
+  return { ...outcome, snapshotId: snapshot.snapshot_id };
 }
 
 /**
- * §4.6 a deferral is not work: no completion journal entry, no token record
- * and no receipt. The task goes back to the policy agent with an
- * operator-visible instant, merged into metadata read moments ago by the queue
- * claim so a concurrent operator edit is not clobbered.
+ * §4.7 the attempt history that survives process exit: route identifiers and
+ * enum values only, never a prompt, never model output, never an error string
+ * that could carry task content. Anything else in that array — an operator
+ * edit, a truncated write — is ignored rather than trusted.
  */
-function deferredTaskUpdate({ task, agent, deferredUntil, reasonCode }) {
+function readAttemptLog(task) {
+  const stored = task?.metadata?.policy_mvp?.attempt_log;
+  if (!Array.isArray(stored)) return [];
+  return stored
+    .filter(
+      (entry) =>
+        entry !== null &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        typeof entry.route === "string" &&
+        entry.route.length > 0 &&
+        entry.route.length <= 512 &&
+        FAILURE_KINDS.includes(entry.failure_kind) &&
+        typeof entry.at === "string" &&
+        entry.at.length <= 64,
+    )
+    .map((entry) => ({
+      route: entry.route,
+      failure_kind: entry.failure_kind,
+      at: entry.at,
+    }))
+    .slice(-ATTEMPT_LOG_LIMIT);
+}
+
+function mergedPolicyMetadata(task, fields) {
   const freshMetadata =
     task?.metadata !== null &&
     typeof task?.metadata === "object" &&
@@ -801,17 +923,112 @@ function deferredTaskUpdate({ task, agent, deferredUntil, reasonCode }) {
     !Array.isArray(freshMetadata.policy_mvp)
       ? freshMetadata.policy_mvp
       : {};
+  return { ...freshMetadata, policy_mvp: { ...freshPolicyMetadata, ...fields } };
+}
+
+/**
+ * §4.3 the ladder ran out, or the attempt ceiling did. That is a decision, not
+ * a crash: the task goes to Antonin with the attempt history attached and the
+ * invocation exits 0, exactly as a deferral does.
+ */
+function ownerTaskUpdate({ task, reasonCode, attemptLog, policyVersion }) {
+  return {
+    status: "awaiting_owner",
+    metadata: mergedPolicyMetadata(
+      task,
+      attemptLog.length === 0 ? {} : { attempt_log: attemptLog },
+    ),
+    error_message: `Policy ${policyVersion} requires owner: ${reasonCode}`,
+  };
+}
+
+/**
+ * §4.6 a deferral is not work, and §4.3's owner handoff is a decision rather
+ * than a crash: both write no completion journal entry, no token record and no
+ * receipt, release the lease, and exit 0. The attempt history rides along so
+ * the next invocation resumes the ladder where this one left it.
+ */
+async function concludeWithoutExecution({
+  plan,
+  task,
+  taskId,
+  decision,
+  attemptLog,
+  normalized,
+  missionControl,
+  leaseStore,
+  lease,
+  recoveryLeaseTtlMs,
+}) {
+  const deferredUntil =
+    plan.decision === "defer"
+      ? new Date(plan.deferredUntil).toISOString()
+      : null;
+  // A stale owner exits without mutating anything: the lease is renewed to a
+  // TTL longer than the bounded HTTP call, and a takeover in the meantime
+  // stops this hand-off before it can touch a task it no longer owns.
+  await renewForNetwork(
+    leaseStore,
+    { task_id: taskId, owner: normalized.agent, fencing_token: lease.fencing_token },
+    recoveryLeaseTtlMs,
+  );
+  let mutationError = null;
+  try {
+    await missionControl.updateTask(
+      task.id,
+      deferredUntil === null
+        ? ownerTaskUpdate({
+            task,
+            reasonCode: plan.reasonCode,
+            attemptLog,
+            policyVersion: decision.policyVersion,
+          })
+        : deferredTaskUpdate({
+            task,
+            agent: normalized.agent,
+            deferredUntil,
+            reasonCode: plan.reasonCode,
+            attemptLog,
+          }),
+    );
+  } catch (error) {
+    mutationError = error;
+  }
+  const cleanupWarning = await releaseLeaseForCleanup(
+    leaseStore,
+    taskId,
+    normalized.agent,
+    lease.fencing_token,
+  );
+  if (mutationError !== null) {
+    throw new AttemptHandoffError(
+      new Error(safeErrorMessage(mutationError, normalized.mcApiKey)),
+    );
+  }
+  return {
+    ...(deferredUntil === null
+      ? { outcome: "awaiting_owner", processed: 1, taskId: task.id }
+      : { outcome: "deferred", processed: 0, taskId: task.id, deferredUntil }),
+    reasonCode: plan.reasonCode,
+    ...(cleanupWarning ? { cleanupWarning } : {}),
+  };
+}
+
+/**
+ * §4.6 a deferral is not work: no completion journal entry, no token record
+ * and no receipt. The task goes back to the policy agent with an
+ * operator-visible instant, merged into metadata read moments ago by the queue
+ * claim so a concurrent operator edit is not clobbered.
+ */
+function deferredTaskUpdate({ task, agent, deferredUntil, reasonCode, attemptLog }) {
   return {
     status: "assigned",
     assigned_to: agent,
-    metadata: {
-      ...freshMetadata,
-      policy_mvp: {
-        ...freshPolicyMetadata,
-        deferred_until: deferredUntil,
-        deferred_reason: reasonCode,
-      },
-    },
+    metadata: mergedPolicyMetadata(task, {
+      deferred_until: deferredUntil,
+      deferred_reason: reasonCode,
+      ...(attemptLog.length === 0 ? {} : { attempt_log: attemptLog }),
+    }),
     error_message: `Policy deferred this task until ${deferredUntil}: ${reasonCode}`,
   };
 }
@@ -877,6 +1094,12 @@ function validateProcessConfig(config = {}) {
 
   const reviewerProvider = normalizeReviewerProvider(config.reviewerProvider);
   const quotaPolicy = resolveQuotaPolicy(config.quotaPolicyOverrides ?? {});
+  const localModels = normalizeLocalModels(config.localModels);
+  const cloudRunners = normalizeCloudRunners(config.cloudRunners);
+  const cloudTimeoutMs = positiveInteger(
+    config.cloudTimeoutMs ?? DEFAULT_CLOUD_TIMEOUT_MS,
+    "ANTONIN_CLOUD_TIMEOUT_MS",
+  );
 
   return {
     stateDirectory,
@@ -888,10 +1111,50 @@ function validateProcessConfig(config = {}) {
     reviewerProvider,
     localEndpoint,
     localModel,
+    localModels,
+    cloudRunners,
+    cloudTimeoutMs,
     leaseTtlMs,
     quotaPolicy,
     pocRuntimeDirectory,
   };
+}
+
+/** §4.1 rungs 2-3: the other local models this machine may fall back to. */
+function normalizeLocalModels(value) {
+  if (value === undefined || value === null) return DEFAULT_LOCAL_LADDER_MODELS;
+  const models = Array.isArray(value)
+    ? value
+    : String(value)
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== "");
+  for (const model of models) {
+    requireNonEmptyString(model, "ANTONIN_LOCAL_MODELS");
+  }
+  return models;
+}
+
+/**
+ * §7 the runner invocation per provider. It is configuration and not a
+ * constant because the CLIs are not this repository's contract: `codex` is not
+ * even installed on this machine, and a flag can change under us. An operator
+ * corrects the argv through the environment; a wrong one fails as
+ * `cloud_auth_missing` and drops that provider for the run.
+ */
+function normalizeCloudRunners(overrides = {}) {
+  const runners = {};
+  for (const provider of CLOUD_PROVIDERS) {
+    const declared = overrides?.[provider] ?? {};
+    const command = declared.command ?? CLOUD_RUNNER_DEFAULTS[provider].command;
+    const args = declared.args ?? CLOUD_RUNNER_DEFAULTS[provider].args;
+    requireNonEmptyString(command, `${provider} runner command`);
+    if (!Array.isArray(args) || args.some((entry) => typeof entry !== "string")) {
+      throw new TypeError(`${provider} runner args must be an array of strings`);
+    }
+    runners[provider] = { command, args: [...args] };
+  }
+  return runners;
 }
 
 function environmentNumber(environment, name) {
@@ -912,6 +1175,34 @@ function environmentBoolean(environment, name) {
   throw new TypeError(`${name} must be true or false`);
 }
 
+function environmentArgv(environment, name) {
+  const raw = environment[name];
+  if (raw === undefined || String(raw).trim() === "") return undefined;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new TypeError(`${name} must be a JSON array of strings`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) {
+    throw new TypeError(`${name} must be a JSON array of strings`);
+  }
+  return parsed;
+}
+
+function cloudRunnersFromEnvironment(environment) {
+  return {
+    "claude-code": {
+      command: environment.ANTONIN_CLAUDE_CLI,
+      args: environmentArgv(environment, "ANTONIN_CLAUDE_CLI_ARGS"),
+    },
+    codex: {
+      command: environment.ANTONIN_CODEX_CLI,
+      args: environmentArgv(environment, "ANTONIN_CODEX_CLI_ARGS"),
+    },
+  };
+}
+
 function quotaPolicyOverridesFromEnvironment(environment) {
   return {
     warnThreshold: environmentNumber(environment, "ANTONIN_QUOTA_WARN_THRESHOLD"),
@@ -927,6 +1218,17 @@ function quotaPolicyOverridesFromEnvironment(environment) {
       environment,
       "ANTONIN_QUOTA_ADMIT_REVIEWS",
     ),
+    // §5.11 was answered "Autoriser": this override can only close the gate.
+    cloudSubprocessAllowed: environmentBoolean(
+      environment,
+      "ANTONIN_CLOUD_SUBPROCESS",
+    ),
+    maxAttempts: environmentNumber(environment, "ANTONIN_MAX_ATTEMPTS"),
+    operatorTimeZone:
+      environment.ANTONIN_OPERATOR_TZ === undefined ||
+      String(environment.ANTONIN_OPERATOR_TZ).trim() === ""
+        ? undefined
+        : String(environment.ANTONIN_OPERATOR_TZ).trim(),
     maxStalenessMs: environmentNumber(
       environment,
       "ANTONIN_QUOTA_MAX_STALENESS_MS",
@@ -972,6 +1274,9 @@ export function configFromEnvironment(environment = process.env) {
     leaseTtlMs:
       environment.ANTONIN_LEASE_TTL_MS ?? DEFAULT_LEASE_TTL_MS,
     quotaPolicyOverrides: quotaPolicyOverridesFromEnvironment(environment),
+    localModels: environment.ANTONIN_LOCAL_MODELS,
+    cloudRunners: cloudRunnersFromEnvironment(environment),
+    cloudTimeoutMs: environmentNumber(environment, "ANTONIN_CLOUD_TIMEOUT_MS"),
   });
 }
 
@@ -993,14 +1298,89 @@ async function releaseLeaseForCleanup(leaseStore, taskId, owner, fencingToken) {
   }
 }
 
-function recoveryLeaseTtl(configuredTtlMs, missionControl, ollama, override) {
+function recoveryLeaseTtl(configuredTtlMs, missionControl, ollama, override, cloudTimeoutMs = 0) {
   const timeoutMs =
     override ??
     Math.max(
       missionControl.timeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS,
       ollama.timeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS,
+      cloudTimeoutMs,
     );
   return Math.max(configuredTtlMs, timeoutMs + NETWORK_LEASE_MARGIN_MS);
+}
+
+/**
+ * §4.1 a rung is a runner. Local rungs stay on the loopback-HTTP client the
+ * MVP shipped; cloud rungs are the §7 subprocess contract, whose working
+ * directory is a dedicated empty directory inside the external state
+ * directory — never the repository, and never a directory holding state the
+ * child could read.
+ */
+async function runnerForRoute(route, normalized, dependencies) {
+  const parsed = parseRoute(route);
+  if (parsed.provider === "ollama") {
+    if (dependencies.ollama !== undefined) return dependencies.ollama;
+    return new OllamaClient({
+      endpoint: normalized.localEndpoint,
+      model: parsed.detail,
+    });
+  }
+  const workingDirectory = path.join(
+    normalized.stateDirectory,
+    CLOUD_RUNNER_WORKING_DIRECTORY,
+  );
+  await mkdir(workingDirectory, { recursive: true, mode: 0o700 });
+  const declared = normalized.cloudRunners[parsed.provider];
+  return new CloudSubprocessRunner({
+    provider: parsed.provider,
+    command: declared.command,
+    args: declared.args,
+    workingDirectory,
+    timeoutMs: normalized.cloudTimeoutMs,
+    outputFormat: parsed.provider === "claude-code" ? "claude_json" : "text",
+    timeZone: normalized.quotaPolicy.operatorTimeZone,
+  });
+}
+
+/**
+ * §2.6 the canary reads the outcome of the attempt it authorised. A refusal
+ * latches the window until its parsed reset; a success proves only that the
+ * window was open at that instant, which is why it carries no fraction.
+ *
+ * Recording is best-effort by construction: a quota write must never fail a
+ * completion that already happened, and `quotas.json` is a routing hint, not
+ * the audit trail.
+ */
+async function recordProviderOutcome({ quotaStore, provider, outcome, error, now }) {
+  if (!CLOUD_PROVIDERS.includes(provider)) return;
+  const plan = PROVIDER_PLANS[provider];
+  try {
+    if (outcome === "refused") {
+      await quotaStore.observe({
+        provider,
+        plan,
+        window_id: error?.quotaWindowId ?? "session_5h",
+        source: "refusal_observed",
+        observed_at: now,
+        remaining_fraction: 0,
+        ...(Number.isSafeInteger(error?.resetsAt)
+          ? { exhausted_until: error.resetsAt }
+          : {}),
+      });
+      return;
+    }
+    for (const windowId of ["weekly", "session_5h"]) {
+      await quotaStore.observe({
+        provider,
+        plan,
+        window_id: windowId,
+        source: "success_observed",
+        observed_at: now,
+      });
+    }
+  } catch {
+    // A routing hint that cannot be written is a routing hint we do without.
+  }
 }
 
 async function adoptPendingCompletion({
@@ -1033,7 +1413,14 @@ async function adoptPendingCompletion({
   );
 }
 
-async function recoverExecutionFailure({
+/**
+ * The audit record of an attempt that produced nothing. It is hash-only like
+ * every other receipt, and best-effort: a broken local ledger must not turn a
+ * failed attempt into an unrecoverable invocation. A stale lease is the one
+ * exception — it means this invocation no longer owns the task and must stop
+ * touching it.
+ */
+async function appendFailureReceipt({
   task,
   taskId,
   decision,
@@ -1043,7 +1430,6 @@ async function recoverExecutionFailure({
   attempt,
   leaseStore,
   receiptLedger,
-  missionControl,
   owner,
   recoveryLeaseTtlMs,
 }) {
@@ -1071,6 +1457,40 @@ async function recoverExecutionFailure({
     if (isStaleLeaseError(error)) throw error;
     // Failure receipts remain best-effort when the local ledger itself is broken.
   }
+}
+
+async function recoverExecutionFailure({
+  task,
+  taskId,
+  decision,
+  lease,
+  prompt,
+  completion,
+  attempt,
+  leaseStore,
+  receiptLedger,
+  missionControl,
+  owner,
+  recoveryLeaseTtlMs,
+}) {
+  const leaseEntry = {
+    task_id: taskId,
+    owner,
+    fencing_token: lease.fencing_token,
+  };
+  await appendFailureReceipt({
+    task,
+    taskId,
+    decision,
+    lease,
+    prompt,
+    completion,
+    attempt,
+    leaseStore,
+    receiptLedger,
+    owner,
+    recoveryLeaseTtlMs,
+  });
 
   await renewForNetwork(leaseStore, leaseEntry, recoveryLeaseTtlMs);
   try {
@@ -1131,6 +1551,7 @@ export async function processOne(config, dependencies = {}) {
     missionControl,
     ollama,
     dependencies.networkTimeoutMs,
+    normalized.cloudTimeoutMs,
   );
 
   let pendingCompletion = await completionJournal.firstPending(
@@ -1215,93 +1636,136 @@ export async function processOne(config, dependencies = {}) {
     throw new Error(`lease is unavailable for task ${taskId}`);
   }
 
-  let admission;
-  try {
-    admission = await resolveAdmission({
-      decision,
-      normalized,
-      quotaStore,
-      receiptLedger,
-      now: now(),
-    });
-  } catch (error) {
-    // Admission runs before any provider call, so nothing has been executed:
-    // hand the lease back rather than holding it until the TTL expires.
-    await releaseLeaseForCleanup(
-      leaseStore,
-      taskId,
-      normalized.agent,
-      lease.fencing_token,
-    );
-    throw new Error(safeErrorMessage(error, normalized.mcApiKey));
-  }
-  if (admission.decision !== "execute") {
-    const deferredUntil =
-      admission.decision === "defer"
-        ? new Date(admission.deferredUntil).toISOString()
-        : null;
-    let mutationError = null;
-    try {
-      if (deferredUntil === null) {
-        await moveToAwaitingOwner(
-          missionControl,
-          task.id,
-          `Policy ${decision.policyVersion} requires owner: ${admission.reasonCode}`,
-        );
-      } else {
-        await missionControl.updateTask(
-          task.id,
-          deferredTaskUpdate({
-            task,
-            agent: normalized.agent,
-            deferredUntil,
-            reasonCode: admission.reasonCode,
-          }),
-        );
-      }
-    } catch (error) {
-      mutationError = error;
-    }
-    const cleanupWarning = await releaseLeaseForCleanup(
-      leaseStore,
-      taskId,
-      normalized.agent,
-      lease.fencing_token,
-    );
-    if (mutationError !== null) {
-      throw new Error(safeErrorMessage(mutationError, normalized.mcApiKey));
-    }
-    return {
-      ...(deferredUntil === null
-        ? { outcome: "awaiting_owner", processed: 1, taskId: task.id }
-        : { outcome: "deferred", processed: 0, taskId: task.id, deferredUntil }),
-      reasonCode: admission.reasonCode,
-      ...(cleanupWarning ? { cleanupWarning } : {}),
-    };
-  }
-
   const prompt = localPrompt(task);
-  const attempt = {
-    number: 1,
-    route: decision.route,
-    routeChain: decision.route,
-    quotaSnapshotHash: admission.snapshotId,
-  };
+  const ladder = buildRouteLadder({
+    localModel: normalized.localModel,
+    localModels: normalized.localModels,
+  });
+  const attemptLog = readAttemptLog(task);
+  const costCache = new Map();
+  let attempt = null;
   let completion = null;
   let duration = 0;
   let completedResult;
+
   try {
-    await leaseStore.renew(
-      taskId,
-      normalized.agent,
-      lease.fencing_token,
-      recoveryLeaseTtlMs,
-    );
-    const startedAt = now();
-    completion = await ollama.complete(prompt);
-    duration = Math.max(0, now() - startedAt);
-    if (completion.text.length > 5_000) {
-      throw new Error("Ollama response exceeds the task resolution limit");
+    // §4.2 the fallback loop is bounded by construction to the execution
+    // attempt: it contains the provider call and nothing else. Past this loop
+    // a completion exists, `reconcileCompletion` owns the outcome, and no
+    // route is ever re-planned — which is what makes double execution
+    // impossible rather than merely unlikely.
+    while (completion === null) {
+      let plan;
+      try {
+        plan = await resolveAttempt({
+          normalized,
+          ladder,
+          failureKind: attemptLog.at(-1)?.failure_kind ?? null,
+          attemptedRoutes: attemptLog.map((entry) => entry.route),
+          quotaStore,
+          receiptLedger,
+          costCache,
+          now: now(),
+        });
+      } catch (error) {
+        // Planning runs before any provider call, so nothing has been
+        // executed: hand the lease back rather than holding it to its TTL.
+        await releaseLeaseForCleanup(
+          leaseStore,
+          taskId,
+          normalized.agent,
+          lease.fencing_token,
+        );
+        throw new AttemptHandoffError(error);
+      }
+      if (plan.decision !== "execute") {
+        if (plan.decision !== "defer" && attempt !== null) {
+          // §4.3 the ladder ended with Antonin after real attempts were spent:
+          // the audit chain records that capacity was consumed. A deferral
+          // does not reach here, because §4.6 says a deferral is not work.
+          await appendFailureReceipt({
+            task,
+            taskId,
+            decision,
+            lease,
+            prompt,
+            completion: null,
+            attempt,
+            leaseStore,
+            receiptLedger,
+            owner: normalized.agent,
+            recoveryLeaseTtlMs,
+          });
+        }
+        return await concludeWithoutExecution({
+          plan,
+          task,
+          taskId,
+          decision,
+          attemptLog,
+          normalized,
+          missionControl,
+          leaseStore,
+          lease,
+          recoveryLeaseTtlMs,
+        });
+      }
+
+      const provider = parseRoute(plan.route).provider;
+      attempt = {
+        number: plan.attempt,
+        route: plan.route,
+        routeChain: buildRouteChain([
+          ...attemptLog.map((entry) => entry.route),
+          plan.route,
+        ]),
+        quotaSnapshotHash: plan.snapshotId,
+      };
+      try {
+        const runner = await runnerForRoute(plan.route, normalized, dependencies);
+        await leaseStore.renew(
+          taskId,
+          normalized.agent,
+          lease.fencing_token,
+          recoveryLeaseTtlMs,
+        );
+        const startedAt = now();
+        const produced = await runner.complete(prompt);
+        duration = Math.max(0, now() - startedAt);
+        if (produced.text.length > MAX_RESOLUTION_LENGTH) {
+          throw resolutionLimitError(provider);
+        }
+        await recordProviderOutcome({
+          quotaStore,
+          provider,
+          outcome: "succeeded",
+          now: now(),
+        });
+        completion = produced;
+      } catch (error) {
+        const failureKind = classifyFailure(error, { provider });
+        if (failureKind === "cloud_quota_exhausted") {
+          await recordProviderOutcome({
+            quotaStore,
+            provider,
+            outcome: "refused",
+            error,
+            now: now(),
+          });
+        }
+        if (!isFallbackEligible(failureKind)) {
+          // §4.2 and §3: the completion boundary kinds and anything
+          // unclassified keep the delivered behaviour — failure receipt,
+          // owner, non-zero exit — instead of being re-routed.
+          throw error;
+        }
+        attemptLog.push({
+          route: plan.route,
+          failure_kind: failureKind,
+          at: new Date(now()).toISOString(),
+        });
+        while (attemptLog.length > ATTEMPT_LOG_LIMIT) attemptLog.shift();
+      }
     }
 
     const entry = completionEntry({
@@ -1312,7 +1776,7 @@ export async function processOne(config, dependencies = {}) {
       completion,
       duration,
       owner: normalized.agent,
-      model: normalized.localModel,
+      model: routeModelName(attempt.route),
       now: now(),
       attempt,
     });
@@ -1347,7 +1811,10 @@ export async function processOne(config, dependencies = {}) {
       receiptHash: reconciled.receipt_hash,
     };
   } catch (error) {
-    if (error instanceof CompletionPendingError) {
+    if (
+      error instanceof CompletionPendingError ||
+      error instanceof AttemptHandoffError
+    ) {
       throw new Error(safeErrorMessage(error, normalized.mcApiKey));
     }
     if (isStaleLeaseError(error)) {
@@ -1405,6 +1872,17 @@ export async function runCommand(command, environment = process.env) {
       reviewerProvider: config.reviewerProvider,
       localEndpoint: config.localEndpoint,
       localModel: config.localModel,
+      routeLadder: buildRouteLadder({
+        localModel: config.localModel,
+        localModels: config.localModels,
+      }),
+      cloudRunnerCommands: Object.fromEntries(
+        Object.entries(config.cloudRunners).map(([provider, runner]) => [
+          provider,
+          runner.command,
+        ]),
+      ),
+      cloudSubprocessAllowed: config.quotaPolicy.cloudSubprocessAllowed,
       leaseTtlMs: config.leaseTtlMs,
       apiKeyConfigured: true,
     };

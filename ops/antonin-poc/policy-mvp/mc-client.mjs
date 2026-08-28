@@ -78,6 +78,36 @@ function mutationResponseError(message) {
   return new MissionControlRequestError(message, { ambiguous: true });
 }
 
+/**
+ * Structural equality over JSON values. A field of the policy metadata is not
+ * always a scalar — §4.7's `attempt_log` is an array — and comparing those by
+ * identity would fail every time, because the value read back has been through
+ * JSON and is never the object that was sent.
+ */
+function sameJsonValue(actual, expected) {
+  if (actual === expected) return true;
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      expected.every((value, index) => sameJsonValue(actual[index], value))
+    );
+  }
+  if (expected !== null && typeof expected === "object") {
+    if (actual === null || typeof actual !== "object" || Array.isArray(actual)) {
+      return false;
+    }
+    const expectedKeys = Object.keys(expected).sort();
+    const actualKeys = Object.keys(actual).sort();
+    return (
+      expectedKeys.length === actualKeys.length &&
+      expectedKeys.every((key, index) => key === actualKeys[index]) &&
+      expectedKeys.every((key) => sameJsonValue(actual[key], expected[key]))
+    );
+  }
+  return false;
+}
+
 function completionMetadataMatches(actual, expected) {
   if (expected === undefined) return true;
   if (
@@ -87,8 +117,8 @@ function completionMetadataMatches(actual, expected) {
   ) {
     return false;
   }
-  return Object.entries(expected).every(
-    ([field, value]) => actual[field] === value,
+  return Object.entries(expected).every(([field, value]) =>
+    sameJsonValue(actual[field], value),
   );
 }
 

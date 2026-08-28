@@ -1629,7 +1629,93 @@ test("a release cleanup failure cannot reclassify a confirmed completion", async
   assert.equal(receipt.outcome, "success");
 });
 
-test("processOne records a guarded failure, attempts awaiting_owner, and releases the lease", async (t) => {
+test("a local rung that keeps failing climbs the ladder and then hands the task to the owner", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const mcRequests = [];
+  let taskState = { ...queuedTask() };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    const body = request.method === "GET" ? null : await readJson(request);
+    mcRequests.push({ method: request.method, url: request.url, body });
+    if (request.method === "GET") {
+      sendJson(response, 200, queueResponse(taskState));
+      return;
+    }
+    taskState = { ...taskState, ...body };
+    sendJson(response, 200, { task: taskState });
+  });
+  const models = [];
+  const localEndpoint = await fakeHttpServer(t, async (request, response) => {
+    models.push((await readJson(request)).model);
+    sendJson(response, 500, { error: "local model unavailable" });
+  });
+
+  const result = await processOne(
+    processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+  );
+
+  // §4.3 one same-rung retry for a transient failure, then the next rung,
+  // then the §5.5 attempt ceiling.
+  assert.deepEqual(models, [
+    "qwen2.5-coder:7b",
+    "qwen2.5-coder:7b",
+    "qwen2.5-coder:14b",
+  ]);
+  assert.equal(result.outcome, "awaiting_owner");
+  assert.equal(result.processed, 1);
+  assert.equal(result.reasonCode, "max_attempts_exhausted");
+  assert.equal(
+    mcRequests.some((request) => request.url === "/api/tokens"),
+    false,
+  );
+
+  const mutation = mcRequests.at(-1);
+  assert.equal(mutation.method, "PUT");
+  assert.equal(mutation.body.status, "awaiting_owner");
+  assert.equal(
+    mutation.body.error_message,
+    "Policy antonin-policy-v1 requires owner: max_attempts_exhausted",
+  );
+  // §4.7 the attempt history is route identifiers and enum values only.
+  assert.deepEqual(
+    mutation.body.metadata.policy_mvp.attempt_log.map((entry) => [
+      entry.route,
+      entry.failure_kind,
+    ]),
+    [
+      ["ollama/qwen2.5-coder:7b", "local_transient"],
+      ["ollama/qwen2.5-coder:7b", "local_transient"],
+      ["ollama/qwen2.5-coder:14b", "local_transient"],
+    ],
+  );
+  assert.equal(
+    JSON.stringify(mutation.body.metadata).includes("local model unavailable"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(mutation.body.metadata).includes("Sort harmless labels"),
+    false,
+  );
+
+  const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
+  assert.equal((await ledger.verify()).records, 1);
+  const [receipt] = (await readFile(ledger.filePath, "utf8"))
+    .trimEnd()
+    .split("\n")
+    .map(JSON.parse);
+  assert.equal(receipt.outcome, "failure");
+  assert.equal(receipt.attempt, 3);
+  assert.equal(
+    receipt.route_chain,
+    "ollama/qwen2.5-coder:7b>ollama/qwen2.5-coder:7b>ollama/qwen2.5-coder:14b",
+  );
+  assert.match(receipt.quota_snapshot_hash, /^[a-f0-9]{64}$/);
+  assert.equal(receipt.output_hash, createHash("sha256").update("").digest("hex"));
+  assert.deepEqual(receipt.token_usage, { input: 0, output: 0 });
+  assert.equal(JSON.stringify(receipt).includes("local model unavailable"), false);
+  await assertLeaseReleased(state);
+});
+
+test("an unclassified execution failure still records a failure receipt and exits non-zero", async (t) => {
   const state = await temporaryPolicyState(t);
   const mcRequests = [];
   const mcUrl = await fakeHttpServer(t, async (request, response) => {
@@ -1642,20 +1728,17 @@ test("processOne records a guarded failure, attempts awaiting_owner, and release
     sendJson(response, 200, { task: { id: 42, status: "awaiting_owner" } });
   });
   const localEndpoint = await fakeHttpServer(t, (_request, response) => {
-    sendJson(response, 500, { error: "local model unavailable" });
+    // A 3xx from the daemon is nothing this engine can classify.
+    sendJson(response, 302, { error: "moved" });
   });
 
   await assert.rejects(
     processOne(
       processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
     ),
-    /Ollama request failed \(500\)/,
+    /Ollama request failed \(302\)/,
   );
 
-  assert.equal(
-    mcRequests.some((request) => request.url === "/api/tokens"),
-    false,
-  );
   assert.deepEqual(mcRequests.at(-1), {
     method: "PUT",
     url: "/api/tasks/42",
@@ -1671,9 +1754,8 @@ test("processOne records a guarded failure, attempts awaiting_owner, and release
     .split("\n")
     .map(JSON.parse);
   assert.equal(receipt.outcome, "failure");
-  assert.equal(receipt.output_hash, createHash("sha256").update("").digest("hex"));
-  assert.deepEqual(receipt.token_usage, { input: 0, output: 0 });
-  assert.equal(JSON.stringify(receipt).includes("local model unavailable"), false);
+  assert.equal(receipt.attempt, 1);
+  assert.equal(receipt.route_chain, "ollama/qwen2.5-coder:7b");
   await assertLeaseReleased(state);
 });
 
@@ -2462,6 +2544,277 @@ test("an unusable reviewer provider fails closed before claiming a task", async 
     /warnThreshold must be greater than weeklyReserveFraction/,
   );
   assert.equal(requests, 0);
+});
+
+/**
+ * The cloud rungs are always mocked: a Node fixture script stands in for
+ * `claude` and `codex`, so the ladder, the runner contract and the refusal
+ * path are exercised end to end without spending a single token of Antonin's
+ * subscription.
+ */
+async function mockCloudCli(t, source) {
+  const directory = await mkdtemp(path.join(tmpdir(), "antonin-cloud-cli-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scriptPath = path.join(directory, "mock-cli.mjs");
+  const callLogPath = path.join(directory, "calls.log");
+  await writeFile(
+    scriptPath,
+    `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(callLogPath)}, "call\\n");
+${source}`,
+    { encoding: "utf8", mode: 0o700 },
+  );
+  return {
+    command: process.execPath,
+    args: [scriptPath],
+    calls: async () => {
+      try {
+        return (await readFile(callLogPath, "utf8")).trimEnd().split("\n").length;
+      } catch {
+        return 0;
+      }
+    },
+  };
+}
+
+const CLOUD_ANSWER = `process.stdout.write(
+  JSON.stringify({
+    result: "alpha\\nbeta",
+    usage: { input_tokens: 31, output_tokens: 7 },
+  }),
+);
+`;
+
+const CLOUD_REFUSAL = `process.stdout.write(
+  JSON.stringify({
+    result: "You've hit your session limit \\u00b7 resets 7:30pm (Europe/Paris)",
+    usage: { input_tokens: 2, output_tokens: 1 },
+  }),
+);
+`;
+
+async function ladderServers(t) {
+  const mcRequests = [];
+  const tokenRecords = [];
+  let taskState = { ...queuedTask() };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    const body = request.method === "GET" ? null : await readJson(request);
+    mcRequests.push({ method: request.method, url: request.url, body });
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      sendJson(response, 200, queueResponse(taskState));
+      return;
+    }
+    if (
+      request.method === "GET" &&
+      request.url === "/api/tokens?action=list&timeframe=all"
+    ) {
+      sendJson(response, 200, {
+        usage: tokenRecords,
+        total: tokenRecords.length,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      const record = { id: `token-${tokenRecords.length + 1}`, ...body };
+      tokenRecords.push(record);
+      sendJson(response, 200, { success: true, record });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    taskState = { ...taskState, ...body };
+    sendJson(response, 200, { task: taskState });
+  });
+  return { mcRequests, mcUrl, tokenRecords, task: () => taskState };
+}
+
+test("an unreachable local daemon falls back to a cloud rung and leaves exactly one completion", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t);
+  const claude = await mockCloudCli(t, CLOUD_ANSWER);
+
+  const result = await processOne({
+    ...processConfig(state, { mcUrl: servers.mcUrl }),
+    cloudRunners: { "claude-code": { command: claude.command, args: claude.args } },
+  });
+  assert.equal(await claude.calls(), 1);
+
+  assert.equal(result.outcome, "review");
+  assert.equal(result.processed, 1);
+  assert.equal(result.reviewer, "poc-aegis-cloud");
+
+  const journal = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  assert.equal(Object.keys(journal.entries).length, 1);
+  const entry = Object.values(journal.entries)[0];
+  assert.equal(entry.phases.receipt_confirmed, true);
+  assert.equal(entry.token_record.model, "claude-code/max");
+
+  const records = (
+    await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8")
+  )
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(records.length, 1);
+  assert.equal(records[0].route, "claude-code/max");
+  assert.equal(records[0].attempt, 2);
+  assert.equal(
+    records[0].route_chain,
+    "ollama/qwen2.5-coder:7b>claude-code/max",
+  );
+  assert.equal(records[0].outcome, "success");
+  assert.deepEqual(records[0].token_usage, { input: 31, output: 7 });
+  assert.equal(records[0].schema_version, "antonin-receipt-v1");
+  assert.equal(servers.task().resolution, "alpha\nbeta");
+  assert.equal(servers.task().assigned_to, "poc-aegis-cloud");
+
+  // §2.6 a success proves only that the window was open at that instant.
+  const quotas = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "quotas.json"), "utf8"),
+  );
+  for (const windowId of ["weekly", "session_5h"]) {
+    const window = quotas.windows[`claude-code:max:${windowId}`];
+    assert.equal(window.source, "success_observed");
+    assert.equal(window.remaining_fraction, null);
+    assert.equal(window.exhausted_until, null);
+    assert.equal(Number.isSafeInteger(window.last_canary_at), true);
+  }
+  await assertLeaseReleased(state);
+});
+
+test("a cloud refusal latches the window, defers the task, and is re-deferred next time", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t);
+  const refusing = await mockCloudCli(t, CLOUD_REFUSAL);
+  const config = {
+    ...processConfig(state, { mcUrl: servers.mcUrl }),
+    cloudRunners: {
+      "claude-code": { command: refusing.command, args: refusing.args },
+      codex: { command: refusing.command, args: refusing.args },
+    },
+    quotaPolicyOverrides: { maxAttempts: 5 },
+  };
+
+  const first = await processOne(config);
+
+  assert.equal(first.outcome, "deferred");
+  assert.equal(first.processed, 0);
+  assert.equal(first.reasonCode, "ladder_exhausted");
+  assert.equal(
+    servers.mcRequests.some((request) => request.url === "/api/tokens"),
+    false,
+  );
+  await assert.rejects(
+    readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8"),
+    { code: "ENOENT" },
+  );
+
+  // §2.4 the refusal is contractual and latches the window it names; §1 the
+  // reset is a local wall clock resolved through the operator timezone.
+  const quotas = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "quotas.json"), "utf8"),
+  );
+  for (const provider of ["claude-code:max", "codex:pro"]) {
+    const window = quotas.windows[`${provider}:session_5h`];
+    assert.equal(window.source, "refusal_observed");
+    assert.equal(window.confidence, "contractual");
+    assert.equal(window.remaining_fraction, 0);
+    assert.equal(Number.isSafeInteger(window.exhausted_until), true);
+    assert.equal(window.exhausted_until > Date.now(), true);
+    assert.equal(
+      new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Europe/Paris",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(new Date(window.exhausted_until)),
+      "19:30",
+    );
+  }
+  const attemptLog = servers.task().metadata.policy_mvp.attempt_log;
+  assert.deepEqual(
+    attemptLog.map((entry) => [entry.route, entry.failure_kind]),
+    [
+      ["ollama/qwen2.5-coder:7b", "local_daemon_unreachable"],
+      ["claude-code/max", "cloud_quota_exhausted"],
+      ["codex/pro", "cloud_quota_exhausted"],
+    ],
+  );
+  assert.equal(
+    JSON.stringify(attemptLog).includes("session limit"),
+    false,
+  );
+
+  const second = await processOne(config);
+  assert.equal(second.outcome, "deferred");
+  await assertLeaseReleased(state);
+});
+
+test("closing the subprocess gate stops the ladder at the local rungs", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t);
+  const claude = await mockCloudCli(t, CLOUD_ANSWER);
+
+  const result = await processOne({
+    ...processConfig(state, { mcUrl: servers.mcUrl }),
+    cloudRunners: { "claude-code": { command: claude.command, args: claude.args } },
+    quotaPolicyOverrides: { cloudSubprocessAllowed: false },
+  });
+
+  assert.equal(result.outcome, "awaiting_owner");
+  assert.equal(result.reasonCode, "cloud_subprocess_not_allowed");
+  assert.equal(await claude.calls(), 0);
+  assert.equal(servers.task().status, "awaiting_owner");
+  await assertLeaseReleased(state);
+});
+
+test("no fallback is planned once a completion exists", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const claude = await mockCloudCli(t, CLOUD_ANSWER);
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET" && request.url?.startsWith("/api/tasks/queue?")) {
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.url === "/api/tokens?action=list&timeframe=all") {
+      sendJson(response, 200, { usage: [], total: 0, timeframe: "all" });
+      return;
+    }
+    // §4.2 everything past the completion boundary is reconciliation, never
+    // another route: this refusal must not produce a second provider call.
+    sendJson(response, 500, { error: "control plane unavailable" });
+  });
+
+  await assert.rejects(
+    processOne({
+      ...processConfig(state, { mcUrl }),
+      cloudRunners: {
+        "claude-code": {
+          command: claude.command,
+          args: claude.args,
+        },
+      },
+    }),
+    /completion pending reconciliation/,
+  );
+
+  const journal = JSON.parse(
+    await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"),
+  );
+  assert.equal(Object.keys(journal.entries).length, 1);
+  assert.equal(Object.values(journal.entries)[0].receipt.route, "claude-code/max");
+  // One provider call: the control-plane failure after the boundary is
+  // reconciled on the next invocation, never re-executed on another rung.
+  assert.equal(await claude.calls(), 1);
+  await assert.rejects(
+    readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8"),
+    { code: "ENOENT" },
+  );
 });
 
 test("the quota-status CLI command emits non-secret JSON", async (t) => {
