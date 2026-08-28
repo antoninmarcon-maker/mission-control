@@ -1,5 +1,7 @@
 import {
   CLOUD_PROVIDERS,
+  DEFAULT_LOCAL_LADDER_MODELS,
+  PROVIDER_PLANS,
   catalogWindowsForProvider,
   parseRoute,
   planKey,
@@ -408,6 +410,294 @@ export function admitAttempt({
     reasonCode: "admitted",
     deferredUntil: null,
     canaryClaims,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// §4.1 the route ladder and §4.3 the fallback matrix
+// ---------------------------------------------------------------------------
+
+/**
+ * §4.1 rungs 1-3 are the local models actually installed, rung 1 being the
+ * configured one; rungs 4-5 are the subscriptions. The cloud rungs are listed
+ * here in catalog order and *ordered per attempt* by `planRoute`, as §4.1
+ * requires. The §5.11 gate is not applied here: `admitAttempt` is the single
+ * authority on whether a cloud rung may run, so a closed gate produces one
+ * explicit refusal instead of a silently shorter ladder.
+ */
+export function buildRouteLadder({
+  localModel,
+  localModels = DEFAULT_LOCAL_LADDER_MODELS,
+  cloudProviders = CLOUD_PROVIDERS,
+} = {}) {
+  const models = [
+    ...(typeof localModel === "string" && localModel.trim() !== ""
+      ? [localModel.trim()]
+      : []),
+    ...localModels,
+  ];
+  const local = [];
+  for (const model of models) {
+    const route = `ollama/${model}`;
+    if (local.some((entry) => entry.route === route)) continue;
+    local.push({
+      rung: local.length + 1,
+      route,
+      provider: "ollama",
+      kind: "local",
+    });
+  }
+  const cloud = cloudProviders.map((provider, index) => ({
+    rung: local.length + index + 1,
+    route: `${provider}/${PROVIDER_PLANS[provider]}`,
+    provider,
+    kind: "cloud",
+  }));
+  return { local, cloud };
+}
+
+export function riskClassOfDecision(decision) {
+  return decision?.status === "execute_local" ? "mechanical" : "sensitive";
+}
+
+const SAME_RUNG_RETRY_KINDS = new Set(["local_transient", "cloud_transient"]);
+const LOCAL_SKIPPING_KINDS = new Set(["local_daemon_unreachable"]);
+
+/** The scarcer window of a provider is the longest one: a weekly block costs days. */
+function scarcerWindow(snapshot, provider) {
+  const windows = (snapshot?.windows ?? []).filter(
+    (candidate) => candidate.provider === provider && candidate.metered !== false,
+  );
+  return windows.sort(
+    (left, right) => (right.window_minutes ?? 0) - (left.window_minutes ?? 0),
+  )[0];
+}
+
+const CLOUD_STATE_RANK = Object.freeze({
+  ok: 0,
+  unknown: 1,
+  warn: 2,
+  critical: 3,
+  exhausted: 4,
+});
+
+/**
+ * §4.1 "the engine prefers the cloud provider whose scarcer window has more
+ * headroom". Ordering is total and deterministic: alert state first, then the
+ * remaining fraction, then the provider name, so two invocations reading the
+ * same snapshot always climb the ladder in the same order.
+ */
+function orderCloudRungs(rungs, snapshot) {
+  return [...rungs].sort((left, right) => {
+    const leftWindow = scarcerWindow(snapshot, left.provider);
+    const rightWindow = scarcerWindow(snapshot, right.provider);
+    const rankDelta =
+      (CLOUD_STATE_RANK[leftWindow?.state] ?? 5) -
+      (CLOUD_STATE_RANK[rightWindow?.state] ?? 5);
+    if (rankDelta !== 0) return rankDelta;
+    const headroomDelta =
+      (rightWindow?.remaining_fraction ?? -1) -
+      (leftWindow?.remaining_fraction ?? -1);
+    if (headroomDelta !== 0) return headroomDelta;
+    return left.route.localeCompare(right.route);
+  });
+}
+
+function terminal(decision, reasonCode) {
+  return {
+    decision,
+    route: null,
+    kind: null,
+    rung: null,
+    reasonCode,
+    deferredUntil: null,
+  };
+}
+
+function candidate(entry, reasonCode) {
+  return {
+    decision: "execute",
+    route: entry.route,
+    kind: entry.kind,
+    rung: entry.rung,
+    reasonCode,
+    deferredUntil: null,
+  };
+}
+
+/**
+ * §4.3 the matrix, as a pure choice of the next rung. It never performs I/O and
+ * never decides admissibility: `admitAttempt` owns that, so a route chosen here
+ * is still a proposal. `attemptedRoutes` is the task's attempt history, oldest
+ * first, including the attempt that just failed.
+ */
+export function planRoute({
+  riskClass,
+  failureKind = null,
+  attemptedRoutes = [],
+  ladder,
+  reviewerRoute = null,
+  snapshot,
+  policy,
+}) {
+  if (riskClass !== "mechanical") {
+    // §4.3 fallback never upgrades a task's risk class.
+    return terminal(
+      "awaiting_owner",
+      riskClass === "sensitive" ? "sensitive_requires_owner" : "unknown_risk_class",
+    );
+  }
+  if (failureKind !== null && BOUNDARY_KINDS.has(failureKind)) {
+    // §4.2 these happen after a completion exists; their existing handling is
+    // the only correct one and re-routing would double-execute.
+    return terminal("unchanged", "completion_boundary_not_eligible");
+  }
+  if (failureKind !== null && !isFallbackEligible(failureKind)) {
+    return terminal(
+      "awaiting_owner",
+      failureKind === "policy_reject" ? "policy_reject" : "unclassified_failure",
+    );
+  }
+  if (attemptedRoutes.length >= policy.maxAttempts) {
+    return terminal("awaiting_owner", "max_attempts_exhausted");
+  }
+
+  const currentRoute = attemptedRoutes.at(-1) ?? null;
+  const attemptsOnCurrentRoute = attemptedRoutes.filter(
+    (route) => route === currentRoute,
+  ).length;
+
+  if (failureKind === null) {
+    const first = ladder.local[0] ?? ladder.cloud[0];
+    if (first === undefined) return terminal("awaiting_owner", "ladder_exhausted");
+    return candidate(first, "first_rung");
+  }
+  if (
+    SAME_RUNG_RETRY_KINDS.has(failureKind) &&
+    attemptsOnCurrentRoute === 1 &&
+    currentRoute !== null
+  ) {
+    // §4.3 one same-rung retry, and exactly one: the second failure of a route
+    // is a property of the route, not of the moment.
+    const entry = [...ladder.local, ...ladder.cloud].find(
+      (rung) => rung.route === currentRoute,
+    );
+    if (entry !== undefined) return candidate(entry, "same_rung_retry");
+  }
+  if (failureKind === "local_output_invalid" && attemptedRoutes.length >= 2) {
+    // §4.3 repeated malformed output is evidence the task was not mechanical,
+    // and the honest answer to that is Antonin, not a bigger model.
+    return terminal("awaiting_owner", "local_output_invalid_twice");
+  }
+
+  const skipsLocal =
+    LOCAL_SKIPPING_KINDS.has(failureKind) || failureKind.startsWith("cloud_");
+  const nextLocal = skipsLocal
+    ? undefined
+    : ladder.local.find((entry) => !attemptedRoutes.includes(entry.route));
+  if (nextLocal !== undefined) return candidate(nextLocal, "next_local_rung");
+
+  const reviewerProvider = parseRoute(reviewerRoute)?.provider ?? null;
+  const remainingCloud = ladder.cloud.filter(
+    (entry) => !attemptedRoutes.includes(entry.route),
+  );
+  const distinctCloud = remainingCloud.filter(
+    (entry) => entry.provider !== reviewerProvider,
+  );
+  if (distinctCloud.length === 0) {
+    if (remainingCloud.length > 0) {
+      // §4.4 one provider must never grade its own work, and which agent
+      // reviews is Antonin's configuration, not this engine's to reassign.
+      return terminal("awaiting_owner", "reviewer_must_be_distinct");
+    }
+    return terminal(
+      // §4.3 a missing subscription is never fixed by waiting; an exhausted
+      // ladder after a quota block still is, so it defers.
+      failureKind === "cloud_auth_missing" ? "awaiting_owner" : "defer",
+      "ladder_exhausted",
+    );
+  }
+  return candidate(orderCloudRungs(distinctCloud, snapshot)[0], "next_cloud_rung");
+}
+
+/**
+ * The §4.3 matrix as a single terminal decision: choose the rung, then submit
+ * it to §4.4-§4.5 admission. `costForRoute` is an injected pure lookup, so this
+ * whole path stays free of I/O and is exercisable cell by cell.
+ */
+export function resolveNextAttempt({
+  riskClass,
+  failureKind = null,
+  attemptedRoutes = [],
+  ladder,
+  reviewerRoute,
+  snapshot,
+  policy,
+  now,
+  costForRoute = () => null,
+}) {
+  const planned = planRoute({
+    riskClass,
+    failureKind,
+    attemptedRoutes,
+    ladder,
+    reviewerRoute,
+    snapshot,
+    policy,
+  });
+  const attempt = attemptedRoutes.length + 1;
+  if (planned.decision !== "execute") {
+    // A ladder with nothing left to try carries no reset instant, so the wait
+    // is one canary interval — and even that is capped by §5.5's max deferral.
+    const deferrable =
+      planned.decision === "defer" && policy.canaryIntervalMs <= policy.maxDeferMs;
+    return {
+      ...planned,
+      decision:
+        planned.decision === "defer" && !deferrable
+          ? "awaiting_owner"
+          : planned.decision,
+      attempt,
+      reviewerRoute,
+      canaryClaims: [],
+      deferredUntil: deferrable ? now + policy.canaryIntervalMs : null,
+    };
+  }
+
+  const admission = admitAttempt({
+    riskClass,
+    executorRoute: planned.route,
+    reviewerRoute,
+    snapshot,
+    executorCostTokens: costForRoute(planned.route),
+    reviewerCostTokens: costForRoute(reviewerRoute),
+    policy,
+    now,
+  });
+  if (admission.decision === "execute") {
+    return {
+      ...planned,
+      attempt,
+      reviewerRoute,
+      canaryClaims: admission.canaryClaims,
+    };
+  }
+  // §4.3 waiting cannot restore a subscription that is not there, so a
+  // deferral after `cloud_auth_missing` becomes an owner decision.
+  const decision =
+    admission.decision === "defer" && failureKind === "cloud_auth_missing"
+      ? "awaiting_owner"
+      : admission.decision;
+  return {
+    decision,
+    route: null,
+    kind: null,
+    rung: null,
+    attempt,
+    reviewerRoute,
+    reasonCode: admission.reasonCode,
+    deferredUntil: decision === "defer" ? admission.deferredUntil : null,
+    canaryClaims: [],
   };
 }
 

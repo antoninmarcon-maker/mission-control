@@ -20,10 +20,12 @@ import {
   FAILURE_KINDS,
   POLICY_VERSION,
   admitAttempt,
+  buildRouteLadder,
   classifyFailure,
   evaluateTask,
   isFallbackEligible,
   percentile90,
+  resolveNextAttempt,
   validateLoopbackHttpUrl,
 } from "../policy-core.mjs";
 import { LeaseStore } from "../lease-store.mjs";
@@ -947,6 +949,382 @@ test("the cost estimator ignores failure receipts and reads a bounded tail", asy
 
   const missing = new ReceiptLedger(await temporaryStateDirectory(t));
   assert.deepEqual(await missing.recentSuccessCosts("ollama/qwen2.5-coder:7b"), []);
+});
+
+// ---------------------------------------------------------------------------
+// §4.1 route ladder and §4.3 fallback matrix
+// ---------------------------------------------------------------------------
+
+function ladder(overrides = {}) {
+  return buildRouteLadder({
+    localModel: "qwen2.5-coder:7b",
+    ...overrides,
+  });
+}
+
+function nextAttempt(overrides = {}) {
+  return resolveNextAttempt({
+    riskClass: "mechanical",
+    failureKind: null,
+    attemptedRoutes: [],
+    ladder: ladder(),
+    reviewerRoute: "external/poc-aegis-cloud",
+    snapshot: quotaSnapshot(),
+    policy: resolveQuotaPolicy(),
+    now: QUOTA_BASE_INSTANT,
+    ...overrides,
+  });
+}
+
+test("the ladder starts at the configured local model and keeps the installed rungs", () => {
+  assert.deepEqual(ladder(), {
+    local: [
+      { rung: 1, route: "ollama/qwen2.5-coder:7b", provider: "ollama", kind: "local" },
+      { rung: 2, route: "ollama/qwen2.5-coder:14b", provider: "ollama", kind: "local" },
+      { rung: 3, route: "ollama/qwen3:14b", provider: "ollama", kind: "local" },
+    ],
+    cloud: [
+      { rung: 4, route: "claude-code/max", provider: "claude-code", kind: "cloud" },
+      { rung: 5, route: "codex/pro", provider: "codex", kind: "cloud" },
+    ],
+  });
+
+  const reordered = ladder({ localModel: "qwen3:14b" });
+  assert.deepEqual(
+    reordered.local.map((entry) => entry.route),
+    ["ollama/qwen3:14b", "ollama/qwen2.5-coder:7b", "ollama/qwen2.5-coder:14b"],
+  );
+  const custom = ladder({ localModel: "phi4:14b", localModels: ["qwen3:14b"] });
+  assert.deepEqual(
+    custom.local.map((entry) => entry.route),
+    ["ollama/phi4:14b", "ollama/qwen3:14b"],
+  );
+});
+
+test("planning is pure: it performs no I/O and is deterministic", () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => {
+    throw new Error("planning must not perform I/O");
+  };
+  try {
+    const first = nextAttempt();
+    const second = nextAttempt();
+    assert.deepEqual(first, second);
+    assert.equal(first.decision, "execute");
+    assert.equal(first.kind, "local");
+    assert.equal(first.route, "ollama/qwen2.5-coder:7b");
+    assert.equal(first.attempt, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("the fallback matrix is total over risk, failure kind and quota state", () => {
+  const decisions = new Set(["execute", "defer", "awaiting_owner", "unchanged"]);
+  const seen = new Set();
+  for (const riskClass of ["mechanical", "sensitive"]) {
+    for (const failureKind of [null, ...FAILURE_KINDS]) {
+      for (const state of ["ok", "warn", "critical", "exhausted", "unknown"]) {
+        for (const attemptedRoutes of [
+          [],
+          ["ollama/qwen2.5-coder:7b"],
+          ["ollama/qwen2.5-coder:7b", "ollama/qwen2.5-coder:14b"],
+          [
+            "ollama/qwen2.5-coder:7b",
+            "ollama/qwen2.5-coder:14b",
+            "ollama/qwen3:14b",
+          ],
+          ["ollama/qwen2.5-coder:7b", "claude-code/max"],
+          ["claude-code/max", "claude-code/max"],
+        ]) {
+          const outcome = nextAttempt({
+            riskClass,
+            failureKind,
+            attemptedRoutes,
+            reviewerRoute: "external/poc-aegis-cloud",
+            snapshot: quotaSnapshot({
+              "claude-code/weekly": state,
+              "claude-code/session_5h": state,
+              "codex/weekly": state,
+              "codex/session_5h": state,
+            }),
+            policy: resolveQuotaPolicy({ maxAttempts: 5 }),
+          });
+          const cell = `${riskClass}/${failureKind}/${state}/${attemptedRoutes.join("|")}`;
+          assert.equal(decisions.has(outcome.decision), true, cell);
+          assert.equal(typeof outcome.reasonCode, "string", cell);
+          assert.notEqual(outcome.reasonCode, "", cell);
+          if (outcome.decision === "execute") {
+            assert.equal(typeof outcome.route, "string", cell);
+            assert.equal(["local", "cloud"].includes(outcome.kind), true, cell);
+          } else {
+            assert.equal(outcome.route, null, cell);
+            assert.equal(outcome.kind, null, cell);
+          }
+          if (outcome.decision === "defer") {
+            assert.equal(Number.isSafeInteger(outcome.deferredUntil), true, cell);
+          } else {
+            assert.equal(outcome.deferredUntil, null, cell);
+          }
+          seen.add(cell);
+        }
+      }
+    }
+  }
+  assert.equal(seen.size, 2 * (FAILURE_KINDS.length + 1) * 5 * 6);
+});
+
+test("a sensitive task stays with the owner at every failure kind and quota state", () => {
+  for (const failureKind of [null, ...FAILURE_KINDS]) {
+    for (const state of ["ok", "warn", "critical", "exhausted", "unknown"]) {
+      const outcome = nextAttempt({
+        riskClass: "sensitive",
+        failureKind,
+        snapshot: quotaSnapshot({
+          "claude-code/weekly": state,
+          "codex/weekly": state,
+        }),
+      });
+      assert.equal(outcome.decision, "awaiting_owner", `${failureKind}/${state}`);
+      assert.equal(outcome.route, null);
+      assert.equal(outcome.reasonCode, "sensitive_requires_owner");
+    }
+  }
+});
+
+test("the completion boundary is never re-routed and an unclassified failure goes to the owner", () => {
+  for (const failureKind of ["control_plane_ambiguous", "lease_lost"]) {
+    const outcome = nextAttempt({
+      failureKind,
+      attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    });
+    assert.equal(outcome.decision, "unchanged", failureKind);
+    assert.equal(outcome.route, null, failureKind);
+    assert.equal(outcome.reasonCode, "completion_boundary_not_eligible");
+  }
+
+  for (const failureKind of ["unknown", "policy_reject"]) {
+    const outcome = nextAttempt({
+      failureKind,
+      attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    });
+    assert.equal(outcome.decision, "awaiting_owner", failureKind);
+    assert.equal(outcome.route, null, failureKind);
+  }
+});
+
+test("local failures climb the local rungs before ever reaching the cloud", () => {
+  const modelError = nextAttempt({
+    failureKind: "local_model_error",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+  });
+  assert.equal(modelError.decision, "execute");
+  assert.equal(modelError.route, "ollama/qwen2.5-coder:14b");
+  assert.equal(modelError.attempt, 2);
+
+  const secondRung = nextAttempt({
+    failureKind: "local_model_error",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "ollama/qwen2.5-coder:14b"],
+  });
+  assert.equal(secondRung.route, "ollama/qwen3:14b");
+
+  const exhaustedLocal = nextAttempt({
+    failureKind: "local_model_error",
+    attemptedRoutes: [
+      "ollama/qwen2.5-coder:7b",
+      "ollama/qwen2.5-coder:14b",
+      "ollama/qwen3:14b",
+    ],
+    policy: resolveQuotaPolicy({ maxAttempts: 5 }),
+  });
+  assert.equal(exhaustedLocal.decision, "execute");
+  assert.equal(exhaustedLocal.kind, "cloud");
+  assert.equal(exhaustedLocal.attempt, 4);
+});
+
+test("an unreachable daemon skips every Ollama rung and defers when no cloud is admissible", () => {
+  const toCloud = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+  });
+  assert.equal(toCloud.decision, "execute");
+  assert.equal(toCloud.kind, "cloud");
+  assert.equal(toCloud.route, "claude-code/max");
+
+  const blocked = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    snapshot: quotaSnapshot({
+      "claude-code/weekly": "critical",
+      "claude-code/session_5h": "critical",
+      "codex/weekly": "critical",
+      "codex/session_5h": "critical",
+    }),
+  });
+  assert.equal(blocked.decision, "defer");
+  assert.equal(blocked.reasonCode, "execution_window_critical");
+});
+
+test("a transient failure retries its own rung exactly once", () => {
+  const retry = nextAttempt({
+    failureKind: "local_transient",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+  });
+  assert.equal(retry.route, "ollama/qwen2.5-coder:7b");
+  assert.equal(retry.reasonCode, "same_rung_retry");
+
+  const downgraded = nextAttempt({
+    failureKind: "local_transient",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "ollama/qwen2.5-coder:7b"],
+  });
+  assert.equal(downgraded.route, "ollama/qwen2.5-coder:14b");
+});
+
+test("invalid local output buys one more rung and then stops", () => {
+  const oneMore = nextAttempt({
+    failureKind: "local_output_invalid",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+  });
+  assert.equal(oneMore.decision, "execute");
+  assert.equal(oneMore.route, "ollama/qwen2.5-coder:14b");
+
+  const stop = nextAttempt({
+    failureKind: "local_output_invalid",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "ollama/qwen2.5-coder:14b"],
+  });
+  assert.equal(stop.decision, "awaiting_owner");
+  assert.equal(stop.reasonCode, "local_output_invalid_twice");
+});
+
+test("cloud failures move to the other provider, defer, or stop by kind", () => {
+  const otherProvider = nextAttempt({
+    failureKind: "cloud_quota_exhausted",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "claude-code/max"],
+  });
+  assert.equal(otherProvider.decision, "execute");
+  assert.equal(otherProvider.route, "codex/pro");
+
+  const noProviderLeft = nextAttempt({
+    failureKind: "cloud_quota_exhausted",
+    attemptedRoutes: [
+      "ollama/qwen2.5-coder:7b",
+      "claude-code/max",
+      "codex/pro",
+    ],
+    policy: resolveQuotaPolicy({ maxAttempts: 5 }),
+  });
+  assert.equal(noProviderLeft.decision, "defer");
+  assert.equal(noProviderLeft.reasonCode, "ladder_exhausted");
+
+  // §4.3 a missing subscription is never fixed by waiting.
+  const authMissing = nextAttempt({
+    failureKind: "cloud_auth_missing",
+    attemptedRoutes: [
+      "ollama/qwen2.5-coder:7b",
+      "claude-code/max",
+      "codex/pro",
+    ],
+    policy: resolveQuotaPolicy({ maxAttempts: 5 }),
+  });
+  assert.equal(authMissing.decision, "awaiting_owner");
+  assert.equal(authMissing.reasonCode, "ladder_exhausted");
+
+  const authMissingBlockedPeer = nextAttempt({
+    failureKind: "cloud_auth_missing",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "claude-code/max"],
+    snapshot: quotaSnapshot({
+      "codex/weekly": "exhausted",
+      "codex/session_5h": "exhausted",
+    }),
+  });
+  assert.equal(authMissingBlockedPeer.decision, "awaiting_owner");
+
+  const cloudRetry = nextAttempt({
+    failureKind: "cloud_transient",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "claude-code/max"],
+  });
+  assert.equal(cloudRetry.route, "claude-code/max");
+  assert.equal(cloudRetry.reasonCode, "same_rung_retry");
+});
+
+test("the cloud rungs are ordered by the headroom of the scarcer window", () => {
+  const codexFirst = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    snapshot: quotaSnapshot(
+      {},
+      {
+        "claude-code/weekly": { remaining_fraction: 0.4, used_fraction: 0.6 },
+        "codex/weekly": { remaining_fraction: 0.9, used_fraction: 0.1 },
+      },
+    ),
+  });
+  assert.equal(codexFirst.route, "codex/pro");
+
+  const knownBeatsUnknown = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    snapshot: quotaSnapshot({
+      "claude-code/weekly": "unknown",
+      "claude-code/session_5h": "unknown",
+    }),
+  });
+  assert.equal(knownBeatsUnknown.route, "codex/pro");
+});
+
+test("a fallback never routes execution onto the reviewer's own provider", () => {
+  const avoided = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    reviewerRoute: "claude-code/max",
+  });
+  assert.equal(avoided.decision, "execute");
+  assert.equal(avoided.route, "codex/pro");
+  assert.equal(avoided.reviewerRoute, "claude-code/max");
+
+  const refused = nextAttempt({
+    failureKind: "cloud_quota_exhausted",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b", "codex/pro"],
+    reviewerRoute: "claude-code/max",
+  });
+  assert.equal(refused.decision, "awaiting_owner");
+  assert.equal(refused.reasonCode, "reviewer_must_be_distinct");
+});
+
+test("the attempt ceiling ends the ladder wherever it has reached", () => {
+  const outcome = nextAttempt({
+    failureKind: "local_model_error",
+    attemptedRoutes: [
+      "ollama/qwen2.5-coder:7b",
+      "ollama/qwen2.5-coder:14b",
+      "ollama/qwen3:14b",
+    ],
+    policy: resolveQuotaPolicy({ maxAttempts: 3 }),
+  });
+  assert.equal(outcome.decision, "awaiting_owner");
+  assert.equal(outcome.reasonCode, "max_attempts_exhausted");
+});
+
+test("the planned route carries the cost estimate into admission", () => {
+  const policy = resolveQuotaPolicy({
+    tokensPerWindow: { "codex:pro": 100_000 },
+  });
+  const outcome = nextAttempt({
+    failureKind: "local_daemon_unreachable",
+    attemptedRoutes: ["ollama/qwen2.5-coder:7b"],
+    reviewerRoute: "external/poc-aegis-cloud",
+    snapshot: quotaSnapshot(
+      {},
+      {
+        "claude-code/weekly": { remaining_fraction: 0.4, used_fraction: 0.6 },
+        "codex/session_5h": { remaining_fraction: 0.5, used_fraction: 0.5 },
+      },
+    ),
+    policy,
+    costForRoute: (route) => (route === "codex/pro" ? 40_000 : null),
+  });
+  assert.equal(outcome.decision, "defer");
+  assert.equal(outcome.reasonCode, "execution_session_window_too_small");
 });
 
 test("an executor route this engine tracks no window for is refused", () => {
