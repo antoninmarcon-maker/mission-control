@@ -41,6 +41,7 @@ Optional environment variables:
 | `ANTONIN_CLOUD_TIMEOUT_MS` | `180000` |
 | `ANTONIN_MAX_ATTEMPTS` | `3` (placeholder, decision reserved to Antonin) |
 | `ANTONIN_OPERATOR_TZ` | `Europe/Paris` (placeholder; used to resolve a refusal's wall-clock reset) |
+| `ANTONIN_QUOTA_SCAN` | unset — the passive scanners stay off. `true` lets the engine read the newest Codex rollouts and Claude transcripts, read-only and bounded, to skip a provider already known to be blocked. |
 | `ANTONIN_QUOTA_WEEKLY_RESERVE` | `0.2` (placeholder, decision reserved to Antonin) |
 | `ANTONIN_QUOTA_SAFETY_FACTOR` | `1.5` (placeholder) |
 | `ANTONIN_QUOTA_ADMIT_REVIEWS` | `false` (placeholder) |
@@ -141,6 +142,8 @@ Which rung comes next depends on *why* the previous one failed: a transient fail
 **Fallback applies to the execution attempt only, and never once a completion exists.** The loop that chooses rungs contains the provider call and nothing else; past it, reconciliation owns the outcome. An ambiguous control-plane response or a lost lease is therefore never re-routed: those keep the reconciliation and contention paths they already had.
 
 Every attempt is admitted before it runs, so a rung whose window is exhausted, critical, or already spent its canary defers rather than executes. The attempt history lives in `metadata.policy_mvp.attempt_log` — the last five `{route, failure_kind, at}` entries, route identifiers and enum values only, never a prompt, model output or error string — and the number of attempts a task may consume is `ANTONIN_MAX_ATTEMPTS`.
+
+With `ANTONIN_QUOTA_SCAN=true` the engine also reads the sources it did not produce: the newest Codex rollout files and Claude transcripts. That read is `O_RDONLY`, bounded to the newest files by mtime with a byte cap and a stop at the first record found, restricted to `~/.codex/sessions` and `~/.claude/projects` through `realpath` (a file linking outside its root is skipped, not followed), and it extracts only the numeric fields of a quota window — no prompt, no model output, no session id, no project path ever reaches `quotas.json` or Mission Control. Both sources are heuristic, so a reading can only make the engine more cautious: it skips a provider already known to be blocked and never authorises a spend. A refusal whose reset has already passed is ignored rather than latched.
 
 A cloud refusal is read from the runner's own output (`You've hit your session limit · resets 7:30pm`), recorded as a contractual `refusal_observed` observation, and latches the window it names until the parsed reset, resolved through `ANTONIN_OPERATOR_TZ` including across DST. A cloud success records `success_observed`, which proves the window was open at that instant and nothing more — so the next attempt on that window is a canary again.
 

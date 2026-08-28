@@ -31,6 +31,11 @@ import {
 } from "./policy-core.mjs";
 import { CloudSubprocessRunner } from "./cloud-runner.mjs";
 import {
+  CLAUDE_PROJECTS_ROOT,
+  CODEX_SESSIONS_ROOT,
+  scanDeclaredQuota,
+} from "./quota-scanners.mjs";
+import {
   CLOUD_PROVIDERS,
   CLOUD_RUNNER_DEFAULTS,
   DEFAULT_LOCAL_LADDER_MODELS,
@@ -1100,6 +1105,10 @@ function validateProcessConfig(config = {}) {
     config.cloudTimeoutMs ?? DEFAULT_CLOUD_TIMEOUT_MS,
     "ANTONIN_CLOUD_TIMEOUT_MS",
   );
+  // §2.9 reading Antonin's own session files is opt-in: the engine works
+  // without it (the canary rule is the fallback), so it never starts reading
+  // his transcripts because a default said so.
+  const quotaScanEnabled = config.quotaScanEnabled === true;
 
   return {
     stateDirectory,
@@ -1114,6 +1123,7 @@ function validateProcessConfig(config = {}) {
     localModels,
     cloudRunners,
     cloudTimeoutMs,
+    quotaScanEnabled,
     leaseTtlMs,
     quotaPolicy,
     pocRuntimeDirectory,
@@ -1277,6 +1287,7 @@ export function configFromEnvironment(environment = process.env) {
     localModels: environment.ANTONIN_LOCAL_MODELS,
     cloudRunners: cloudRunnersFromEnvironment(environment),
     cloudTimeoutMs: environmentNumber(environment, "ANTONIN_CLOUD_TIMEOUT_MS"),
+    quotaScanEnabled: environmentBoolean(environment, "ANTONIN_QUOTA_SCAN"),
   });
 }
 
@@ -1340,6 +1351,36 @@ async function runnerForRoute(route, normalized, dependencies) {
     outputFormat: parsed.provider === "claude-code" ? "claude_json" : "text",
     timeZone: normalized.quotaPolicy.operatorTimeZone,
   });
+}
+
+/**
+ * §2.9 the passive sources, read once per invocation and only when Antonin has
+ * turned them on. Their single job (§2.6) is to skip a provider we already
+ * know is blocked; they can never authorise a spend, because both are
+ * heuristic and §2.4 rule 1 keeps a heuristic reading away from `ok`.
+ *
+ * The allowed roots are fixed here, not configurable: the guard would be
+ * theatre if the environment could point it anywhere. Failures are swallowed —
+ * no reading simply leaves the engine in the canary regime it starts from.
+ */
+async function applyScannedQuota({ quotaStore, normalized, scan, now }) {
+  if (scan === null) return;
+  let observations;
+  try {
+    observations = await scan({
+      now,
+      timeZone: normalized.quotaPolicy.operatorTimeZone,
+    });
+  } catch {
+    return;
+  }
+  for (const observation of observations) {
+    try {
+      await quotaStore.observe(observation);
+    } catch {
+      // A malformed reading is discarded, never trusted into the store.
+    }
+  }
 }
 
 /**
@@ -1643,6 +1684,21 @@ export async function processOne(config, dependencies = {}) {
   });
   const attemptLog = readAttemptLog(task);
   const costCache = new Map();
+  await applyScannedQuota({
+    quotaStore,
+    normalized,
+    scan:
+      dependencies.scanQuota ??
+      (normalized.quotaScanEnabled
+        ? (options) =>
+            scanDeclaredQuota({
+              ...options,
+              root: undefined,
+              allowedRoots: [CODEX_SESSIONS_ROOT, CLAUDE_PROJECTS_ROOT],
+            })
+        : null),
+    now: now(),
+  });
   let attempt = null;
   let completion = null;
   let duration = 0;
@@ -1883,6 +1939,7 @@ export async function runCommand(command, environment = process.env) {
         ]),
       ),
       cloudSubprocessAllowed: config.quotaPolicy.cloudSubprocessAllowed,
+      quotaScanEnabled: config.quotaScanEnabled,
       leaseTtlMs: config.leaseTtlMs,
       apiKeyConfigured: true,
     };

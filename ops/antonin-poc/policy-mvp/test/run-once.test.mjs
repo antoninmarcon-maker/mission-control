@@ -2755,6 +2755,77 @@ test("a cloud refusal latches the window, defers the task, and is re-deferred ne
   await assertLeaseReleased(state);
 });
 
+test("a scanned block skips the provider it names instead of spending a canary on it", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t);
+  const claude = await mockCloudCli(t, CLOUD_ANSWER);
+  const codex = await mockCloudCli(t, CLOUD_ANSWER);
+  const scans = [];
+
+  const result = await processOne(
+    {
+      ...processConfig(state, { mcUrl: servers.mcUrl }),
+      cloudRunners: {
+        "claude-code": { command: claude.command, args: claude.args },
+        codex: { command: codex.command, args: codex.args },
+      },
+    },
+    {
+      // §2.9 a heuristic reading may only make the engine more cautious: it
+      // skips a provider already known to be blocked, and never authorises one.
+      scanQuota: async (options) => {
+        scans.push(options.timeZone);
+        return [
+          {
+            provider: "claude-code",
+            plan: "max",
+            window_id: "weekly",
+            source: "claude_refusal_string",
+            observed_at: Date.now(),
+            used_fraction: 1,
+            exhausted_until: Date.now() + 3_600_000,
+          },
+        ];
+      },
+    },
+  );
+
+  assert.deepEqual(scans, ["Europe/Paris"]);
+  assert.equal(result.outcome, "review");
+  assert.equal(await claude.calls(), 0);
+  assert.equal(await codex.calls(), 1);
+  const records = (
+    await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8")
+  )
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(records[0].route, "codex/pro");
+  assert.equal(records[0].route_chain, "ollama/qwen2.5-coder:7b>codex/pro");
+});
+
+test("the passive scanners stay off until Antonin turns them on", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t);
+  const environment = {
+    ANTONIN_POLICY_STATE_DIR: state.stateDirectory,
+    MC_URL: servers.mcUrl,
+    MC_API_KEY: "secret",
+    LOCAL_LLM_ENDPOINT: "http://127.0.0.1:11434/v1",
+  };
+
+  assert.equal(configFromEnvironment(environment).quotaScanEnabled, false);
+  assert.equal(
+    configFromEnvironment({ ...environment, ANTONIN_QUOTA_SCAN: "true" })
+      .quotaScanEnabled,
+    true,
+  );
+  assert.throws(
+    () => configFromEnvironment({ ...environment, ANTONIN_QUOTA_SCAN: "yes" }),
+    /ANTONIN_QUOTA_SCAN must be true or false/,
+  );
+});
+
 test("closing the subprocess gate stops the ladder at the local rungs", async (t) => {
   const state = await temporaryPolicyState(t);
   const servers = await ladderServers(t);
