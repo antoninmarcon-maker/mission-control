@@ -471,7 +471,7 @@ test("processOne moves a policy-rejected task to awaiting_owner without calling 
       body: {
         status: "awaiting_owner",
         error_message:
-          "Policy antonin-policy-v0 requires owner: priority_requires_owner",
+          "Policy antonin-policy-v1 requires owner: priority_requires_owner",
       },
     },
   ]);
@@ -579,6 +579,8 @@ test("processOne completes an allowed task under a lease and leaves a hash-only 
       .update(
         [
           "42",
+          // §4.7 policy v1 puts the route in the completion identity.
+          "ollama/qwen2.5-coder:7b",
           createHash("sha256").update(ollamaRequest.messages[0].content).digest("hex"),
           createHash("sha256").update("alpha\nbeta").digest("hex"),
         ].join("\0"),
@@ -598,7 +600,14 @@ test("processOne completes an allowed task under a lease and leaves a hash-only 
     .update("alpha\nbeta")
     .digest("hex");
   const expectedCompletionId = createHash("sha256")
-    .update(["42", expectedInputHash, expectedOutputHash].join("\0"))
+    .update(
+      [
+        "42",
+        "ollama/qwen2.5-coder:7b",
+        expectedInputHash,
+        expectedOutputHash,
+      ].join("\0"),
+    )
     .digest("hex");
   assert.deepEqual(events[5].body, {
     status: "review",
@@ -609,7 +618,7 @@ test("processOne completes an allowed task under a lease and leaves a hash-only 
         completion_id: expectedCompletionId,
         input_hash: expectedInputHash,
         output_hash: expectedOutputHash,
-        policy_version: "antonin-policy-v0",
+        policy_version: "antonin-policy-v1",
       },
     },
     error_message: "",
@@ -1312,6 +1321,151 @@ test("processOne resumes the first unconfirmed completion phase without re-runni
   assert.deepEqual(counts, { queue: 1, tokenPost: 1, taskPut: 2, ollama: 1 });
   assert.equal((await ledger.verify()).records, 1);
   await assertLeaseReleased(state);
+});
+
+test("a completion left pending by the v0 build resolves under the v0 identity rule", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const inputHash = createHash("sha256").update("v0 prompt").digest("hex");
+  const outputHash = createHash("sha256").update("alpha\nbeta").digest("hex");
+  // §4.7 the identity of a pending entry is the one its own build recorded:
+  // v0 hashed (task, input, output) with no route.
+  const completionId = createHash("sha256")
+    .update(["42", inputHash, outputHash].join("\0"))
+    .digest("hex");
+  const tokenSessionId = `antonin-policy-engine:policy-mvp:completion-${completionId}`;
+  const policyMetadata = {
+    completion_id: completionId,
+    input_hash: inputHash,
+    output_hash: outputHash,
+    policy_version: "antonin-policy-v0",
+  };
+  await mkdir(state.stateDirectory, { recursive: true });
+  await writeFile(
+    path.join(state.stateDirectory, "completions.json"),
+    `${JSON.stringify({
+      version: 1,
+      entries: {
+        [completionId]: {
+          completion_id: completionId,
+          task_id: "42",
+          task_api_id: 42,
+          owner: "antonin-policy-engine",
+          fencing_token: 1,
+          token_session_id: tokenSessionId,
+          token_record: {
+            model: "qwen2.5-coder:7b",
+            sessionId: tokenSessionId,
+            inputTokens: 19,
+            outputTokens: 5,
+            operation: "policy_mvp",
+            duration: 12,
+            taskId: 42,
+          },
+          task_update: {
+            status: "review",
+            assigned_to: "poc-aegis-cloud",
+            resolution: "alpha\nbeta",
+            metadata: { policy_mvp: policyMetadata },
+            error_message: "",
+          },
+          receipt: {
+            task_id: "42",
+            task_version: 7,
+            policy_version: "antonin-policy-v0",
+            route: "ollama/qwen2.5-coder:7b",
+            reviewer: "poc-aegis-cloud",
+            lease_id: "42:1",
+            fencing_token: 1,
+            input_hash: inputHash,
+            output_hash: outputHash,
+            token_usage: { input: 19, output: 5 },
+            outcome: "success",
+          },
+          phases: {
+            token_confirmed: false,
+            task_confirmed: false,
+            receipt_confirmed: false,
+          },
+          token_attempted: false,
+          token_ambiguous: false,
+          receipt_hash: null,
+          created_at: 1_788_000_000_000,
+          updated_at: 1_788_000_000_000,
+        },
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const leaseStore = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
+  await leaseStore.acquire("42", "antonin-policy-engine", { ttlMs: 120_000 });
+
+  let tokenRecord = null;
+  let taskState = {
+    ...queuedTask(),
+    status: "in_progress",
+    assigned_to: "antonin-policy-engine",
+  };
+  const counts = { queue: 0, ollama: 0, taskPut: 0 };
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.url?.startsWith("/api/tasks/queue?")) {
+      counts.queue += 1;
+      sendJson(response, 200, queueResponse(queuedTask()));
+      return;
+    }
+    if (request.url === "/api/tokens?action=list&timeframe=all") {
+      sendJson(response, 200, {
+        usage: tokenRecord === null ? [] : [tokenRecord],
+        total: tokenRecord === null ? 0 : 1,
+        timeframe: "all",
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/tokens") {
+      tokenRecord = { id: "token-1", ...(await readJson(request)) };
+      sendJson(response, 200, { success: true, record: tokenRecord });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/tasks/42") {
+      sendJson(response, 200, { task: taskState });
+      return;
+    }
+    counts.taskPut += 1;
+    taskState = { ...taskState, ...(await readJson(request)) };
+    sendJson(response, 200, { task: taskState });
+  });
+  const localEndpoint = await fakeHttpServer(t, (_request, response) => {
+    counts.ollama += 1;
+    sendJson(response, 200, { choices: [{ message: { content: "unexpected" } }] });
+  });
+
+  const result = await processOne(
+    processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }),
+  );
+
+  assert.equal(result.outcome, "review");
+  assert.equal(result.reconciled, true);
+  assert.deepEqual(counts, { queue: 0, ollama: 0, taskPut: 1 });
+  assert.equal(taskState.metadata.policy_mvp.completion_id, completionId);
+  assert.equal(taskState.metadata.policy_mvp.policy_version, "antonin-policy-v0");
+
+  // Exactly one receipt, written in the schema the pending entry was formed in.
+  const records = (
+    await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8")
+  )
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(records.length, 1);
+  assert.equal(records[0].schema_version, "antonin-receipt-v0");
+  assert.equal(Object.hasOwn(records[0], "attempt"), false);
+  assert.equal(records[0].record_hash, result.receiptHash);
+  assert.deepEqual(
+    await new ReceiptLedger(
+      state.stateDirectory,
+      state.stateStoreOptions,
+    ).verify(),
+    { valid: true, records: 1, lastHash: records[0].record_hash },
+  );
 });
 
 test("confirmed Mission Control mutations remain pending when the receipt ledger is corrupt", async (t) => {

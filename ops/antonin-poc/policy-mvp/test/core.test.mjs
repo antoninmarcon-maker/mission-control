@@ -22,10 +22,12 @@ import {
   admitAttempt,
   buildRouteLadder,
   classifyFailure,
+  completionIdentityFields,
   evaluateTask,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
+  riskClassOfDecision,
   validateLoopbackHttpUrl,
 } from "../policy-core.mjs";
 import { LeaseStore } from "../lease-store.mjs";
@@ -35,6 +37,8 @@ import { QUOTA_WINDOW_CATALOG, resolveQuotaPolicy } from "../quota-config.mjs";
 import {
   RECEIPT_SCHEMA_VERSION,
   ReceiptLedger,
+  canonicalJson,
+  sha256,
 } from "../receipt-ledger.mjs";
 
 async function temporaryStateDirectory(t) {
@@ -63,13 +67,55 @@ test("policy routes a medium-priority simple local sort to Ollama and a distinct
   });
 
   assert.deepEqual(decision, {
-    policyVersion: "antonin-policy-v0",
+    policyVersion: "antonin-policy-v1",
     status: "execute_local",
     route: "ollama/qwen2.5-coder:7b",
     reviewer: "poc-aegis-cloud",
     reasonCode: "eligible_mechanical_task",
   });
-  assert.equal(POLICY_VERSION, "antonin-policy-v0");
+  assert.equal(POLICY_VERSION, "antonin-policy-v1");
+  assert.equal(riskClassOfDecision(decision), "mechanical");
+  assert.equal(
+    riskClassOfDecision({ status: "awaiting_owner" }),
+    "sensitive",
+  );
+});
+
+test("completion identity is derived from the recorded policy version, not this build", () => {
+  const v0 = completionIdentityFields({
+    policyVersion: "antonin-policy-v0",
+    taskId: "42",
+    route: "ollama/qwen2.5-coder:7b",
+    inputHash: "a".repeat(64),
+    outputHash: "b".repeat(64),
+  });
+  const v1 = completionIdentityFields({
+    policyVersion: "antonin-policy-v1",
+    taskId: "42",
+    route: "ollama/qwen2.5-coder:7b",
+    inputHash: "a".repeat(64),
+    outputHash: "b".repeat(64),
+  });
+
+  // §4.7 v0 ignored the route; a pending v0 entry must keep resolving that way.
+  assert.deepEqual(v0, ["42", "a".repeat(64), "b".repeat(64)]);
+  assert.deepEqual(v1, [
+    "42",
+    "ollama/qwen2.5-coder:7b",
+    "a".repeat(64),
+    "b".repeat(64),
+  ]);
+  // Two rungs producing identical output no longer collide on one identity.
+  assert.notDeepEqual(
+    v1,
+    completionIdentityFields({
+      policyVersion: "antonin-policy-v1",
+      taskId: "42",
+      route: "claude-code/max",
+      inputHash: "a".repeat(64),
+      outputHash: "b".repeat(64),
+    }),
+  );
 });
 
 test("policy denies high and critical priority tasks", () => {
@@ -357,7 +403,7 @@ function receipt(overrides = {}) {
   return {
     task_id: "task-1",
     task_version: 7,
-    policy_version: "antonin-policy-v0",
+    policy_version: POLICY_VERSION,
     route: "ollama/qwen2.5-coder:7b",
     reviewer: "poc-aegis-cloud",
     lease_id: "task-1:1",
@@ -366,6 +412,9 @@ function receipt(overrides = {}) {
     output_hash: "b".repeat(64),
     token_usage: { output: 3, input: 2 },
     outcome: "success",
+    attempt: 1,
+    route_chain: "ollama/qwen2.5-coder:7b",
+    quota_snapshot_hash: "e".repeat(64),
     ...overrides,
   };
 }
@@ -378,12 +427,12 @@ test("receipt genesis append is canonical, hash-linked, compact, and mode 600", 
 
   const record = await ledger.append(receipt());
   const canonicalWithoutHash =
-    `{"fencing_token":1,"input_hash":"${"a".repeat(64)}","lease_id":"task-1:1","outcome":"success","output_hash":"${"b".repeat(64)}","policy_version":"antonin-policy-v0","previous_hash":null,"reviewer":"poc-aegis-cloud","route":"ollama/qwen2.5-coder:7b","schema_version":"antonin-receipt-v0","task_id":"task-1","task_version":7,"timestamp":"2026-08-27T10:00:00.000Z","token_usage":{"input":2,"output":3}}`;
+    `{"attempt":1,"fencing_token":1,"input_hash":"${"a".repeat(64)}","lease_id":"task-1:1","outcome":"success","output_hash":"${"b".repeat(64)}","policy_version":"antonin-policy-v1","previous_hash":null,"quota_snapshot_hash":"${"e".repeat(64)}","reviewer":"poc-aegis-cloud","route":"ollama/qwen2.5-coder:7b","route_chain":"ollama/qwen2.5-coder:7b","schema_version":"antonin-receipt-v1","task_id":"task-1","task_version":7,"timestamp":"2026-08-27T10:00:00.000Z","token_usage":{"input":2,"output":3}}`;
   const expectedHash = createHash("sha256")
     .update(canonicalWithoutHash)
     .digest("hex");
 
-  assert.equal(RECEIPT_SCHEMA_VERSION, "antonin-receipt-v0");
+  assert.equal(RECEIPT_SCHEMA_VERSION, "antonin-receipt-v1");
   assert.equal(record.previous_hash, null);
   assert.equal(record.record_hash, expectedHash);
   assert.equal((await stat(ledger.filePath)).mode & 0o777, 0o600);
@@ -499,6 +548,127 @@ test("receipt append rejects raw values disguised as hashes or token counts and 
   }
 
   await assert.rejects(readFile(ledger.filePath, "utf8"), { code: "ENOENT" });
+});
+
+function v0Receipt(overrides = {}) {
+  const {
+    attempt,
+    route_chain: routeChain,
+    quota_snapshot_hash: quotaSnapshotHash,
+    ...fields
+  } = receipt(overrides);
+  return { ...fields, policy_version: "antonin-policy-v0" };
+}
+
+function storedV0Line(previousHash, overrides = {}) {
+  const withoutRecordHash = {
+    schema_version: "antonin-receipt-v0",
+    timestamp: "2026-08-20T10:00:00.000Z",
+    ...v0Receipt(overrides),
+    previous_hash: previousHash,
+  };
+  return `${canonicalJson({
+    ...withoutRecordHash,
+    record_hash: sha256(canonicalJson(withoutRecordHash)),
+  })}\n`;
+}
+
+test("the ledger verifies a mixed v0/v1 chain and rejects a record foreign to its own version", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const ledger = new ReceiptLedger(stateDirectory, { now: () => 1_000 });
+
+  // A ledger written by the previous build: v0 records only.
+  await writeFile(ledger.filePath, storedV0Line(null), { mode: 0o600 });
+  assert.deepEqual(await ledger.verify(), {
+    valid: true,
+    records: 1,
+    lastHash: JSON.parse(storedV0Line(null)).record_hash,
+  });
+
+  // The first v1 append must extend that chain, not reject it.
+  const appended = await ledger.append(
+    receipt({ task_id: "task-2", lease_id: "task-2:1", attempt: 2 }),
+  );
+  assert.equal(appended.schema_version, "antonin-receipt-v1");
+  assert.equal(appended.attempt, 2);
+  const verified = await ledger.verify();
+  assert.equal(verified.valid, true);
+  assert.equal(verified.records, 2);
+
+  // A v1-only field on a v0 record is not a v0 record.
+  const contaminated = new ReceiptLedger(await temporaryStateDirectory(t), {
+    now: () => 1_000,
+  });
+  const line = JSON.parse(storedV0Line(null));
+  await writeFile(
+    contaminated.filePath,
+    `${JSON.stringify({ ...line, attempt: 1 })}\n`,
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    contaminated.verify(),
+    /unsupported or sensitive receipt field: attempt/,
+  );
+
+  // A v1 record missing a v1 field is not a v1 record either.
+  const truncated = new ReceiptLedger(await temporaryStateDirectory(t), {
+    now: () => 1_000,
+  });
+  const v1Line = JSON.parse(
+    (await readFile(ledger.filePath, "utf8")).trimEnd().split("\n")[1],
+  );
+  delete v1Line.route_chain;
+  await writeFile(truncated.filePath, `${JSON.stringify(v1Line)}\n`, {
+    mode: 0o600,
+  });
+  await assert.rejects(truncated.verify(), /missing route_chain at line 1/);
+
+  // An unknown version is still refused outright.
+  const future = new ReceiptLedger(await temporaryStateDirectory(t), {
+    now: () => 1_000,
+  });
+  await writeFile(
+    future.filePath,
+    `${JSON.stringify({ ...line, schema_version: "antonin-receipt-v9" })}\n`,
+    { mode: 0o600 },
+  );
+  await assert.rejects(future.verify(), /unsupported schema version at line 1/);
+});
+
+test("v1 receipt fields are validated like every other field", async (t) => {
+  const ledger = new ReceiptLedger(await temporaryStateDirectory(t), {
+    now: () => 1_000,
+  });
+
+  for (const overrides of [
+    { attempt: 0 },
+    { attempt: -1 },
+    { attempt: 1.5 },
+    { route_chain: "" },
+    { route_chain: "x".repeat(513) },
+    { quota_snapshot_hash: "not-a-hash" },
+  ]) {
+    await assert.rejects(ledger.append(receipt(overrides)), /invalid receipt field/);
+  }
+
+  // Half a v1 receipt is neither version and is refused.
+  const { route_chain: _dropped, ...partial } = receipt();
+  await assert.rejects(
+    ledger.append(partial),
+    /receipt is missing required field: route_chain/,
+  );
+  await assert.rejects(readFile(ledger.filePath, "utf8"), { code: "ENOENT" });
+
+  // §4.7 a completion left pending by the v0 build hands back a v0 receipt,
+  // and it must be written as it was formed rather than back-filled.
+  const stored = await ledger.append(v0Receipt());
+  assert.equal(stored.schema_version, "antonin-receipt-v0");
+  assert.equal(Object.hasOwn(stored, "attempt"), false);
+  assert.deepEqual(await ledger.verify(), {
+    valid: true,
+    records: 1,
+    lastHash: stored.record_hash,
+  });
 });
 
 const QUOTA_BASE_INSTANT = 1_800_000_000_000;

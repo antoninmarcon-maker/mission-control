@@ -7,7 +7,33 @@ import {
   planKey,
 } from "./quota-config.mjs";
 
-export const POLICY_VERSION = "antonin-policy-v0";
+export const POLICY_VERSION = "antonin-policy-v1";
+
+/**
+ * §4.7 completion identity. v0 derived `completion_id` from
+ * `(task_id, input_hash, output_hash)`, which is safe with a single route and
+ * unsafe with a ladder: two rungs producing byte-identical output would
+ * collide on one completion id while `receiptAlreadyStored` matches on
+ * `STABLE_RECEIPT_FIELDS`, which *does* include the route — the journal would
+ * consider the completion known while the ledger would not find its receipt,
+ * and a second receipt would be appended for one completion. v1 therefore adds
+ * the route.
+ *
+ * Identity is always computed from the **recorded** policy version, never from
+ * this build's `POLICY_VERSION`, so a pending v0 entry left in
+ * `completions.json` by an older build keeps resolving under the v0 rule.
+ */
+export function completionIdentityFields({
+  policyVersion,
+  taskId,
+  route,
+  inputHash,
+  outputHash,
+}) {
+  return policyVersion === "antonin-policy-v0"
+    ? [taskId, inputHash, outputHash]
+    : [taskId, route, inputHash, outputHash];
+}
 
 const ALLOW_TERMS = [
   "sort",

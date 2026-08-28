@@ -11,9 +11,9 @@ import path from "node:path";
 
 import { resolveExternalStateDirectory } from "./lease-store.mjs";
 
-export const RECEIPT_SCHEMA_VERSION = "antonin-receipt-v0";
+export const RECEIPT_SCHEMA_VERSION = "antonin-receipt-v1";
 
-const RECEIPT_FIELDS = new Set([
+const RECEIPT_FIELDS_V0 = [
   "task_id",
   "task_version",
   "policy_version",
@@ -25,18 +25,51 @@ const RECEIPT_FIELDS = new Set([
   "output_hash",
   "token_usage",
   "outcome",
+];
+
+/**
+ * §4.7 v1 adds exactly three scalars: the 1-based `attempt` that produced the
+ * receipt, the `route_chain` of the §4.1 ladder rungs it climbed, and a
+ * `quota_snapshot_hash` pointing into `quota-observations.jsonl`.
+ */
+const RECEIPT_FIELDS_V1 = [
+  ...RECEIPT_FIELDS_V0,
+  "attempt",
+  "route_chain",
+  "quota_snapshot_hash",
+];
+
+/**
+ * §4.7 the migration hazard, stated as a data structure. `#readAndVerify` runs
+ * over the *entire* file on every append and every verify, so a naive version
+ * bump would make the first v1 append reject every existing v0 record and
+ * brick both the ledger and `verify-ledger`. Each record is therefore
+ * validated against the field set of **its own** `schema_version`, and a mixed
+ * chain is a valid chain.
+ */
+const RECEIPT_SCHEMA_FIELDS = new Map([
+  ["antonin-receipt-v0", new Set(RECEIPT_FIELDS_V0)],
+  ["antonin-receipt-v1", new Set(RECEIPT_FIELDS_V1)],
 ]);
 
-const DEFAULT_COST_TAIL_BYTES = 262_144;
-const DEFAULT_COST_SAMPLES = 200;
+const RECEIPT_FIELDS = RECEIPT_SCHEMA_FIELDS.get(RECEIPT_SCHEMA_VERSION);
 
-const STORED_FIELDS = new Set([
-  ...RECEIPT_FIELDS,
+const RECORD_ENVELOPE_FIELDS = [
   "schema_version",
   "timestamp",
   "previous_hash",
   "record_hash",
-]);
+];
+
+const DEFAULT_COST_TAIL_BYTES = 262_144;
+const DEFAULT_COST_SAMPLES = 200;
+
+function storedFieldsFor(schemaVersion) {
+  const fields = RECEIPT_SCHEMA_FIELDS.get(schemaVersion);
+  return fields === undefined
+    ? null
+    : new Set([...fields, ...RECORD_ENVELOPE_FIELDS]);
+}
 
 function defaultSleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -127,7 +160,7 @@ function assertSha256(value, field) {
   }
 }
 
-function assertReceiptValues(receipt) {
+function assertReceiptValues(receipt, schemaVersion = RECEIPT_SCHEMA_VERSION) {
   assertBoundedString(receipt.task_id, "task_id", 256);
   if (receipt.task_version !== null) {
     assertNonNegativeInteger(receipt.task_version, "task_version");
@@ -159,35 +192,65 @@ function assertReceiptValues(receipt) {
   assertNonNegativeInteger(receipt.token_usage.input, "token_usage.input");
   assertNonNegativeInteger(receipt.token_usage.output, "token_usage.output");
   assertBoundedString(receipt.outcome, "outcome", 128);
+  if (schemaVersion === "antonin-receipt-v0") return;
+
+  assertNonNegativeInteger(receipt.attempt, "attempt");
+  if (receipt.attempt === 0) {
+    // Attempts are 1-based: a receipt for attempt 0 describes no attempt.
+    throw new TypeError("invalid receipt field: attempt");
+  }
+  assertBoundedString(receipt.route_chain, "route_chain", 512);
+  assertSha256(receipt.quota_snapshot_hash, "quota_snapshot_hash");
+}
+
+/**
+ * §4.7 the version of a *new* record is decided by the fields it carries, not
+ * by the current build. A completion left pending by the v0 build hands back a
+ * v0 receipt, and its audit record must be written as it was formed: filling
+ * in an attempt number and a snapshot hash after the fact would be fabricated
+ * evidence. A half-filled receipt is neither version and is refused.
+ */
+function schemaVersionForInput(receipt) {
+  const additions = RECEIPT_FIELDS_V1.filter(
+    (field) => !RECEIPT_FIELDS_V0.includes(field),
+  );
+  const missing = additions.filter((field) => !Object.hasOwn(receipt, field));
+  if (missing.length === 0) return "antonin-receipt-v1";
+  if (missing.length === additions.length) return "antonin-receipt-v0";
+  throw new TypeError(`receipt is missing required field: ${missing[0]}`);
 }
 
 function assertReceiptInput(receipt) {
   if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) {
     throw new TypeError("receipt must be an object");
   }
-  assertExactFields(receipt, RECEIPT_FIELDS);
+  const schemaVersion = schemaVersionForInput(receipt);
+  const fields = RECEIPT_SCHEMA_FIELDS.get(schemaVersion);
+  assertExactFields(receipt, fields);
   assertNoSensitiveFields(receipt);
-  for (const field of RECEIPT_FIELDS) {
+  for (const field of fields) {
     if (!Object.hasOwn(receipt, field)) {
       throw new TypeError(`receipt is missing required field: ${field}`);
     }
   }
-  assertReceiptValues(receipt);
+  assertReceiptValues(receipt, schemaVersion);
+  return schemaVersion;
 }
 
 function assertStoredRecord(record, lineNumber) {
   if (record === null || typeof record !== "object" || Array.isArray(record)) {
     throw new Error(`invalid receipt at line ${lineNumber}`);
   }
-  assertExactFields(record, STORED_FIELDS);
+  const storedFields = storedFieldsFor(record.schema_version);
+  if (storedFields === null) {
+    throw new Error(`unsupported schema version at line ${lineNumber}`);
+  }
+  assertExactFields(record, storedFields);
   assertNoSensitiveFields(record);
-  for (const field of STORED_FIELDS) {
+  for (const field of storedFields) {
     if (!Object.hasOwn(record, field)) {
       throw new Error(`missing ${field} at line ${lineNumber}`);
     }
-  }
-  if (record.schema_version !== RECEIPT_SCHEMA_VERSION) {
-    throw new Error(`unsupported schema version at line ${lineNumber}`);
   }
   assertBoundedString(record.timestamp, "timestamp", 64);
   if (record.previous_hash !== null) {
@@ -196,8 +259,12 @@ function assertStoredRecord(record, lineNumber) {
   assertSha256(record.record_hash, "record_hash");
   assertReceiptValues(
     Object.fromEntries(
-      [...RECEIPT_FIELDS].map((field) => [field, record[field]]),
+      [...RECEIPT_SCHEMA_FIELDS.get(record.schema_version)].map((field) => [
+        field,
+        record[field],
+      ]),
     ),
+    record.schema_version,
   );
 }
 
@@ -213,13 +280,13 @@ export class ReceiptLedger {
   }
 
   async append(receipt) {
-    assertReceiptInput(receipt);
+    const schemaVersion = assertReceiptInput(receipt);
 
     return this.#withLock(async () => {
       const records = await this.#readAndVerify();
       const previousHash = records.at(-1)?.record_hash ?? null;
       const withoutRecordHash = {
-        schema_version: RECEIPT_SCHEMA_VERSION,
+        schema_version: schemaVersion,
         timestamp: new Date(this.now()).toISOString(),
         ...receipt,
         previous_hash: previousHash,

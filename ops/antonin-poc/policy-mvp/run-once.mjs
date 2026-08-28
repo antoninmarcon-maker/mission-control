@@ -20,6 +20,7 @@ import {
 import { OllamaClient } from "./ollama-client.mjs";
 import {
   admitAttempt,
+  completionIdentityFields,
   evaluateTask,
   percentile90,
   validateLoopbackHttpUrl,
@@ -334,12 +335,13 @@ function receiptInput({
   prompt,
   completion,
   outcome,
+  attempt,
 }) {
   return {
     task_id: String(task.id),
     task_version: taskVersion(task),
     policy_version: decision.policyVersion,
-    route: decision.route,
+    route: attempt.route,
     reviewer: decision.reviewer,
     lease_id: `${String(task.id)}:${lease.fencing_token}`,
     fencing_token: lease.fencing_token,
@@ -350,10 +352,26 @@ function receiptInput({
       output: completion?.outputTokens ?? 0,
     },
     outcome,
+    // §4.7 the three v1 scalars: which attempt produced this, the ladder rungs
+    // it climbed, and the quota snapshot the decision was taken on.
+    attempt: attempt.number,
+    route_chain: attempt.routeChain,
+    quota_snapshot_hash: attempt.quotaSnapshotHash,
   };
 }
 
-function completionEntry({ task, decision, lease, prompt, completion, duration, owner, model, now }) {
+function completionEntry({
+  task,
+  decision,
+  lease,
+  prompt,
+  completion,
+  duration,
+  owner,
+  model,
+  now,
+  attempt,
+}) {
   const receipt = receiptInput({
     task,
     decision,
@@ -361,13 +379,16 @@ function completionEntry({ task, decision, lease, prompt, completion, duration, 
     prompt,
     completion,
     outcome: "success",
+    attempt,
   });
   const completionId = sha256(
-    [
-      String(task.id),
-      receipt.input_hash,
-      receipt.output_hash,
-    ].join("\0"),
+    completionIdentityFields({
+      policyVersion: receipt.policy_version,
+      taskId: String(task.id),
+      route: receipt.route,
+      inputHash: receipt.input_hash,
+      outputHash: receipt.output_hash,
+    }).join("\0"),
   );
   const tokenSessionId = `${owner}:policy-mvp:completion-${completionId}`;
   const taskMetadata =
@@ -737,7 +758,9 @@ async function resolveAdmission({
     policy: normalized.quotaPolicy,
     now,
   });
-  if (admission.decision !== "execute") return admission;
+  if (admission.decision !== "execute") {
+    return { ...admission, snapshotId: snapshot.snapshot_id };
+  }
 
   for (const claim of admission.canaryClaims) {
     const claimed = await quotaStore.claimCanary(claim.provider, claim.window_id, {
@@ -752,10 +775,11 @@ async function resolveAdmission({
         reasonCode: "canary_claimed_by_a_concurrent_invocation",
         deferredUntil: now + normalized.quotaPolicy.canaryIntervalMs,
         canaryClaims: [],
+        snapshotId: snapshot.snapshot_id,
       };
     }
   }
-  return admission;
+  return { ...admission, snapshotId: snapshot.snapshot_id };
 }
 
 /**
@@ -1016,6 +1040,7 @@ async function recoverExecutionFailure({
   lease,
   prompt,
   completion,
+  attempt,
   leaseStore,
   receiptLedger,
   missionControl,
@@ -1038,6 +1063,7 @@ async function recoverExecutionFailure({
           prompt,
           completion,
           outcome: "failure",
+          attempt,
         }),
       ),
     );
@@ -1255,6 +1281,12 @@ export async function processOne(config, dependencies = {}) {
   }
 
   const prompt = localPrompt(task);
+  const attempt = {
+    number: 1,
+    route: decision.route,
+    routeChain: decision.route,
+    quotaSnapshotHash: admission.snapshotId,
+  };
   let completion = null;
   let duration = 0;
   let completedResult;
@@ -1282,6 +1314,7 @@ export async function processOne(config, dependencies = {}) {
       owner: normalized.agent,
       model: normalized.localModel,
       now: now(),
+      attempt,
     });
     let reconciled;
     try {
@@ -1328,6 +1361,7 @@ export async function processOne(config, dependencies = {}) {
         lease,
         prompt,
         completion,
+        attempt,
         leaseStore,
         receiptLedger,
         missionControl,
