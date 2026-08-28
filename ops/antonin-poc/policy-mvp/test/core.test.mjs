@@ -773,14 +773,21 @@ test("a reviewer on the executor provider is refused instead of grading itself",
   assert.equal(decision.reasonCode, "reviewer_must_be_distinct");
 });
 
-test("cloud execution stays refused while the subprocess gate is closed", () => {
-  const decision = admission({
+test("the open subprocess gate admits a cloud executor and closing it refuses one", () => {
+  assert.equal(resolveQuotaPolicy().cloudSubprocessAllowed, true);
+  const admitted = admission({
     executorRoute: "claude-code/max",
     reviewerRoute: "codex/pro",
   });
-  assert.equal(decision.decision, "awaiting_owner");
-  assert.equal(decision.reasonCode, "cloud_subprocess_not_allowed");
-  assert.equal(resolveQuotaPolicy().cloudSubprocessAllowed, false);
+  assert.equal(admitted.decision, "execute");
+
+  const closed = admission({
+    executorRoute: "claude-code/max",
+    reviewerRoute: "codex/pro",
+    policy: resolveQuotaPolicy({ cloudSubprocessAllowed: false }),
+  });
+  assert.equal(closed.decision, "awaiting_owner");
+  assert.equal(closed.reasonCode, "cloud_subprocess_not_allowed");
 });
 
 test("an unknown window spends one canary and then defers", () => {
@@ -839,17 +846,29 @@ test("the 5 h inequality defers a job whose p90 cost exceeds the remaining windo
   assert.equal(doesNotFit.decision, "defer");
   assert.equal(doesNotFit.reasonCode, "review_session_window_too_small");
 
+  // An undeclared window size (§5.3) makes the inequality unevaluable, not
+  // false: the window state and the refusal circuit breaker still govern.
   const unmetered = admitAttempt({
     riskClass: "mechanical",
     executorRoute: "ollama/qwen2.5-coder:7b",
     reviewerRoute: "codex/pro",
     snapshot,
+    reviewerCostTokens: 10_000_000,
+    policy: resolveQuotaPolicy({ admissionAppliesToReviews: true }),
+    now: QUOTA_BASE_INSTANT,
+  });
+  assert.equal(unmetered.decision, "execute");
+  const unmeteredAndCritical = admitAttempt({
+    riskClass: "mechanical",
+    executorRoute: "ollama/qwen2.5-coder:7b",
+    reviewerRoute: "codex/pro",
+    snapshot: quotaSnapshot({ "codex/session_5h": "critical" }),
     reviewerCostTokens: 10,
     policy: resolveQuotaPolicy({ admissionAppliesToReviews: true }),
     now: QUOTA_BASE_INSTANT,
   });
-  assert.equal(unmetered.decision, "defer");
-  assert.equal(unmetered.reasonCode, "review_session_window_unmetered");
+  assert.equal(unmeteredAndCritical.decision, "defer");
+  assert.equal(unmeteredAndCritical.reasonCode, "review_window_critical");
 
   const reviewsNotGated = admitAttempt({
     riskClass: "mechanical",

@@ -26,6 +26,7 @@ import {
 } from "./policy-core.mjs";
 import {
   CLOUD_PROVIDERS,
+  OWNER_DECISIONS_TAKEN,
   OWNER_DECISION_PLACEHOLDERS,
   PROVIDER_PLANS,
   planKey,
@@ -1386,6 +1387,7 @@ export async function runCommand(command, environment = process.env) {
       reviewerRoute: reviewerRouteOf(config),
       windows: snapshot.windows,
       policy: config.quotaPolicy,
+      ownerDecisionsTaken: OWNER_DECISIONS_TAKEN,
       ownerDecisionsPending: OWNER_DECISION_PLACEHOLDERS,
     };
   }

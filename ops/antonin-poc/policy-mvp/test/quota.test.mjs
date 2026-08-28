@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  OWNER_DECISIONS_TAKEN,
   OWNER_DECISION_PLACEHOLDERS,
   QUOTA_WINDOW_CATALOG,
   resolveQuotaPolicy,
@@ -489,25 +490,60 @@ test("derived states are a pure function of the record, the clock and the policy
   );
 });
 
-test("the reserved owner decisions are declared as pending placeholders", () => {
+test("the reserved owner decisions are split between taken and still pending", () => {
   const policy = resolveQuotaPolicy();
-  const byId = new Map(
+  const pending = new Map(
     OWNER_DECISION_PLACEHOLDERS.map((entry) => [entry.id, entry]),
   );
+  const taken = new Map(OWNER_DECISIONS_TAKEN.map((entry) => [entry.id, entry]));
 
   for (const entry of OWNER_DECISION_PLACEHOLDERS) {
     assert.equal(entry.status, "DÉCISION ANTONIN EN ATTENTE");
     assert.match(entry.spec, /^§5\.\d+$/);
   }
-  assert.equal(byId.get("weekly_reserve_fraction").value, 0.2);
+  for (const entry of OWNER_DECISIONS_TAKEN) {
+    assert.equal(entry.status, "DÉCIDÉ PAR ANTONIN");
+    assert.equal(entry.decided_at, "2026-08-28");
+    assert.match(entry.spec, /^§5\.\d+$/);
+    assert.equal(typeof entry.answer, "string");
+    assert.notEqual(entry.answer, "");
+  }
+  assert.equal(pending.has("weekly_reserve_fraction"), false);
+  assert.equal(pending.has("cloud_subprocess_allowed"), false);
+
+  // §5.1 decided at 20 %, so this is a value and no longer a placeholder.
+  assert.equal(taken.get("weekly_reserve_fraction").value, 0.2);
+  assert.equal(taken.get("weekly_reserve_fraction").answer, "20 % (Recommandé)");
   assert.equal(policy.weeklyReserveFraction, 0.2);
-  assert.equal(byId.get("tokens_per_window").value, null);
+
+  // §5.11 authorised, so rungs 4-5 exist. It can still be switched off, and
+  // only off: the environment may narrow the ladder, never widen it.
+  assert.equal(taken.get("cloud_subprocess_allowed").value, true);
+  assert.equal(
+    taken.get("cloud_subprocess_allowed").answer,
+    "Autoriser (Recommandé)",
+  );
+  assert.equal(policy.cloudSubprocessAllowed, true);
+  assert.equal(
+    resolveQuotaPolicy({ cloudSubprocessAllowed: false }).cloudSubprocessAllowed,
+    false,
+  );
+  assert.equal(
+    resolveQuotaPolicy({ cloudSubprocessAllowed: true }).cloudSubprocessAllowed,
+    true,
+  );
+
+  // §5.3 still unanswered: only /usage can source it.
+  assert.equal(pending.get("tokens_per_window").value, null);
   assert.deepEqual(policy.tokensPerWindow, {
     "claude-code:max": null,
     "codex:pro": null,
   });
-  assert.equal(byId.get("cloud_subprocess_allowed").value, false);
-  assert.equal(policy.cloudSubprocessAllowed, false);
+  // §5.5 and §5.10 are consumed by the ladder, so they are declared pending.
+  assert.equal(pending.get("max_attempts").value, 3);
+  assert.equal(policy.maxAttempts, 3);
+  assert.equal(pending.get("operator_time_zone").value, "Europe/Paris");
+  assert.equal(policy.operatorTimeZone, "Europe/Paris");
 });
 
 test("policy resolution validates thresholds and keeps the reserve below the warning band", () => {

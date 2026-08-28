@@ -2338,7 +2338,7 @@ test("the quota-status CLI command emits non-secret JSON", async (t) => {
     json.windows.map((window) => window.state).sort(),
     ["ok", "unknown", "unknown", "unknown", "unknown"],
   );
-  assert.equal(json.policy.cloudSubprocessAllowed, false);
+  assert.equal(json.policy.cloudSubprocessAllowed, true);
   assert.deepEqual(json.policy.tokensPerWindow, {
     "claude-code:max": null,
     "codex:pro": null,
@@ -2348,6 +2348,13 @@ test("the quota-status CLI command emits non-secret JSON", async (t) => {
       (decision) => decision.status === "DÉCISION ANTONIN EN ATTENTE",
     ),
     true,
+  );
+  assert.deepEqual(
+    json.ownerDecisionsTaken.map((decision) => [decision.id, decision.answer]),
+    [
+      ["weekly_reserve_fraction", "20 % (Recommandé)"],
+      ["cloud_subprocess_allowed", "Autoriser (Recommandé)"],
+    ],
   );
   assert.equal(result.stdout.includes(apiKey), false);
   assert.equal(result.stderr, "");

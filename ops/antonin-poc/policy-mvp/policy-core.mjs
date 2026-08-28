@@ -298,14 +298,14 @@ function admitProviderWindows({
     if (entry.window_id !== "session_5h" || !gated) continue;
 
     const budget = policy.tokensPerWindow[planKey(entry.provider, entry.plan)];
-    if (budget === null) {
-      // tokens_per_window is undeclared (§5.3): the inequality cannot be
-      // evaluated, so the job is not started.
-      return blocked(`${usage}_session_window_unmetered`, window.resets_at);
-    }
-    if (costTokens === null) {
-      // §2.7 no history for this route: the first run is the measurement, and
-      // the window is above the warning band by construction.
+    if (budget === null || costTokens === null) {
+      // The inequality has two unevaluable cases and neither one blocks:
+      // §5.3 `tokens_per_window` is undeclared, and §2.7 has no cost history
+      // for this route. Requiring either would contradict §2.6 — the whole
+      // design exists because remaining quota cannot be metered — so the
+      // window governs by its state alone: `ok` admits, `warn` refuses
+      // executions, `critical`/`exhausted` block, and `unknown` costs a
+      // canary. The refusal circuit breaker of §2.8 remains the backstop.
       continue;
     }
     if (

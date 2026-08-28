@@ -11,31 +11,43 @@
  */
 
 // ===========================================================================
-// DÉCISION ANTONIN EN ATTENTE
+// DÉCISIONS ANTONIN — prises et en attente
 // ---------------------------------------------------------------------------
 // Spec §5 reserves these values to Antonin and says explicitly that the
 // parenthesised figures are proposals to react to, "not a default to adopt
-// silently". They are adopted here as *loud placeholders* so the first slice
-// can run and be reviewed; every one of them is wrong until Antonin says
-// otherwise, and `run-once.mjs quota-status` prints this table so the pending
-// decisions stay visible from the operator side.
+// silently". Two of them were answered on 2026-08-28 and are recorded here
+// with Antonin's verbatim answer; the rest stay *loud placeholders* so the
+// slice can run and be reviewed. `run-once.mjs quota-status` prints both
+// tables so the pending decisions stay visible from the operator side.
 //
-// Reserved decisions still missing from this table, because no code path in
-// this slice consumes them: §5.4 (fail-open vs fail-closed on unknown cloud
-// quota — the design's fail-closed + canary proposal is implemented),
-// §5.5 ANTONIN_MAX_ATTEMPTS, §5.6 daily cloud spend ceiling, §5.7 reviewer
-// capacity behaviour, §5.8 paid API-key rung, §5.9 off-hours window,
-// §5.10 operator timezone authority.
+// Reserved decisions still missing from this table, because no code path
+// consumes them: §5.4 (fail-open vs fail-closed on unknown cloud quota — the
+// design's fail-closed + canary proposal is implemented), §5.6 daily cloud
+// spend ceiling, §5.7 reviewer capacity behaviour, §5.8 paid API-key rung,
+// §5.9 off-hours window.
 // ===========================================================================
-export const OWNER_DECISION_PLACEHOLDERS = Object.freeze([
+const OWNER_DECISION_CATALOG = Object.freeze([
   Object.freeze({
     id: "weekly_reserve_fraction",
     spec: "§5.1",
-    status: "DÉCISION ANTONIN EN ATTENTE",
+    status: "DÉCIDÉ PAR ANTONIN",
+    decided_at: "2026-08-28",
+    answer: "20 % (Recommandé)",
     value: 0.2,
     proposal: 0.25,
     effect:
       "share of every weekly window the fleet must never touch; below it a window is critical and no cloud dispatch happens",
+  }),
+  Object.freeze({
+    id: "cloud_subprocess_allowed",
+    spec: "§5.11",
+    status: "DÉCIDÉ PAR ANTONIN",
+    decided_at: "2026-08-28",
+    answer: "Autoriser (Recommandé)",
+    value: true,
+    proposal: false,
+    effect:
+      "whether a cloud runner may spawn a subprocess at all; true makes rungs 4-5 of the §4.1 ladder reachable through the §7 runner contract. The environment may switch it off (ANTONIN_CLOUD_SUBPROCESS=false) but never on: an override can only narrow the ladder.",
   }),
   Object.freeze({
     id: "session_safety_factor",
@@ -74,15 +86,34 @@ export const OWNER_DECISION_PLACEHOLDERS = Object.freeze([
       "longest deferral; a reset further away than this becomes awaiting_owner instead of a deferral",
   }),
   Object.freeze({
-    id: "cloud_subprocess_allowed",
-    spec: "§5.11",
+    id: "max_attempts",
+    spec: "§5.5",
     status: "DÉCISION ANTONIN EN ATTENTE",
-    value: false,
-    proposal: false,
+    value: 3,
+    proposal: 3,
     effect:
-      "whether a cloud runner may spawn a subprocess at all; false keeps the ladder stopped at the Ollama rungs, so any cloud route is refused to the owner. Deliberately not environment-overridable: rungs 4-5 need the §7 gate and a runner that does not exist yet.",
+      "attempts a single task may consume across the §4.1 ladder before it goes to the owner; the counter is the length of metadata.policy_mvp.attempt_log, so it survives process exit",
+  }),
+  Object.freeze({
+    id: "operator_time_zone",
+    spec: "§5.10",
+    status: "DÉCISION ANTONIN EN ATTENTE",
+    value: "Europe/Paris",
+    proposal: "Europe/Paris",
+    effect:
+      "timezone used to resolve a refusal's local wall-clock reset time (`resets 7:30pm`) into an instant, including across DST transitions",
   }),
 ]);
+
+export const OWNER_DECISIONS_TAKEN = Object.freeze(
+  OWNER_DECISION_CATALOG.filter((entry) => entry.status === "DÉCIDÉ PAR ANTONIN"),
+);
+
+export const OWNER_DECISION_PLACEHOLDERS = Object.freeze(
+  OWNER_DECISION_CATALOG.filter(
+    (entry) => entry.status === "DÉCISION ANTONIN EN ATTENTE",
+  ),
+);
 
 /**
  * Engine tunables. These are *not* reserved to Antonin by §5; they are
@@ -144,6 +175,58 @@ export const PROVIDER_PLANS = Object.freeze({
 });
 
 export const CLOUD_PROVIDERS = Object.freeze(["claude-code", "codex"]);
+
+/**
+ * §4.1 rungs 1-3: the models actually installed on this machine, in the order
+ * the ladder climbs them. Rung 1 is always the configured `LOCAL_LLM_MODEL`;
+ * these are the fallbacks tried after it.
+ */
+export const DEFAULT_LOCAL_LADDER_MODELS = Object.freeze([
+  "qwen2.5-coder:7b",
+  "qwen2.5-coder:14b",
+  "qwen3:14b",
+]);
+
+/**
+ * §7 the cloud runner contract. Rungs 4-5 are CLI subscriptions, not HTTP
+ * endpoints, so each provider names an argv-only invocation. The prompt is
+ * never an argument: it goes to the child's stdin, so no task text can reach
+ * the process table.
+ *
+ * These argv defaults follow `claude --help` on this machine; the Codex CLI is
+ * not installed here, so its argv is a documented default that an operator can
+ * correct through the environment without touching this file. A missing binary
+ * is a `cloud_auth_missing` failure, which drops that provider for the run.
+ *
+ * `--bare` is deliberately absent from the Claude argv: it forces
+ * `ANTHROPIC_API_KEY` authentication, which would turn a subscription rung
+ * into metered API spend — the paid route §5.8 does not authorise.
+ */
+export const CLOUD_RUNNER_DEFAULTS = Object.freeze({
+  "claude-code": Object.freeze({
+    command: "claude",
+    args: Object.freeze([
+      "--print",
+      "--output-format",
+      "json",
+      "--no-session-persistence",
+      "--permission-mode",
+      "manual",
+      "--disallowed-tools",
+      "Bash",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+    ]),
+  }),
+  codex: Object.freeze({
+    command: "codex",
+    args: Object.freeze(["exec", "--sandbox", "read-only", "-"]),
+  }),
+});
 
 /**
  * §2.4 source reliability. The tier is a property of the source, never of the
@@ -229,12 +312,25 @@ function requireBoolean(value, name) {
   return value;
 }
 
-function placeholderValue(id) {
-  const entry = OWNER_DECISION_PLACEHOLDERS.find(
-    (candidate) => candidate.id === id,
-  );
+function requireTimeZone(value, name) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError(`${name} must be an IANA time zone`);
+  }
+  try {
+    // The only contractual validation available: the runtime either knows the
+    // zone or throws. A typo must fail at configuration time, not while a
+    // refusal is being resolved into a latch.
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+  } catch {
+    throw new TypeError(`${name} must be an IANA time zone`);
+  }
+  return value;
+}
+
+function ownerDecisionValue(id) {
+  const entry = OWNER_DECISION_CATALOG.find((candidate) => candidate.id === id);
   if (entry === undefined) {
-    throw new TypeError(`unknown owner decision placeholder: ${id}`);
+    throw new TypeError(`unknown owner decision: ${id}`);
   }
   return entry.value;
 }
@@ -248,7 +344,7 @@ function requireNullableTokenBudget(value, name) {
 }
 
 function resolveTokensPerWindow(overrides) {
-  const declared = placeholderValue("tokens_per_window");
+  const declared = ownerDecisionValue("tokens_per_window");
   const resolved = {};
   for (const provider of CLOUD_PROVIDERS) {
     const key = planKey(provider, PROVIDER_PLANS[provider]);
@@ -288,24 +384,38 @@ export function resolveQuotaPolicy(overrides = {}) {
     ),
     weeklyReserveFraction: requireFraction(
       overrides.weeklyReserveFraction ??
-        placeholderValue("weekly_reserve_fraction"),
+        ownerDecisionValue("weekly_reserve_fraction"),
       "weeklyReserveFraction",
     ),
     sessionSafetyFactor: requirePositiveNumber(
-      overrides.sessionSafetyFactor ?? placeholderValue("session_safety_factor"),
+      overrides.sessionSafetyFactor ?? ownerDecisionValue("session_safety_factor"),
       "sessionSafetyFactor",
     ),
     admissionAppliesToReviews: requireBoolean(
       overrides.admissionAppliesToReviews ??
-        placeholderValue("admission_applies_to_reviews"),
+        ownerDecisionValue("admission_applies_to_reviews"),
       "admissionAppliesToReviews",
     ),
     tokensPerWindow: resolveTokensPerWindow(overrides.tokensPerWindow),
-    // Deliberately not overridable: §5.11 plus §7 gate the cloud runner.
-    cloudSubprocessAllowed: placeholderValue("cloud_subprocess_allowed"),
+    // §5.11 is answered, so the gate is open in code. An override may only
+    // close it again: a conjunction can narrow the ladder, never widen it.
+    cloudSubprocessAllowed:
+      ownerDecisionValue("cloud_subprocess_allowed") &&
+      requireBoolean(
+        overrides.cloudSubprocessAllowed ?? true,
+        "cloudSubprocessAllowed",
+      ),
     maxDeferMs: requirePositiveInteger(
-      overrides.maxDeferMs ?? placeholderValue("max_defer_ms"),
+      overrides.maxDeferMs ?? ownerDecisionValue("max_defer_ms"),
       "maxDeferMs",
+    ),
+    maxAttempts: requirePositiveInteger(
+      overrides.maxAttempts ?? ownerDecisionValue("max_attempts"),
+      "maxAttempts",
+    ),
+    operatorTimeZone: requireTimeZone(
+      overrides.operatorTimeZone ?? ownerDecisionValue("operator_time_zone"),
+      "operatorTimeZone",
     ),
     maxStalenessMs: requirePositiveInteger(
       overrides.maxStalenessMs ?? ENGINE_TUNABLE_DEFAULTS.maxStalenessMs,
