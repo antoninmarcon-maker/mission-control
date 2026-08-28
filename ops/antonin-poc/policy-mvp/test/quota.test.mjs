@@ -322,6 +322,66 @@ test("a heuristic exhaustion latch still applies while a declarative reading is 
   assert.equal(latched.remaining_fraction, 0.9);
 });
 
+test("a contractual success clears a latch without erasing a fresh reading", async (t) => {
+  const directory = await temporaryStateDirectory(t);
+  const clock = clockAt(BASE_INSTANT);
+  const store = storeAt(directory, clock);
+
+  // Antonin declares 10 % left: below the reserve, so no cloud dispatch.
+  const declared = await store.observe(
+    weeklyObservation({ remaining_fraction: 0.1 }),
+  );
+  assert.equal(declared.state, "critical");
+
+  // A success proves only that the window was open at that instant (§2.4). It
+  // must not wash out the level Antonin read, which would re-open a canary
+  // straight into the reserve the level exists to protect.
+  clock.value = BASE_INSTANT + 1_000;
+  const afterSuccess = await store.observe(
+    weeklyObservation({
+      source: "success_observed",
+      observed_at: clock.value,
+      remaining_fraction: undefined,
+    }),
+  );
+  assert.equal(afterSuccess.remaining_fraction, 0.1);
+  assert.equal(afterSuccess.source, "operator_declaration");
+  assert.equal(afterSuccess.state, "critical");
+  assert.equal(afterSuccess.canary_available, false);
+
+  // The reading still ages: past the staleness horizon the window is unknown
+  // again, because a success never refreshed the level it did not measure.
+  clock.value = BASE_INSTANT + 1_000 + resolveQuotaPolicy().maxStalenessMs + 1;
+  assert.equal(
+    windowOf(await store.snapshot(clock.value), "codex", "weekly").state,
+    "unknown",
+  );
+
+  // A refusal's zero is not a level: it is the same fact as the latch, so a
+  // later success clears both and leaves the window unknown rather than
+  // pinned at critical by a fraction nobody measured.
+  const latched = await store.observe(
+    weeklyObservation({
+      source: "refusal_observed",
+      observed_at: clock.value,
+      remaining_fraction: 0,
+      exhausted_until: clock.value + 3_600_000,
+    }),
+  );
+  assert.equal(latched.state, "exhausted");
+  clock.value += 1_000;
+  const cleared = await store.observe(
+    weeklyObservation({
+      source: "success_observed",
+      observed_at: clock.value,
+      remaining_fraction: undefined,
+    }),
+  );
+  assert.equal(cleared.exhausted_until, null);
+  assert.equal(cleared.remaining_fraction, null);
+  assert.equal(cleared.state, "unknown");
+});
+
 test("claimCanary elects exactly one winner for concurrent invocations", async (t) => {
   const directory = await temporaryStateDirectory(t);
   const clock = clockAt(BASE_INSTANT);

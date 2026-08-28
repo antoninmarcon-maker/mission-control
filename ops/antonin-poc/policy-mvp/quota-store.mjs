@@ -279,6 +279,34 @@ function mergeObservation(stored, incoming, confidence, now, policy) {
     };
   }
 
+  // A stored "nothing left" — a refusal's zero, or the same zero carried
+  // forward by a later reading — is the fact the latch records, not a level. A
+  // success disproves it, so it is replaced rather than preserved.
+  const disprovesStoredBlock =
+    incoming.source === "success_observed" &&
+    (latchActive || stored.remaining_fraction === 0);
+
+  if (
+    incoming.remaining_fraction === null &&
+    stored.remaining_fraction !== null &&
+    storedIsFresh &&
+    !disprovesStoredBlock
+  ) {
+    // §2.4 a `success_observed` yields "not exhausted at T" and nothing else.
+    // Letting it overwrite a fresh reading would wash out the only level we
+    // have — including a `critical` one Antonin read himself — and re-open a
+    // canary straight into the reserve that level exists to protect. The
+    // stored `observed_at` is kept too, so the reading still ages on its own
+    // clock: a success refreshes liveness, never the measurement.
+    return {
+      ...stored,
+      exhausted_until:
+        incoming.source === "success_observed"
+          ? null
+          : (stored.exhausted_until ?? incoming.exhausted_until ?? null),
+    };
+  }
+
   const merged = { ...incoming, last_canary_at: stored.last_canary_at };
 
   if (confidence === "heuristic" && storedIsFresh) {
