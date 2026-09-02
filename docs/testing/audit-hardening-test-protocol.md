@@ -1,7 +1,9 @@
 # Mission Control — protocole de validation audit/hardening
 
-Date de référence : 2 septembre 2026  
-Branche : `fix/audit-hardening`  
+Date de référence : 2 septembre 2026
+
+Branche : `fix/audit-hardening`
+
 PR : <https://github.com/antoninmarcon-maker/mission-control/pull/3>
 
 ## Accès de démonstration isolé
