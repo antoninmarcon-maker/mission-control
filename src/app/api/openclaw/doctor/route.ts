@@ -90,8 +90,17 @@ async function runAndCacheDoctor(): Promise<CachedDoctor> {
       // we want the next poll to pick that up immediately rather than waiting
       // out the TTL.
       const entry: CachedDoctor = {
-        payload: { error: 'OpenClaw is not installed or not reachable' },
-        status: 400,
+        payload: {
+          available: false,
+          healthy: false,
+          level: 'warning',
+          category: 'general',
+          summary: 'OpenClaw is not installed or not reachable',
+          issues: [],
+          canFix: false,
+          raw: '',
+        },
+        status: 200,
         fetchedAt: Date.now(),
       }
       return entry

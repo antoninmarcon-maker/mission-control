@@ -347,7 +347,7 @@ function handleStatus(workspaceId: number) {
 async function handleGitHubStats() {
   const token = await getGitHubToken()
   if (!token) {
-    return NextResponse.json({ error: 'GITHUB_TOKEN not configured' }, { status: 400 })
+    return NextResponse.json({ configured: false })
   }
 
   // Fetch user profile

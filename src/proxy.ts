@@ -201,7 +201,7 @@ export function proxy(request: NextRequest) {
   const isPublicHealthProbe = pathname === '/api/status' && request.nextUrl.searchParams.get('action') === 'health'
   // Exact-match only (no prefix/wildcard) so this exempts just the two health routes.
   const isPublicHealthRoute = pathname === '/api/health' || pathname === '/health'
-  if (pathname === '/login' || pathname === '/setup' || pathname.startsWith('/api/auth/') || pathname === '/api/setup' || pathname === '/api/docs' || pathname === '/docs' || isPublicHealthProbe || isPublicHealthRoute) {
+  if (pathname === '/login' || pathname === '/setup' || pathname === '/robots.txt' || pathname.startsWith('/api/auth/') || pathname === '/api/setup' || pathname === '/api/docs' || pathname === '/docs' || isPublicHealthProbe || isPublicHealthRoute) {
     const { response, nonce } = nextResponseWithNonce(request)
     return addSecurityHeaders(response, request, nonce)
   }

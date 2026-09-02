@@ -89,7 +89,7 @@ export function Dashboard() {
       requests.push(
         apiFetch<any>('/api/github?action=stats')
           .then((data) => {
-            if (data && !data.error) setGithubStats(data)
+            if (data && data.configured !== false && !data.error) setGithubStats(data)
           })
           .catch(() => {})
           .finally(() => setLoading(prev => ({ ...prev, github: false })))

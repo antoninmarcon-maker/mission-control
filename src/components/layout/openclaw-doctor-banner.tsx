@@ -7,6 +7,7 @@ import { useMissionControl } from '@/store'
 import { apiFetch, ApiError } from '@/lib/api-client'
 
 interface OpenClawDoctorStatus {
+  available?: boolean
   level: 'healthy' | 'warning' | 'error'
   category: 'config' | 'state' | 'security' | 'general'
   healthy: boolean
@@ -111,7 +112,7 @@ export function OpenClawDoctorBanner() {
   const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
   const dismissed = doctorDismissedAt != null && (Date.now() - doctorDismissedAt) < TWENTY_FOUR_HOURS
 
-  if (loading || dismissed || !doctor || doctor.healthy) return null
+  if (loading || dismissed || !doctor || doctor.available === false || doctor.healthy) return null
 
   const tone =
     doctor.level === 'error'
