@@ -254,6 +254,7 @@ export function Dashboard() {
 
   return (
     <div className="p-5 space-y-4">
+      <h1 className="sr-only">Mission Control overview</h1>
       <OnboardingChecklistWidget />
       <EmptyStateLaunchpad
         agentCount={dbStats?.agents.total ?? agents.length}

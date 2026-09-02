@@ -129,7 +129,7 @@ function BriefingItem({
     <Tag
       type={onClick ? 'button' : undefined}
       onClick={onClick}
-      className={`inline-flex items-center gap-1.5 text-xs text-foreground/80 ${
+      className={`inline-flex min-h-6 items-center gap-1.5 text-xs text-foreground/80 ${
         onClick ? 'hover:text-foreground cursor-pointer transition-colors' : ''
       }`}
     >

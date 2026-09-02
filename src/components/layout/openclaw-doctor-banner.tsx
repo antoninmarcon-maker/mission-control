@@ -178,7 +178,7 @@ export function OpenClawDoctorBanner() {
             <button
               onClick={handleFix}
               disabled={busy}
-              className={`shrink-0 rounded px-2.5 py-1 text-2xs font-medium transition-colors ${tone.button}`}
+              className={`min-h-6 shrink-0 rounded px-2.5 py-1 text-2xs font-medium transition-colors ${tone.button}`}
             >
               {busy ? t('runningFix') : t('runDoctorFix')}
             </button>

@@ -91,7 +91,7 @@ export function OpenClawUpdateBanner() {
           <>
             <button
               onClick={handleUpdate}
-              className="shrink-0 text-2xs font-medium text-cyan-900 bg-cyan-500 hover:bg-cyan-400 px-2.5 py-1 rounded transition-colors"
+              className="min-h-6 shrink-0 rounded bg-cyan-500 px-2.5 py-1 text-2xs font-medium text-cyan-900 transition-colors hover:bg-cyan-400"
             >
               {tc('updateNow')}
             </button>

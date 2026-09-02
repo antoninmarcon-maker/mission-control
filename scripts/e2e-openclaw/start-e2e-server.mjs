@@ -250,7 +250,7 @@ if (!fs.existsSync(buildIdPath)) {
 const standaloneServerPath = findStandaloneServer(repoRoot)
 
 app = standaloneServerPath && fs.existsSync(standaloneServerPath)
-  ? spawn('node', [standaloneServerPath], {
+  ? spawn('bash', ['scripts/start-standalone.sh'], {
       cwd: repoRoot,
       env: baseEnv,
       stdio: 'inherit',
