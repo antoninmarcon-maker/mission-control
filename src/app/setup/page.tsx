@@ -90,6 +90,7 @@ export default function SetupPage() {
       })
 
       if (!data.needsSetup) {
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
         window.location.href = '/login'
         return
       }
@@ -170,6 +171,8 @@ export default function SetupPage() {
       updateProgress(3, 'done')
 
       await new Promise((r) => setTimeout(r, 500))
+      // Reload so the newly created session is present on the first dashboard request.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
       window.location.href = '/'
     } catch (error) {
       updateProgress(1, 'error')

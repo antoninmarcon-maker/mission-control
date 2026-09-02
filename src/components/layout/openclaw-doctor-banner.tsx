@@ -147,7 +147,7 @@ export function OpenClawDoctorBanner() {
 
   return (
     <div className="mx-4 mt-3 mb-0">
-      <div className={`flex items-start gap-3 px-4 py-3 rounded-lg border text-sm ${tone.frame}`}>
+      <div className={`flex flex-wrap items-start gap-3 rounded-lg border px-4 py-3 text-sm sm:flex-nowrap ${tone.frame}`}>
         <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
         <div className="min-w-0 flex-1">
           <p className="text-xs">
@@ -174,7 +174,7 @@ export function OpenClawDoctorBanner() {
             <p className="mt-2 text-2xs opacity-85">{fixProgress}</p>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex w-full shrink-0 flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap">
           {doctor.canFix && state !== 'success' && (
             <button
               onClick={handleFix}

@@ -197,6 +197,7 @@ export function SettingsPanel() {
         redirectOnUnauthenticated: false,
       })
       if (res.status === 401) {
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
         window.location.assign('/login?next=%2Fsettings')
         return
       }

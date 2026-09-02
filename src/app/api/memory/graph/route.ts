@@ -86,10 +86,7 @@ export async function GET(request: NextRequest) {
   if (isolationDenied) return isolationDenied
 
   if (!memoryDbDir || !existsSync(memoryDbDir)) {
-    return NextResponse.json(
-      { error: 'Memory directory not available', agents: [] },
-      { status: 404 }
-    )
+    return NextResponse.json({ available: false, agents: [] })
   }
 
   const agentFilter = request.nextUrl.searchParams.get('agent') || 'all'
@@ -111,7 +108,7 @@ export async function GET(request: NextRequest) {
     // Sort by total chunks descending
     agents.sort((a, b) => b.totalChunks - a.totalChunks)
 
-    return NextResponse.json({ agents })
+    return NextResponse.json({ available: true, agents })
   } catch (err) {
     logger.error(`Failed to build memory graph data: ${err}`)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

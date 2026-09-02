@@ -64,7 +64,7 @@ export function OpenClawUpdateBanner() {
 
   return (
     <div className="mx-4 mt-3 mb-0">
-      <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-sm">
+      <div className="flex flex-wrap items-center gap-3 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm sm:flex-nowrap">
         <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 shrink-0" />
         <p className="flex-1 text-xs text-cyan-300">
           {state === 'updating' && (
@@ -88,7 +88,7 @@ export function OpenClawUpdateBanner() {
           )}
         </p>
         {!busy && state !== 'success' && (
-          <>
+          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap">
             <button
               onClick={handleUpdate}
               className="min-h-6 shrink-0 rounded bg-cyan-500 px-2.5 py-1 text-2xs font-medium text-cyan-900 transition-colors hover:bg-cyan-400"
@@ -128,7 +128,7 @@ export function OpenClawUpdateBanner() {
                 <path d="M4 4l8 8M12 4l-8 8" />
               </svg>
             </Button>
-          </>
+          </div>
         )}
         {busy && (
           <svg className="w-4 h-4 animate-spin text-amber-400 shrink-0" viewBox="0 0 24 24" fill="none">

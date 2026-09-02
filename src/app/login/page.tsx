@@ -182,6 +182,8 @@ export default function LoginPage() {
     })
       .then((data) => {
         if (data.needsSetup) {
+          // Full navigation leaves the authenticated app shell before first-time setup.
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
           window.location.href = '/setup'
         }
       })
@@ -224,6 +226,7 @@ export default function LoginPage() {
 
     // Full reload ensures the session cookie is sent on all subsequent requests.
     // router.push() + refresh() can race and use stale RSC payloads.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = '/'
     return true
   }, [t])
@@ -349,7 +352,10 @@ export default function LoginPage() {
               {t('noAdminDescription')}
             </p>
             <Button
-              onClick={() => { window.location.href = '/setup' }}
+              onClick={() => {
+                // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+                window.location.href = '/setup'
+              }}
               size="sm"
               className="mt-3"
             >

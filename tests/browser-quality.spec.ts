@@ -85,4 +85,30 @@ test.describe('Browser quality regressions', () => {
 
     expect(undersizedButtons).toEqual([])
   })
+
+  test('mobile dashboard keeps interactive controls inside the viewport', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await signIn(page)
+
+    const clippedControls = await page.locator('button:visible, a[href]:visible, [role="button"]:visible').evaluateAll((controls) =>
+      controls
+        .filter((control) => !control.classList.contains('sr-only'))
+        .map((control) => {
+          const rect = control.getBoundingClientRect()
+          return {
+            name: (
+              control.getAttribute('aria-label') ||
+              control.getAttribute('title') ||
+              control.textContent ||
+              '<unnamed>'
+            ).trim().replace(/\s+/g, ' ').slice(0, 80),
+            left: Math.round(rect.left),
+            right: Math.round(rect.right),
+          }
+        })
+        .filter(({ left, right }) => left < 0 || right > window.innerWidth)
+    )
+
+    expect(clippedControls).toEqual([])
+  })
 })
