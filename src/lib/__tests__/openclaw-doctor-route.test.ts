@@ -100,17 +100,24 @@ describe('GET /api/openclaw/doctor — single-flight + TTL cache (issue #613)', 
     expect(runOpenClaw).toHaveBeenCalledTimes(2)
   })
 
-  it('does not cache "not installed" — next poll re-attempts immediately', async () => {
+  it('returns an unavailable status without caching "not installed"', async () => {
     runOpenClaw.mockRejectedValue(Object.assign(new Error('spawn openclaw ENOENT'), { code: 'ENOENT' }))
 
     const { GET } = await import('@/app/api/openclaw/doctor/route')
 
     const first = await GET(fakeRequest())
-    expect(first.status).toBe(400)
+    expect(first.status).toBe(200)
+    await expect(first.json()).resolves.toMatchObject({
+      available: false,
+      healthy: false,
+      level: 'warning',
+      category: 'general',
+      canFix: false,
+    })
     expect(runOpenClaw).toHaveBeenCalledTimes(1)
 
     const second = await GET(fakeRequest())
-    expect(second.status).toBe(400)
+    expect(second.status).toBe(200)
     // Both calls invoked the subprocess — operator may install OpenClaw mid-session.
     expect(runOpenClaw).toHaveBeenCalledTimes(2)
   })

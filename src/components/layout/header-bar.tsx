@@ -369,6 +369,7 @@ export function HeaderBar() {
             onClick={() => navigateToPanel('notifications')}
             onMouseEnter={() => prefetchPanel('notifications')}
             onFocus={() => prefetchPanel('notifications')}
+            aria-label={th('goToNotifications')}
             className="relative"
           >
             <BellIcon />

@@ -19,6 +19,15 @@ test.describe('GitHub Sync API', () => {
     expect(body.error).toBeDefined()
   })
 
+  test('GET /api/github?action=stats reports an optional integration as unavailable', async ({ request }) => {
+    const res = await request.get('/api/github?action=stats', {
+      headers: API_KEY_HEADER,
+    })
+
+    expect(res.status()).toBe(200)
+    await expect(res.json()).resolves.toEqual({ configured: false })
+  })
+
   test('GET /api/github rejects invalid action', async ({ request }) => {
     const res = await request.get('/api/github?action=invalid', {
       headers: API_KEY_HEADER,

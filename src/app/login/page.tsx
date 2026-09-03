@@ -182,6 +182,8 @@ export default function LoginPage() {
     })
       .then((data) => {
         if (data.needsSetup) {
+          // Full navigation leaves the authenticated app shell before first-time setup.
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
           window.location.href = '/setup'
         }
       })
@@ -224,6 +226,7 @@ export default function LoginPage() {
 
     // Full reload ensures the session cookie is sent on all subsequent requests.
     // router.push() + refresh() can race and use stale RSC payloads.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = '/'
     return true
   }, [t])
@@ -292,7 +295,7 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background p-4">
+    <main className="min-h-screen flex items-center justify-center bg-background p-4">
       <div className="absolute top-4 right-4">
         <LanguageSwitcherSelect />
       </div>
@@ -349,7 +352,10 @@ export default function LoginPage() {
               {t('noAdminDescription')}
             </p>
             <Button
-              onClick={() => { window.location.href = '/setup' }}
+              onClick={() => {
+                // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+                window.location.href = '/setup'
+              }}
               size="sm"
               className="mt-3"
             >
@@ -543,6 +549,6 @@ export default function LoginPage() {
 
         <p className="text-center text-xs text-muted-foreground mt-6">{t('orchestrationTagline')}</p>
       </div>
-    </div>
+    </main>
   )
 }

@@ -89,7 +89,7 @@ export function Dashboard() {
       requests.push(
         apiFetch<any>('/api/github?action=stats')
           .then((data) => {
-            if (data && !data.error) setGithubStats(data)
+            if (data && data.configured !== false && !data.error) setGithubStats(data)
           })
           .catch(() => {})
           .finally(() => setLoading(prev => ({ ...prev, github: false })))
@@ -254,6 +254,7 @@ export function Dashboard() {
 
   return (
     <div className="p-5 space-y-4">
+      <h1 className="sr-only">Mission Control overview</h1>
       <OnboardingChecklistWidget />
       <EmptyStateLaunchpad
         agentCount={dbStats?.agents.total ?? agents.length}
