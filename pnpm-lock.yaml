@@ -60,7 +60,7 @@ importers:
         specifier: ^10.3.1
         version: 10.3.1
       postcss:
-        specifier: ^8.5.26
+        specifier: '>=8.5.18 <9'
         version: 8.5.26
       react:
         specifier: ^19.2.8
