@@ -680,13 +680,19 @@ function anthropicDispatchId(alias: 'opus' | 'sonnet' | 'haiku', fallback: strin
   return entry && entry.provider === 'anthropic' ? getDispatchModelId(entry) : fallback
 }
 
-function classifyDirectModel(task: DispatchableTask): string {
+export function classifyDirectModel(task: DispatchableTask): string {
   // Check per-agent config override first
   if (task.agent_config) {
     try {
       const cfg = JSON.parse(task.agent_config)
       if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) {
-        // Strip gateway prefixes like "9router/cc/" to get bare model ID
+        // Preserve recognized provider prefixes ("ollama/<model>",
+        // "local/<model>", etc.) — pickProvider() needs them intact to
+        // route to the right backend. Only strip unrecognized gateway
+        // prefixes like "9router/cc/" down to the bare model ID.
+        if (stripProviderPrefix(cfg.dispatchModel) !== cfg.dispatchModel) {
+          return cfg.dispatchModel
+        }
         return cfg.dispatchModel.replace(/^.*\//, '')
       }
     } catch { /* ignore */ }
