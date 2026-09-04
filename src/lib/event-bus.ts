@@ -22,6 +22,11 @@ export function eventBelongsToWorkspace(event: ServerEvent, workspaceId: number)
 
 // Event types emitted by the bus
 export type EventType =
+  | 'proposal.created'
+  | 'proposal.updated'
+  | 'proposal.dismissed'
+  | 'proposal.accepted'
+  | 'proposal.expired'
   | 'task.created'
   | 'task.updated'
   | 'task.deleted'

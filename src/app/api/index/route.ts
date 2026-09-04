@@ -12,6 +12,10 @@ interface Endpoint {
 }
 
 const endpoints: Endpoint[] = [
+  // ── Task proposals ────────────────────────────────
+  { path: '/api/task-proposals', methods: ['GET', 'POST'], description: 'Task proposals — scoped listing and metrics, idempotent ingestion', tag: 'Tasks', auth: 'viewer/operator' },
+  { path: '/api/task-proposals/:id', methods: ['PUT'], description: 'Edit or dismiss a pending proposal with a revision guard', tag: 'Tasks', auth: 'operator' },
+  { path: '/api/task-proposals/:id/accept', methods: ['POST'], description: 'Human-only atomic acceptance; retries return the linked task', tag: 'Tasks', auth: 'operator' },
   // ── Tasks ─────────────────────────────────────────
   { path: '/api/tasks', methods: ['GET', 'POST'], description: 'Task CRUD — list, create', tag: 'Tasks', auth: 'viewer/operator' },
   { path: '/api/tasks/:id', methods: ['GET', 'PATCH', 'DELETE'], description: 'Task detail — read, update, delete', tag: 'Tasks', auth: 'viewer/operator/admin' },
