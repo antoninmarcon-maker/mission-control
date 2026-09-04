@@ -1550,6 +1550,46 @@ const migrations: Migration[] = [
         db.exec(`ALTER TABLE agents ADD COLUMN claude_base_session_created_at TEXT DEFAULT NULL`)
       }
     }
+  },
+  {
+    id: '056_task_proposals',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS task_proposals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL,
+          project_id INTEGER,
+          source_type TEXT NOT NULL CHECK(source_type IN ('chat','event')),
+          source_ref TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          title TEXT NOT NULL,
+          objective TEXT NOT NULL,
+          context TEXT NOT NULL,
+          rationale TEXT NOT NULL,
+          risk TEXT NOT NULL CHECK(risk IN ('low','medium','high','critical')),
+          route_forecast TEXT,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','dismissed','expired')),
+          revision TEXT NOT NULL,
+          orchestrator_agent TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          accepted_by TEXT,
+          accepted_at INTEGER,
+          dismissed_by TEXT,
+          dismissed_at INTEGER,
+          dismissal_reason TEXT,
+          task_id INTEGER,
+          expires_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE(workspace_id, idempotency_key),
+          FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
+          FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_proposals_workspace_status ON task_proposals(workspace_id, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_task_proposals_source ON task_proposals(workspace_id, source_type, source_ref);
+      `)
+    }
   }
 ]
 
