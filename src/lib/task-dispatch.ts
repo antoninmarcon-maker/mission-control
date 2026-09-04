@@ -15,6 +15,7 @@ import { getAllGatewaySessions } from './sessions'
 import { parseJsonlTranscript, readSessionJsonl, type TranscriptMessage } from './transcript-parser'
 import { syncTaskOutbound } from './github-sync-engine'
 import { classifyModelProvider, getDispatchModelId, getModelByAlias } from './models'
+import { CLARIFICATION_READY_SQL, clarificationPrompt } from './task-clarification'
 import { getMiniMaxApiKey, resolveMiniMaxEndpoint } from './minimax'
 import type Database from 'better-sqlite3'
 
@@ -284,6 +285,8 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
   if (task.description) {
     lines.push('', task.description)
   }
+  const confirmedScope = clarificationPrompt(safeParseMetadata(task.metadata))
+  if (confirmedScope) lines.push('', confirmedScope)
 
   if (rejectionFeedback) {
     lines.push('', '## Previous Review Feedback', rejectionFeedback, '', 'Please address this feedback in your response.')
@@ -1745,6 +1748,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
     WHERE t.status = 'assigned'
       AND w.isolation = 'shared'
       AND t.assigned_to IS NOT NULL
+      AND ${CLARIFICATION_READY_SQL.replaceAll('metadata', 't.metadata')}
     ORDER BY
       CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       t.created_at ASC
@@ -1771,7 +1775,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
     // multiple workers polling), exactly one UPDATE reports changes=1 and the
     // loser skips this task — preventing double-dispatch (issue/PR #698).
     const claim = db
-      .prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?")
+      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL}`)
       .run('in_progress', now, task.id, task.workspace_id)
 
     if (claim.changes === 0) {
@@ -2162,6 +2166,7 @@ export async function autoRouteInboxTasks(): Promise<{ ok: boolean; message: str
     SELECT id, title, description, priority, tags, workspace_id
     FROM tasks
     WHERE status = 'inbox' AND assigned_to IS NULL
+      AND ${CLARIFICATION_READY_SQL}
     ORDER BY
       CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       created_at ASC

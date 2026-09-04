@@ -76,7 +76,7 @@ vi.mock('../db', () => ({
       // (UPDATE ... WHERE id = ? AND status = 'assigned') introduced in #698.
       if (
         sql === 'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?' ||
-        sql === "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?"
+        sql.startsWith("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?")
       ) {
         return {
           run: (status: string, _updatedAt: number, taskId: number) => {

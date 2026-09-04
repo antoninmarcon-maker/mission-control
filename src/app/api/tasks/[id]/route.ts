@@ -154,6 +154,10 @@ export async function PUT(
       tags,
       metadata
     } = body;
+    const currentMetadata = currentTask.metadata ? JSON.parse(currentTask.metadata) : {};
+    if (currentMetadata.clarification?.state === 'pending' && requestedStatus && ['in_progress', 'review', 'quality_review', 'done'].includes(requestedStatus)) {
+      return NextResponse.json({ error: 'Le cadrage doit être validé avant exécution.' }, { status: 409 });
+    }
     const normalizedStatus = normalizeTaskUpdateStatus({
       currentStatus: currentTask.status,
       requestedStatus,
@@ -283,7 +287,9 @@ export async function PUT(
       updateParams.push(JSON.stringify(tags));
     }
     if (metadata !== undefined) {
-      fieldsToUpdate.push('metadata = ?');
+      // Reserved decision field: only /clarification may write it. Preserve the
+      // current DB value atomically, even when the edit form has stale metadata.
+      fieldsToUpdate.push("metadata = json_set(?, '$.clarification', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.clarification'))");
       updateParams.push(JSON.stringify(metadata));
     }
     
