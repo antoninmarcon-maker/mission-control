@@ -6,8 +6,9 @@ import { useTranslations } from 'next-intl'
 import Image from 'next/image'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
+import { OfficeAgentAvatar } from '@/components/ui/office-agent-avatar'
 import { useMissionControl, Agent } from '@/store'
-import { buildOfficeLayout } from '@/lib/office-layout'
+import { buildOfficeLayout, getAgentProjectVisual, getIdleMinutes, sortOfficeAgents } from '@/lib/office-layout'
 import { apiFetch, ApiError } from '@/lib/api-client'
 
 type ViewMode = 'office' | 'org-chart'
@@ -51,8 +52,6 @@ interface SeatPosition {
 interface MovingWorker {
   id: string
   agentId: number
-  initials: string
-  colorClass: string
   startX: number
   startY: number
   endX: number
@@ -176,27 +175,6 @@ const statusEmoji: Record<string, string> = {
   offline: '',
 }
 
-function getInitials(name: string): string {
-  return name
-    .split(/[\s_-]+/)
-    .filter(Boolean)
-    .map(w => w[0])
-    .join('')
-    .toUpperCase()
-    .slice(0, 2)
-}
-
-function hashColor(name: string): string {
-  let hash = 0
-  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash)
-  const colors = [
-    'bg-blue-600', 'bg-emerald-600', 'bg-violet-600', 'bg-amber-600',
-    'bg-rose-600', 'bg-cyan-600', 'bg-indigo-600', 'bg-teal-600',
-    'bg-orange-600', 'bg-pink-600', 'bg-lime-600', 'bg-fuchsia-600',
-  ]
-  return colors[Math.abs(hash) % colors.length]
-}
-
 function hashNumber(value: string): number {
   let hash = 0
   for (let i = 0; i < value.length; i += 1) {
@@ -222,13 +200,6 @@ function easeInOut(progress: number): number {
   return progress < 0.5
     ? 2 * progress * progress
     : 1 - Math.pow(-2 * progress + 2, 2) / 2
-}
-
-function getStatusEmote(status: Agent['status']): string {
-  if (status === 'busy') return '\u25CF'  // filled circle
-  if (status === 'idle') return '\u25CB'  // open circle
-  if (status === 'error') return '\u25B2'  // triangle
-  return '\u2013'  // dash
 }
 
 function inferLocalRole(row: SessionAgentRow): string {
@@ -291,36 +262,6 @@ function getPropSprite(propId: string): string {
   if (propId === 'plant-r') return '/office-sprites/kenney/plantSmall2.png'
   if (propId === 'kitchen') return '/office-sprites/kenney/rugRectangle.png'
   return ''
-}
-
-const HERO_SHEET_COLS = 6
-const HERO_SHEET_ROWS = 7
-
-function getWorkerHeroFrame(status: Agent['status'], isMoving: boolean, frame: number) {
-  const phase = frame % 2
-  const walkCol = phase === 0 ? 1 : 3
-  if (isMoving) return { col: walkCol, row: 3 } // side-walk row
-  if (status === 'busy') return { col: walkCol, row: 0 } // forward loop as typing proxy
-  if (status === 'error') return { col: 5, row: 6 }
-  return { col: phase === 0 ? 0 : 5, row: 0 } // idle pulse
-}
-
-interface WorkerVariant {
-  id: string
-  filter: string
-  accent: string
-}
-
-const WORKER_VARIANTS: WorkerVariant[] = [
-  { id: 'default', filter: 'none', accent: 'border-cyan-300/60' },
-  { id: 'warm', filter: 'hue-rotate(18deg) saturate(1.08)', accent: 'border-amber-300/60' },
-  { id: 'cool', filter: 'hue-rotate(-20deg) saturate(1.1)', accent: 'border-sky-300/60' },
-  { id: 'mint', filter: 'hue-rotate(42deg) saturate(1.08)', accent: 'border-emerald-300/60' },
-  { id: 'violet', filter: 'hue-rotate(64deg) saturate(1.12)', accent: 'border-violet-300/60' },
-]
-
-function getWorkerVariant(name: string): WorkerVariant {
-  return WORKER_VARIANTS[hashNumber(name) % WORKER_VARIANTS.length]
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -490,6 +431,12 @@ export function OfficePanel() {
   const t = useTranslations('office')
   const { agents, dashboardMode, currentUser } = useMissionControl()
   const isLocalMode = dashboardMode === 'local'
+  const getStatusText = useCallback((status: Agent['status']) => {
+    if (status === 'busy') return t('activeStatus')
+    if (status === 'idle') return t('legendStandby')
+    if (status === 'error') return t('filterNeedsAttention')
+    return t('filterNotRunning')
+  }, [t])
   const [localAgents, setLocalAgents] = useState<Agent[]>([])
   const [sessionAgents, setSessionAgents] = useState<Agent[]>([])
   const [viewMode, setViewMode] = useState<ViewMode>('office')
@@ -511,7 +458,6 @@ export function OfficePanel() {
   const [loading, setLoading] = useState(true)
   const [localBootstrapping, setLocalBootstrapping] = useState(isLocalMode)
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>('all')
-  const [spriteFrame, setSpriteFrame] = useState(0)
   const [timeTheme, setTimeTheme] = useState<TimeTheme>('night')
   const [mapZoom, setMapZoom] = useState(1)
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 })
@@ -526,7 +472,7 @@ export function OfficePanel() {
   const roamReturnTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map())
   const movingAgentIdsRef = useRef<Set<number>>(new Set())
   const movingWorkersRef = useRef<MovingWorker[]>([])
-  const renderedWorkersRef = useRef<Array<{ agent: Agent; x: number; y: number; zoneLabel: string; seatLabel: string; isMoving: boolean; direction: { dx: number; dy: number }; variant: WorkerVariant }>>([])
+  const renderedWorkersRef = useRef<Array<{ agent: Agent; x: number; y: number; zoneLabel: string; seatLabel: string; isMoving: boolean }>>([])
   const [transitioningAgentIds, setTransitioningAgentIds] = useState<Set<number>>(new Set())
   const previousSeatMapRef = useRef<Map<number, SeatPosition>>(new Map())
   const [movingWorkers, setMovingWorkers] = useState<MovingWorker[]>([])
@@ -632,13 +578,6 @@ export function OfficePanel() {
     const interval = setInterval(fetchAgents, 10000)
     return () => clearInterval(interval)
   }, [fetchAgents])
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setSpriteFrame((current) => (current + 1) % 2)
-    }, 380)
-    return () => clearInterval(interval)
-  }, [])
 
   const displayAgents = useMemo(() => {
     if (agents.length > 0) return agents
@@ -795,17 +734,6 @@ export function OfficePanel() {
     return positions
   }, [movingWorkers])
 
-  const movingDirectionByAgent = useMemo(() => {
-    const directions = new Map<number, { dx: number; dy: number }>()
-    for (const worker of movingWorkers) {
-      directions.set(worker.agentId, {
-        dx: worker.endX - worker.startX,
-        dy: worker.endY - worker.startY,
-      })
-    }
-    return directions
-  }, [movingWorkers])
-
   const renderedWorkers = useMemo(() => {
     return gameWorkers.map((worker) => {
       const movingPosition = movingPositionByAgent.get(worker.agent.id)
@@ -814,11 +742,9 @@ export function OfficePanel() {
         x: movingPosition?.x ?? worker.x,
         y: movingPosition?.y ?? worker.y,
         isMoving: Boolean(movingPosition),
-        direction: movingDirectionByAgent.get(worker.agent.id) || { dx: 0, dy: 0 },
-        variant: getWorkerVariant(worker.agent.name),
       }
     })
-  }, [gameWorkers, movingDirectionByAgent, movingPositionByAgent])
+  }, [gameWorkers, movingPositionByAgent])
 
   const officePrefsKey = useMemo(() => {
     const userPart = currentUser?.id ? `u${currentUser.id}` : `guest-${currentUser?.username || 'anon'}`
@@ -1015,9 +941,9 @@ export function OfficePanel() {
   }, [agentActionOverrides, renderedWorkers])
 
   const rosterRows = useMemo(() => {
-    return gameWorkers.map(({ agent }) => {
-      const minutesIdle = agent.last_seen ? Math.floor((Date.now() / 1000 - agent.last_seen) / 60) : Number.POSITIVE_INFINITY
-      const needsAttention = isLocalMode && agent.status === 'idle' && minutesIdle >= 15
+    return sortOfficeAgents(gameWorkers.map(({ agent }) => agent)).map((agent) => {
+      const minutesIdle = getIdleMinutes(agent.last_seen)
+      const needsAttention = isLocalMode && agent.status === 'idle' && minutesIdle !== null && minutesIdle >= 15
       return {
         agent,
         minutesIdle,
@@ -1079,8 +1005,6 @@ export function OfficePanel() {
       const movement: MovingWorker = {
         id: `${agent.id}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
         agentId: agent.id,
-        initials: getInitials(agent.name),
-        colorClass: hashColor(agent.name),
         startX,
         startY,
         endX,
@@ -1493,39 +1417,18 @@ export function OfficePanel() {
 
   const categoryGroups = useMemo(() => {
     const groups = new Map<string, Agent[]>()
-    const getCategory = (agent: Agent): string => {
-      const name = (agent.name || '').toLowerCase()
-      if (name.startsWith('habi-')) return 'Habi Lanes'
-      if (name.startsWith('ops-')) return 'Ops Automation'
-      if (name.includes('canary')) return 'Canary'
-      if (name.startsWith('main')) return 'Core'
-      if (name.startsWith('remote-')) return 'Remote'
-      return 'Other'
-    }
-
     for (const a of visibleDisplayAgents) {
-      const category = getCategory(a)
+      const category = getAgentProjectVisual(a).label
       if (!groups.has(category)) groups.set(category, [])
       groups.get(category)!.push(a)
     }
-
-    const order = ['Habi Lanes', 'Ops Automation', 'Core', 'Canary', 'Remote', 'Other']
-    return new Map(
-      [...groups.entries()].sort(([a], [b]) => {
-        const ai = order.indexOf(a)
-        const bi = order.indexOf(b)
-        const av = ai === -1 ? Number.MAX_SAFE_INTEGER : ai
-        const bv = bi === -1 ? Number.MAX_SAFE_INTEGER : bi
-        if (av !== bv) return av - bv
-        return a.localeCompare(b)
-      })
-    )
+    return new Map([...groups.entries()].sort(([a], [b]) => a.localeCompare(b)))
   }, [visibleDisplayAgents])
 
   const statusGroups = useMemo(() => {
     const groups = new Map<string, Agent[]>()
     for (const a of visibleDisplayAgents) {
-      const key = statusLabel[a.status] || a.status
+      const key = getStatusText(a.status)
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key)!.push(a)
     }
@@ -1541,7 +1444,7 @@ export function OfficePanel() {
         return a.localeCompare(b)
       })
     )
-  }, [visibleDisplayAgents])
+  }, [getStatusText, visibleDisplayAgents])
 
   const orgGroups = useMemo(() => {
     if (orgSegmentMode === 'role') return roleGroups
@@ -1603,12 +1506,12 @@ export function OfficePanel() {
           <p className="text-sm mt-1">{t('emptyDeckSubtitle')}</p>
         </div>
       ) : viewMode === 'office' ? (
-        <div className={`grid grid-cols-1 ${showSidebar ? 'xl:grid-cols-[220px_1fr]' : 'xl:grid-cols-1'} gap-4`}>
+        <div className={`grid grid-cols-1 ${showSidebar ? 'xl:grid-cols-[286px_minmax(0,1fr)]' : 'xl:grid-cols-1'} gap-4`}>
           {showSidebar && (
           <div className="void-panel text-foreground p-3 h-fit">
             <div className="flex items-center justify-between mb-2">
               <div className="text-xs font-semibold font-mono tracking-wider text-void-cyan">{t('crewHeader')}</div>
-              <div className="text-[10px] text-muted-foreground">{t('onlineCount', { count: visibleDisplayAgents.length })}</div>
+              <div className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-foreground/75">{visibleDisplayAgents.length}</div>
             </div>
             <div className="mb-2 flex flex-wrap gap-1.5">
               {([
@@ -1661,40 +1564,65 @@ export function OfficePanel() {
               </div>
             )}
             <div className="space-y-2 max-h-[560px] overflow-y-auto pr-1">
-              {filteredRosterRows.map(({ agent, minutesIdle, needsAttention }) => (
-                <Button
-                  key={agent.id}
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setSelectedAgent(agent)
-                    const worker = renderedWorkers.find((item) => item.agent.id === agent.id)
-                    if (worker) focusMapPoint(worker.x, worker.y)
-                  }}
-                  className={`w-full flex items-center gap-2 rounded-lg p-2 text-left h-auto ${
-                    needsAttention
-                      ? 'bg-amber-500/12 border border-amber-400/60 hover:bg-amber-500/20'
-                      : 'bg-black/20 border border-white/5 hover:bg-black/35'
-                  }`}
-                >
-                  <span className={`w-6 h-6 rounded ${hashColor(agent.name)} flex items-center justify-center text-[10px] font-bold text-white`}>
-                    {getInitials(agent.name)}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-xs font-medium truncate">{agent.name}</span>
-                    <span className="block text-[10px] text-slate-300 truncate">{agent.role}</span>
-                    <span className="block text-[9px] text-slate-400 truncate">
-                      {agent.last_activity || t('noRecentActivity')}
+              {filteredRosterRows.map(({ agent, minutesIdle, needsAttention }) => {
+                const project = getAgentProjectVisual(agent)
+                const activityLabel = agent.status === 'busy'
+                  ? t('activeStatus')
+                  : agent.status === 'offline'
+                    ? t('filterNotRunning')
+                    : agent.status === 'error'
+                      ? t('filterNeedsAttention')
+                      : minutesIdle === null
+                        ? t('neverSeen')
+                        : t('idleMinutes', { minutes: minutesIdle })
+
+                return (
+                  <Button
+                    key={agent.id}
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setSelectedAgent(agent)
+                      const worker = renderedWorkers.find((item) => item.agent.id === agent.id)
+                      if (worker) focusMapPoint(worker.x, worker.y)
+                    }}
+                    className={`group/roster w-full items-start gap-2.5 rounded-lg border p-2.5 text-left h-auto ${
+                      needsAttention
+                        ? 'bg-amber-500/12 border-amber-400/55 hover:bg-amber-500/20'
+                        : 'bg-black/20 border-white/7 hover:border-white/15 hover:bg-black/35'
+                    }`}
+                  >
+                    <OfficeAgentAvatar
+                      name={agent.name}
+                      status={agent.status}
+                      statusLabel={getStatusText(agent.status)}
+                      project={project}
+                      className="mt-0.5 h-10 w-8 shrink-0 transition-transform duration-200 group-hover/roster:-translate-y-0.5"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="block min-w-0 flex-1 truncate text-xs font-semibold text-foreground">{agent.name}</span>
+                        <span className={`h-1.5 w-1.5 shrink-0 ${agent.status === 'idle' ? 'rounded-full' : agent.status === 'error' ? '[clip-path:polygon(50%_0,100%_100%,0_100%)]' : 'rounded-[2px]'} ${statusDot[agent.status]}`} />
+                      </span>
+                      <span className="mt-0.5 block truncate text-[10px] font-medium" style={{ color: project.accent }}>
+                        {project.label}
+                      </span>
+                      <span className="mt-0.5 block truncate text-[10px] text-foreground/65">{agent.role}</span>
+                      <span className={`mt-1 block truncate text-[9px] font-semibold ${
+                        agent.status === 'busy'
+                          ? 'text-void-amber'
+                          : needsAttention
+                            ? 'text-amber-300'
+                            : agent.status === 'error'
+                              ? 'text-void-crimson'
+                              : 'text-foreground/55'
+                      }`}>
+                        {activityLabel}
+                      </span>
                     </span>
-                  </span>
-                  <span className="flex flex-col items-end gap-1">
-                    <span className={`w-2 h-2 rounded-full ${statusDot[agent.status]}`} />
-                    <span className={`text-[9px] ${needsAttention ? 'text-amber-300 font-semibold' : 'text-slate-400'}`}>
-                      {agent.status === 'busy' ? t('activeStatus') : t('idleMinutes', { minutes: minutesIdle })}
-                    </span>
-                  </span>
-                </Button>
-              ))}
+                  </Button>
+                )
+              })}
               {filteredRosterRows.length === 0 && (
                 <div className="text-[11px] text-slate-400 px-1 py-2">{t('noWorkersInFilter')}</div>
               )}
@@ -1960,7 +1888,12 @@ export function OfficePanel() {
                 ))}
               </svg>
 
-              {renderedWorkers.map(({ agent, x, y, zoneLabel, seatLabel, isMoving, direction }) => (
+              {renderedWorkers.map(({ agent, x, y, seatLabel, isMoving }) => {
+                const project = getAgentProjectVisual(agent)
+                const statusText = getStatusText(agent.status)
+                const keepLabelVisible = agent.status === 'busy' || agent.status === 'error'
+
+                return (
                 <div key={agent.id}>
                   <div
                     className="absolute -translate-x-1/2 pointer-events-none"
@@ -1982,7 +1915,7 @@ export function OfficePanel() {
                     className="absolute -translate-x-1/2 pointer-events-none"
                     style={{ left: `${x}%`, top: `calc(${y}% - 56px)` }}
                   >
-                    <div className="relative w-16 h-9">
+                    <div className="relative w-16 h-8">
                       <Image
                         src="/office-sprites/kenney/desk.png"
                         alt=""
@@ -1990,7 +1923,7 @@ export function OfficePanel() {
                         width={64}
                         height={32}
                         unoptimized
-                        className="w-16 h-9 object-contain opacity-95"
+                        className="w-16 h-8 object-contain opacity-95"
                         style={{ imageRendering: 'pixelated', filter: themePalette.spriteFilter }}
                         draggable={false}
                       />
@@ -2011,38 +1944,36 @@ export function OfficePanel() {
                   <Button
                     variant="ghost"
                     onClick={() => setSelectedAgent(agent)}
-                    className="absolute -translate-x-1/2 -translate-y-1/2 transition-all duration-500 hover:scale-110 h-auto p-0 rounded-none hover:bg-transparent"
+                    aria-label={`${agent.name} — ${project.label} — ${statusText}`}
+                    className={`group/worker absolute h-auto -translate-x-1/2 -translate-y-1/2 rounded-none p-0 transition-[transform,filter,opacity] duration-300 hover:z-40 hover:scale-110 hover:bg-transparent focus-visible:z-40 focus-visible:ring-2 focus-visible:ring-void-cyan focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                      agent.status === 'offline' ? 'opacity-50 saturate-[0.72] hover:opacity-100' : 'opacity-100'
+                    }`}
                     style={{ left: `${x}%`, top: `${y}%` }}
                   >
-                    <div className="absolute -top-7 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-black/70 border border-white/10 text-white text-[11px] px-2 py-0.5 shadow-[0_0_12px_rgba(0,0,0,0.4)]">
-                      <span className={`inline-block w-2 h-2 rounded-full ${statusDot[agent.status]} mr-1`} />
-                      {agent.name}
-                    </div>
-                    <div className="absolute -top-12 left-1/2 -translate-x-1/2 text-sm">
-                      <span className={`${agent.status === 'busy' ? 'animate-bounce' : 'animate-pulse'}`}>{getStatusEmote(agent.status)}</span>
-                    </div>
-                    <div className="relative w-8 h-12 mx-auto">
-                      <div
-                        className={`absolute inset-0 ${transitioningAgentIds.has(agent.id) || isMoving ? 'animate-pulse' : ''}`}
-                        style={{
-                          backgroundImage: `url('/office-sprites/cc0-hero/player_full_animation.png')`,
-                          backgroundRepeat: 'no-repeat',
-                          backgroundSize: `${HERO_SHEET_COLS * 100}% ${HERO_SHEET_ROWS * 100}%`,
-                          backgroundPosition: (() => {
-                            const frame = getWorkerHeroFrame(agent.status, isMoving, spriteFrame)
-                            const xPct = (frame.col / (HERO_SHEET_COLS - 1)) * 100
-                            const yPct = (frame.row / (HERO_SHEET_ROWS - 1)) * 100
-                            return `${xPct}% ${yPct}%`
-                          })(),
-                          imageRendering: 'pixelated',
-                          filter: themePalette.spriteFilter,
-                          transform: isMoving && Math.abs(direction.dx) > Math.abs(direction.dy) && direction.dx < 0 ? 'scaleX(-1)' : undefined,
-                          transformOrigin: 'center',
-                        }}
-                      />
-                      <div className={`absolute left-[8px] top-[14px] w-4 h-3 ${hashColor(agent.name)} border border-black/60`} />
-                    </div>
-                    {!isMoving && <div className="text-[9px] text-slate-300 font-mono mt-0.5">#{seatLabel}</div>}
+                    <span
+                      className={`pointer-events-none absolute -top-9 left-1/2 z-20 flex max-w-40 -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-md border bg-[#050b14]/95 px-2 py-1 text-[10px] font-semibold text-white shadow-[0_8px_20px_rgba(0,0,0,0.45)] backdrop-blur-sm transition-[opacity,transform] duration-200 ${
+                        keepLabelVisible
+                          ? 'translate-y-0 opacity-100'
+                          : 'translate-y-1 opacity-0 group-hover/worker:translate-y-0 group-hover/worker:opacity-100 group-focus-visible/worker:translate-y-0 group-focus-visible/worker:opacity-100'
+                      }`}
+                      style={{ borderColor: `${project.accent}80` }}
+                    >
+                      <span className="h-2 w-1 shrink-0 rounded-sm" style={{ backgroundColor: project.accent }} />
+                      <span className="max-w-28 truncate">{agent.name}</span>
+                      {keepLabelVisible && (
+                        <span className={`ml-0.5 text-[8px] font-bold uppercase tracking-wide ${agent.status === 'busy' ? 'text-void-amber' : 'text-void-crimson'}`}>
+                          {statusText}
+                        </span>
+                      )}
+                    </span>
+                    <OfficeAgentAvatar
+                      name={agent.name}
+                      status={agent.status}
+                      statusLabel={statusText}
+                      project={project}
+                      moving={isMoving || transitioningAgentIds.has(agent.id)}
+                    />
+                    {!isMoving && <span className="mt-0.5 block font-mono text-[8px] text-foreground/55">#{seatLabel}</span>}
                   </Button>
 
                   {agentActionOverrides.has(agent.id) && (
@@ -2063,14 +1994,9 @@ export function OfficePanel() {
                     </div>
                   )}
 
-                  <div
-                    className="absolute text-[9px] text-slate-500/70 font-mono pointer-events-none"
-                    style={{ left: `${x}%`, top: `calc(${y}% + 38px)` }}
-                  >
-                    {zoneLabel}
-                  </div>
                 </div>
-              ))}
+                )
+              })}
             </div>
 
             {showMinimap && (
@@ -2100,8 +2026,13 @@ export function OfficePanel() {
                   <Button
                     key={`mini-worker-${worker.agent.id}`}
                     variant="ghost"
-                    className={`absolute w-2.5 h-2.5 rounded-full -translate-x-1/2 -translate-y-1/2 ${hashColor(worker.agent.name)} border border-black/40 h-auto p-0 min-w-0 hover:bg-transparent`}
-                    style={{ left: `${worker.x}%`, top: `${worker.y}%` }}
+                    className={`absolute h-2.5 w-2.5 min-w-0 -translate-x-1/2 -translate-y-1/2 border-2 border-[#050b14] p-0 hover:scale-125 ${worker.agent.status === 'idle' ? 'rounded-full' : 'rounded-[2px]'}`}
+                    style={{
+                      left: `${worker.x}%`,
+                      top: `${worker.y}%`,
+                      backgroundColor: getAgentProjectVisual(worker.agent).accent,
+                      opacity: worker.agent.status === 'offline' ? 0.45 : 1,
+                    }}
                     onClick={(event) => {
                       event.stopPropagation()
                       setSelectedAgent(worker.agent)
@@ -2227,25 +2158,33 @@ export function OfficePanel() {
                 <span className="text-xs text-muted-foreground ml-1">({members.length})</span>
               </div>
               <div className="flex flex-wrap gap-3">
-                {members.map(agent => (
-                  <div
-                    key={agent.id}
-                    onClick={() => setSelectedAgent(agent)}
-                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer transition-all hover:scale-[1.02] ${statusGlow[agent.status]}`}
-                    style={{ background: 'var(--card)' }}
-                  >
-                    <div className={`w-8 h-8 rounded-full ${hashColor(agent.name)} flex items-center justify-center text-white font-bold text-xs`}>
-                      {getInitials(agent.name)}
-                    </div>
-                    <div>
-                      <div className="text-sm font-medium text-foreground">{agent.name}</div>
-                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                        <span className={`w-1.5 h-1.5 rounded-full ${statusDot[agent.status]}`} />
-                        {agent.status === 'idle' ? t('legendStandby') : agent.status === 'busy' ? t('legendActive') : statusLabel[agent.status]}
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                {members.map(agent => {
+                  const project = getAgentProjectVisual(agent)
+                  return (
+                    <Button
+                      key={agent.id}
+                      variant="ghost"
+                      onClick={() => setSelectedAgent(agent)}
+                      className={`h-auto items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-all hover:-translate-y-0.5 hover:bg-secondary ${statusGlow[agent.status]}`}
+                      style={{ backgroundColor: project.accentSoft }}
+                    >
+                      <OfficeAgentAvatar
+                        name={agent.name}
+                        status={agent.status}
+                        statusLabel={getStatusText(agent.status)}
+                        project={project}
+                        className="h-10 w-8"
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-foreground">{agent.name}</span>
+                        <span className="mt-0.5 flex items-center gap-1.5 text-xs text-foreground/65">
+                          <span className={`h-1.5 w-1.5 ${agent.status === 'idle' ? 'rounded-full' : 'rounded-[2px]'} ${statusDot[agent.status]}`} />
+                          {getStatusText(agent.status)}
+                        </span>
+                      </span>
+                    </Button>
+                  )
+                })}
               </div>
             </div>
           ))}
@@ -2257,12 +2196,19 @@ export function OfficePanel() {
           <div className="bg-card border border-border rounded-lg max-w-sm w-full p-6 shadow-2xl" onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-start mb-4">
               <div className="flex items-center gap-3">
-                <div className={`w-14 h-14 rounded-full ${hashColor(selectedAgent.name)} flex items-center justify-center text-white font-bold text-lg ring-2 ring-offset-2 ring-offset-card ${selectedAgent.status === 'busy' ? 'ring-yellow-500' : selectedAgent.status === 'idle' ? 'ring-green-500' : selectedAgent.status === 'error' ? 'ring-red-500' : 'ring-gray-600'}`}>
-                  {getInitials(selectedAgent.name)}
-                </div>
+                <OfficeAgentAvatar
+                  name={selectedAgent.name}
+                  status={selectedAgent.status}
+                  statusLabel={getStatusText(selectedAgent.status)}
+                  project={getAgentProjectVisual(selectedAgent)}
+                  className="h-16 w-14"
+                />
                 <div>
                   <h3 className="text-lg font-bold text-foreground">{selectedAgent.name}</h3>
                   <p className="text-sm text-muted-foreground">{selectedAgent.role}</p>
+                  <p className="mt-0.5 text-xs font-medium" style={{ color: getAgentProjectVisual(selectedAgent).accent }}>
+                    {getAgentProjectVisual(selectedAgent).label}
+                  </p>
                 </div>
               </div>
               <Button variant="ghost" size="icon-xs" onClick={() => setSelectedAgent(null)} className="text-muted-foreground hover:text-foreground text-xl w-6 h-6">×</Button>
@@ -2271,7 +2217,7 @@ export function OfficePanel() {
             <div className="space-y-3 text-sm">
               <div className="flex items-center gap-2">
                 <span className={`w-3 h-3 rounded-full ${statusDot[selectedAgent.status]}`} />
-                <span className="font-medium text-foreground">{selectedAgent.status === 'idle' ? t('legendStandby') : selectedAgent.status === 'busy' ? t('legendActive') : statusLabel[selectedAgent.status]}</span>
+                <span className="font-medium text-foreground">{getStatusText(selectedAgent.status)}</span>
                 <span className="text-muted-foreground ml-auto">{formatLastSeen(selectedAgent.last_seen, t as (key: string, values?: Record<string, unknown>) => string)}</span>
               </div>
 
