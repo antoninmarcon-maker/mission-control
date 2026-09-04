@@ -1,7 +1,13 @@
 const withNextIntl = require('next-intl/plugin')('./src/i18n/request.ts')
 
+const allowedDevOrigins = (process.env.MC_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((host) => host.trim())
+  .filter(Boolean)
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  ...(allowedDevOrigins.length > 0 ? { allowedDevOrigins } : {}),
   output: 'standalone',
   outputFileTracingRoot: __dirname,
   outputFileTracingIncludes: {
