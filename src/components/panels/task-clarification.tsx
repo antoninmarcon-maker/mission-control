@@ -38,7 +38,7 @@ export function TaskClarification({ taskId, value, canEdit, canCreate = true, on
     <div>
       <h3 className="font-medium">{current?.state === 'answered' ? 'Cadrage validé' : 'À préciser'}</h3>
       <p className="mt-1 text-sm text-muted-foreground">{current?.state === 'answered'
-        ? `Réponses enregistrées par ${current.answeredBy}. Elles seront transmises à l’agent. Cela ne lance pas la tâche.`
+        ? `Réponses enregistrées par ${current.answeredBy}. Elles seront transmises à l’agent. Une tâche déjà assignée peut maintenant démarrer automatiquement.`
         : 'Cadrez le travail avant son lancement. Une réponse libre peut remplacer les choix proposés.'}</p>
     </div>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}

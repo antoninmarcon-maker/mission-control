@@ -1,6 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+// @vitest-environment node
+import Database from 'better-sqlite3'
+import { NextRequest } from 'next/server'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { POST, PUT } from '@/app/api/tasks/[id]/clarification/route'
 
 const mockDbState = vi.hoisted(() => ({
+  db: null as Database.Database | null,
   tasks: [] as Array<{
     id: number
     title: string
@@ -41,7 +46,7 @@ const mockDbState = vi.hoisted(() => ({
 }))
 
 vi.mock('../db', () => ({
-  getDatabase: () => ({
+  getDatabase: () => mockDbState.db ?? ({
     prepare: (sql: string) => {
       if (sql.includes('SELECT') && sql.includes('assigned_to') && sql.includes('metadata') && sql.includes('project_ticket_no')) {
         return {
@@ -79,6 +84,12 @@ vi.mock('../db', () => ({
         sql.startsWith("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?")
       ) {
         return {
+          get: (status: string, _updatedAt: number, taskId: number, workspaceId: number) => {
+            const task = mockDbState.tasks.find((item) => item.id === taskId && item.workspace_id === workspaceId)
+            if (!task) return undefined
+            mockDbState.statusUpdates.push({ status, taskId })
+            return { metadata: task.metadata }
+          },
           run: (status: string, _updatedAt: number, taskId: number) => {
             mockDbState.statusUpdates.push({ status, taskId })
             return { changes: 1 }
@@ -120,6 +131,12 @@ vi.mock('../db', () => ({
     logActivity: mockDbState.logActivity,
   },
 }))
+
+vi.mock('../auth', () => ({
+  requireRole: () => ({ user: { id: 1, role: 'operator', workspace_id: 1, username: 'antonin' } }),
+}))
+
+vi.mock('../rate-limit', () => ({ mutationLimiter: () => null }))
 
 vi.mock('../config', () => ({
   config: {
@@ -546,5 +563,105 @@ describe('existing-session deferred dispatch', () => {
       dispatch_run_id: 'run-22',
       async_state: 'pending',
     })
+  })
+})
+
+describe('atomic dispatch clarification claims', () => {
+  beforeEach(() => {
+    mockDbState.db = new Database(':memory:')
+    mockDbState.db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY, title TEXT, description TEXT, status TEXT DEFAULT 'assigned',
+        priority TEXT DEFAULT 'medium', assigned_to TEXT DEFAULT 'agent-one',
+        metadata TEXT DEFAULT '{}', workspace_id INTEGER DEFAULT 1,
+        project_id INTEGER, project_ticket_no INTEGER, tags TEXT,
+        created_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
+      );
+      CREATE TABLE agents (id INTEGER, name TEXT, config TEXT, runtime_type TEXT, workspace_id INTEGER);
+      CREATE TABLE workspaces (id INTEGER, isolation TEXT);
+      CREATE TABLE projects (id INTEGER, ticket_prefix TEXT, workspace_id INTEGER);
+      CREATE TABLE comments (task_id INTEGER, author TEXT, content TEXT, created_at INTEGER, workspace_id INTEGER);
+      CREATE TABLE gateways (status TEXT);
+      INSERT INTO agents VALUES (7, 'agent-one', NULL, NULL, 1);
+      INSERT INTO workspaces VALUES (1, 'shared');
+      INSERT INTO gateways VALUES ('healthy');
+      INSERT INTO tasks (id, title, created_at) VALUES (1, 'First task', 1), (2, 'Second task', 2);
+    `)
+    mockDbState.callOpenClawGateway.mockReset()
+    mockDbState.callOpenClawGateway.mockResolvedValue({ status: 'accepted', runId: 'run-accepted' })
+    mockDbState.logActivity.mockClear()
+    mockDbState.broadcast.mockClear()
+  })
+
+  afterEach(() => {
+    mockDbState.db?.close()
+    mockDbState.db = null
+  })
+
+  async function openClarification() {
+    const response = await POST(new NextRequest('http://localhost/api/tasks/2/clarification', {
+      method: 'POST',
+      body: JSON.stringify({ questions: [{
+        id: 'scope', prompt: 'Quel périmètre ?', multiple: false,
+        options: [{ id: 'small', label: 'Minimum' }, { id: 'full', label: 'Périmètre complet' }],
+      }] }),
+    }), { params: Promise.resolve({ id: '2' }) })
+    expect(response.status).toBe(201)
+    return (await response.json()).clarification
+  }
+
+  it('dispatches human decisions confirmed after selection but before the atomic claim', async () => {
+    mockDbState.callOpenClawGateway.mockImplementationOnce(async () => {
+      // Both tasks were selected before the first dispatch yielded to the gateway.
+      expect(mockDbState.db!.prepare('SELECT status FROM tasks WHERE id = 2').get()).toEqual({ status: 'assigned' })
+      const clarification = await openClarification()
+      const response = await PUT(new NextRequest('http://localhost/api/tasks/2/clarification', {
+        method: 'PUT',
+        body: JSON.stringify({
+          revision: clarification.revision,
+          answers: [{ questionId: 'scope', selected: ['full'], text: 'Inclure les tests de migration.' }],
+        }),
+      }), { params: Promise.resolve({ id: '2' }) })
+      expect(response.status).toBe(200)
+      return { status: 'accepted', runId: 'run-first' }
+    })
+
+    expect(await dispatchAssignedTasks()).toEqual({ ok: true, message: 'Dispatched 2/2 tasks' })
+
+    const [, secondRequest] = mockDbState.callOpenClawGateway.mock.calls[1]
+    expect(secondRequest.message).toContain('**[TASK-2] Second task**')
+    expect(secondRequest.message).toContain('## Cadrage validé\n\nQuel périmètre ?\nPérimètre complet\nInclure les tests de migration.')
+    expect(secondRequest.message).not.toContain('Minimum')
+    const task = mockDbState.db!.prepare('SELECT status, metadata FROM tasks WHERE id = 2').get() as { status: string; metadata: string }
+    expect(task.status).toBe('in_progress')
+    expect(JSON.parse(task.metadata).clarification).toMatchObject({ state: 'answered', answeredBy: 'antonin' })
+  })
+
+  it('skips a task whose clarification is still pending at claim time', async () => {
+    mockDbState.callOpenClawGateway.mockImplementationOnce(async () => {
+      await openClarification()
+      return { status: 'accepted', runId: 'run-first' }
+    })
+
+    expect(await dispatchAssignedTasks()).toEqual({ ok: true, message: 'Dispatched 1/2 tasks' })
+
+    expect(mockDbState.callOpenClawGateway).toHaveBeenCalledTimes(1)
+    expect(mockDbState.db!.prepare('SELECT status FROM tasks WHERE id = 2').get()).toEqual({ status: 'assigned' })
+    expect(mockDbState.broadcast).not.toHaveBeenCalledWith('task.status_changed', expect.objectContaining({ id: 2 }))
+    expect(mockDbState.logActivity).not.toHaveBeenCalledWith('task_dispatched', 'task', 2, expect.anything(), expect.anything(), expect.anything(), expect.anything())
+  })
+
+  it.each([
+    ['already claimed', "UPDATE tasks SET status = 'in_progress' WHERE id = 2"],
+    ['moved to another workspace', 'UPDATE tasks SET workspace_id = 2 WHERE id = 2'],
+  ])('skips a selected task that was %s before its claim', async (_reason, mutation) => {
+    mockDbState.callOpenClawGateway.mockImplementationOnce(async () => {
+      mockDbState.db!.exec(mutation)
+      return { status: 'accepted', runId: 'run-first' }
+    })
+
+    expect(await dispatchAssignedTasks()).toEqual({ ok: true, message: 'Dispatched 1/2 tasks' })
+    expect(mockDbState.callOpenClawGateway).toHaveBeenCalledTimes(1)
+    expect(mockDbState.broadcast).not.toHaveBeenCalledWith('task.status_changed', expect.objectContaining({ id: 2 }))
   })
 })

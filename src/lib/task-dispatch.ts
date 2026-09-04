@@ -1771,18 +1771,20 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
   for (const task of tasks) {
     // Atomically claim the task: only flip to in_progress if it is still
-    // 'assigned'. If two dispatchers race (e.g. concurrent scheduler ticks or
-    // multiple workers polling), exactly one UPDATE reports changes=1 and the
-    // loser skips this task — preventing double-dispatch (issue/PR #698).
+    // 'assigned' and clarification-ready. RETURNING captures metadata from the
+    // same atomic update, including human answers saved since the initial SELECT.
+    // Concurrent dispatchers receive no row if another worker claimed it first,
+    // preventing double-dispatch (issue/PR #698).
     const claim = db
-      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL}`)
-      .run('in_progress', now, task.id, task.workspace_id)
+      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL} RETURNING metadata`)
+      .get('in_progress', now, task.id, task.workspace_id) as { metadata: string | null } | undefined
 
-    if (claim.changes === 0) {
+    if (!claim) {
       // Another dispatcher won the race (or the task was cancelled between
       // SELECT and UPDATE). Skip silently — no event, no activity, no work.
       continue
     }
+    task.metadata = claim.metadata
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
