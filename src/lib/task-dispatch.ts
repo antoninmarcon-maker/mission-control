@@ -686,8 +686,14 @@ function classifyDirectModel(task: DispatchableTask): string {
     try {
       const cfg = JSON.parse(task.agent_config)
       if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) {
-        // Strip gateway prefixes like "9router/cc/" to get bare model ID
-        return cfg.dispatchModel.replace(/^.*\//, '')
+        // Strip gateway prefixes like "9router/cc/" to get a bare model ID,
+        // but keep a trailing provider prefix ("ollama/qwen3:14b") intact —
+        // pickProvider needs it to route to the local endpoint instead of
+        // falling back to Anthropic with an unknown model.
+        const dm = cfg.dispatchModel
+        const providerScoped = dm.match(/(?:^|\/)((?:openai|local|ollama|lmstudio|litellm|anthropic|minimax)\/[^/]+)$/i)
+        if (providerScoped) return providerScoped[1]
+        return dm.replace(/^.*\//, '')
       }
     } catch { /* ignore */ }
   }
