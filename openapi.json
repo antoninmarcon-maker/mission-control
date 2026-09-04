@@ -449,7 +449,7 @@
           "Tasks"
         ],
         "summary": "Ingest a proposal idempotently",
-        "description": "Requires operator. Derives the orchestrator from the authenticated agent; human ingestion requires a configured coordinator. A workspace-scoped idempotency collision returns the stored row unchanged and creates a compact audit record. No task is launched.",
+        "description": "Requires operator. Agent-scoped credentials supply the authenticated orchestrator and creator. Human sessions use the configured coordinator and their authenticated user identity; X-Agent-Name attribution cannot override either field. Human ingestion without a coordinator and global API keys without authenticated agent credentials return 409, even when X-Agent-Name is supplied. A workspace-scoped idempotency collision returns the stored row unchanged and creates a compact audit record. No task is launched.",
         "x-required-role": "operator",
         "requestBody": {
           "required": true,
@@ -12503,6 +12503,225 @@
       }
     },
     "schemas": {
+      "TaskProposalTask": {
+        "type": "object",
+        "description": "The stored task returned after acceptance or on retry. A new task is assigned; retries return its current lifecycle status and nullable database fields. Tags and metadata are parsed JSON.",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "status",
+          "priority",
+          "assigned_to",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "due_date",
+          "estimated_hours",
+          "actual_hours",
+          "tags",
+          "metadata",
+          "workspace_id",
+          "project_id",
+          "project_ticket_no",
+          "outcome",
+          "error_message",
+          "resolution",
+          "feedback_rating",
+          "feedback_notes",
+          "retry_count",
+          "completed_at",
+          "github_issue_number",
+          "github_repo",
+          "github_synced_at",
+          "github_branch",
+          "github_pr_number",
+          "github_pr_state",
+          "dispatch_attempts"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "backlog",
+              "inbox",
+              "assigned",
+              "awaiting_owner",
+              "in_progress",
+              "review",
+              "quality_review",
+              "done",
+              "failed"
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "urgent"
+            ]
+          },
+          "assigned_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "due_date": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Unix seconds, or null when no due date is set."
+          },
+          "estimated_hours": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "actual_hours": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "workspace_id": {
+            "type": "integer"
+          },
+          "project_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_ticket_no": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "success",
+              "failed",
+              "partial",
+              "abandoned",
+              null
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "feedback_rating": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "feedback_notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_count": {
+            "type": "integer"
+          },
+          "completed_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_issue_number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_repo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_synced_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_pr_number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_pr_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dispatch_attempts": {
+            "type": "integer"
+          }
+        }
+      },
       "TaskClarificationQuestions": {
         "type": "object",
         "required": [
@@ -13180,7 +13399,7 @@
             "$ref": "#/components/schemas/TaskProposal"
           },
           "task": {
-            "$ref": "#/components/schemas/Task"
+            "$ref": "#/components/schemas/TaskProposalTask"
           }
         }
       },

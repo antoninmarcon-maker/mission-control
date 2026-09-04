@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { GET, POST } from '@/app/api/task-proposals/route'
 import { PUT } from '@/app/api/task-proposals/[id]/route'
 import { POST as ACCEPT } from '@/app/api/task-proposals/[id]/accept/route'
@@ -115,6 +116,51 @@ describe('proposal ingestion and listing', () => {
     config.coordinatorAgent = ' configured-coordinator '
     expect(await proposal({}, human)).toMatchObject({ orchestratorAgent: 'configured-coordinator', createdBy: 'antonin' })
     expect(await proposal()).toMatchObject({ orchestratorAgent: 'antonin-policy-engine' })
+  })
+
+  it.each([
+    ['human', '', 409],
+    ['human', 'configured-coordinator', 201],
+    ['global key', '', 409],
+    ['global key', 'configured-coordinator', 409],
+  ] as const)('ignores agent attribution on a %s with coordinator "%s"', async (identity, coordinator, status) => {
+    config.coordinatorAgent = coordinator
+    const headers = { ...(identity === 'human' ? human : { 'x-api-key': 'test-global-key' }), 'x-agent-name': 'caller-controlled-agent' }
+    const response = await create({}, headers)
+    expect(response.status).toBe(status)
+    if (status === 201) {
+      const { proposal: created } = await response.json()
+      expect(created).toMatchObject({ orchestratorAgent: 'configured-coordinator', createdBy: 'antonin' })
+      const duplicate = await create({}, headers)
+      expect(duplicate.status).toBe(200)
+      expect((await duplicate.json()).proposal).toEqual(created)
+      const audits = state.db.prepare("SELECT actor, detail FROM audit_log WHERE target_type = 'task_proposal'").all()
+      expect(audits).toHaveLength(2)
+      expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({ actor: 'antonin' })]))
+      expect(JSON.stringify(audits)).not.toContain('caller-controlled-agent')
+      const accepted = await accept(created.id, created.revision)
+      expect(accepted.status).toBe(200)
+      expect((await accepted.json()).task.assigned_to).toBe('configured-coordinator')
+    } else {
+      expect(state.db.prepare('SELECT COUNT(*) AS count FROM task_proposals').get()).toEqual({ count: 0 })
+      expect(state.db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target_type = 'task_proposal'").get()).toEqual({ count: 0 })
+      expect(taskCount()).toBe(0)
+    }
+  })
+
+  it('keeps authenticated admin-agent ownership despite a different attribution name', async () => {
+    config.coordinatorAgent = ''
+    state.db.prepare("UPDATE agent_api_keys SET scopes = '[\"admin\"]'").run()
+    const headers = { ...agent, 'x-agent-name': 'caller-controlled-agent' }
+    const p = await proposal({}, headers)
+    expect(p).toMatchObject({ orchestratorAgent: 'antonin-policy-engine', createdBy: 'antonin-policy-engine' })
+    expect((await accept(p.id, p.revision, headers)).status).toBe(403)
+  })
+
+  it('uses the human credential when a session and agent key are both supplied', async () => {
+    const headers = { ...human, ...agent, 'x-agent-name': 'caller-controlled-agent' }
+    const p = await proposal({}, headers)
+    expect(p).toMatchObject({ orchestratorAgent: 'configured-coordinator', createdBy: 'antonin' })
   })
 
   it('rejects invalid input and foreign projects without writes', async () => {
@@ -388,5 +434,40 @@ describe('expiry and observability', () => {
       expect(operation.responses['200']).toBeDefined()
       if (method !== 'get') expect(operation.requestBody.content['application/json'].schema).toBeDefined()
     }
+  })
+
+  it('validates the real acceptance response including nullable task fields against OpenAPI', async () => {
+    const p = await proposal()
+    const response = await accept(p.id, p.revision)
+    expect(response.status).toBe(200)
+    const { task } = await response.json()
+    expect(task).toMatchObject({ due_date: null, estimated_hours: null, actual_hours: null, project_id: null })
+    const spec = JSON.parse(readFileSync(join(process.cwd(), 'openapi.json'), 'utf8'))
+    const schemaName = spec.components.schemas.TaskProposalAcceptance.properties.task.$ref.split('/').pop()
+    const taskSchema = spec.components.schemas[schemaName]
+    const validated = z.fromJSONSchema(taskSchema).safeParse(task)
+    expect(validated.error?.issues).toBeUndefined()
+    expect(validated.success).toBe(true)
+    expect(Object.keys(taskSchema.properties)).toEqual(expect.arrayContaining(Object.keys(task)))
+  })
+
+  it.each(['backlog', 'inbox', 'assigned', 'awaiting_owner', 'in_progress', 'review', 'quality_review', 'done', 'failed'])('validates a %s task returned on acceptance retry against OpenAPI', async status => {
+    const p = await proposal()
+    const first = await accept(p.id, p.revision)
+    expect(first.status).toBe(200)
+    const { task: created } = await first.json()
+    state.db.prepare('UPDATE tasks SET status = ?, due_date = 1800000000, estimated_hours = 1.25, actual_hours = 2.5 WHERE id = ?').run(status, created.id)
+    const retry = await accept(p.id, p.revision)
+    expect(retry.status).toBe(200)
+    const { task } = await retry.json()
+    expect(task).toMatchObject({ id: created.id, status, due_date: 1800000000, estimated_hours: 1.25, actual_hours: 2.5 })
+    const spec = JSON.parse(readFileSync(join(process.cwd(), 'openapi.json'), 'utf8'))
+    const schemaName = spec.components.schemas.TaskProposalAcceptance.properties.task.$ref.split('/').pop()
+    const validator = z.fromJSONSchema(spec.components.schemas[schemaName])
+    const validated = validator.safeParse(task)
+    expect(validated.error?.issues).toBeUndefined()
+    expect(validated.success).toBe(true)
+    expect(validator.safeParse({ ...task, status: 'not-a-task-status' }).success).toBe(false)
+    expect(taskCount()).toBe(1)
   })
 })

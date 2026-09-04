@@ -86,9 +86,11 @@ export async function POST(request: NextRequest) {
   try { body = await request.json() } catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }) }
   const parsed = taskProposalInputSchema.safeParse(body)
   if (!parsed.success) return NextResponse.json({ error: 'Invalid proposal' }, { status: 400 })
-  const agentName = auth.user.agent_name?.trim()
-  const isAgent = auth.user.agent_name || auth.user.agent_id || auth.user.id <= 0
-  const orchestrator = isAgent ? agentName : config.coordinatorAgent.trim()
+  // agent_name alone is caller-controlled attribution on sessions/global keys.
+  // Only agent credentials provide agent_id and an authenticated agent name.
+  const isAgent = typeof auth.user.agent_id === 'number' && Number.isSafeInteger(auth.user.agent_id) && auth.user.agent_id > 0
+  const agentName = isAgent ? auth.user.agent_name?.trim() : undefined
+  const orchestrator = isAgent ? agentName : auth.user.id > 0 ? config.coordinatorAgent.trim() : undefined
   if (!orchestrator) return NextResponse.json({ error: 'A proposal orchestrator is required' }, { status: 409 })
   const actor = agentName || auth.user.display_name || auth.user.username
   const data = parsed.data
