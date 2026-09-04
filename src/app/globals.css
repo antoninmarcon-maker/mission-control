@@ -1078,6 +1078,43 @@
   background-size: 100% 100%, 40px 40px, 40px 40px, 40px 40px;
 }
 
+.office-agent-avatar.is-working::before {
+  position: absolute;
+  inset: -3px -2px;
+  z-index: -1;
+  border: 1px solid color-mix(in srgb, var(--agent-status) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--agent-status) 9%, transparent);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--agent-status) 18%, transparent);
+  content: '';
+  animation: office-agent-working 1.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.office-agent-avatar.is-moving svg {
+  transform-origin: 50% 100%;
+  animation: office-agent-step 420ms ease-in-out infinite;
+}
+
+@keyframes office-agent-working {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes office-agent-step {
+  0%, 100% {
+    transform: translateY(0) rotate(-1deg);
+  }
+  50% {
+    transform: translateY(-3px) rotate(1deg);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-converge-left,
   .animate-converge-right,
@@ -1092,6 +1129,10 @@
   .animate-mc-fade-in {
     animation: none !important;
     opacity: 1 !important;
+  }
+  .office-agent-avatar::before,
+  .office-agent-avatar svg {
+    animation: none !important;
   }
 }
 
