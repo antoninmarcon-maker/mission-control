@@ -11,6 +11,7 @@ async function fakeHttpServer(t, handler) {
   await once(server, "listening");
   t.after(async () => {
     server.close();
+    server.closeAllConnections();
     await once(server, "close");
   });
   return `http://127.0.0.1:${server.address().port}`;
@@ -27,6 +28,14 @@ async function readJson(request) {
 function sendJson(response, status, value) {
   response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify(value));
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function proposalInput() {
@@ -107,7 +116,11 @@ test("proposal client fails closed on malformed candidate and proposal acknowled
 test("proposal client retries an ambiguous idempotent POST and returns the persisted acknowledgement", async (t) => {
   const requests = [];
   const proposalsByIdempotencyKey = new Map();
+  const firstRequestPersisted = deferred();
+  const firstResponseMayFinish = deferred();
+  const firstHandlerFinished = deferred();
   const input = proposalInput();
+  t.after(() => firstResponseMayFinish.resolve());
   const baseUrl = await fakeHttpServer(t, async (request, response) => {
     const body = await readJson(request);
     requests.push(body);
@@ -119,14 +132,27 @@ test("proposal client retries an ambiguous idempotent POST and returns the persi
         revision: "c6f1bd11-208b-451e-898a-26776a5e6635",
       };
       proposalsByIdempotencyKey.set(body.idempotencyKey, proposal);
-      response.socket.destroy();
+      firstRequestPersisted.resolve();
+      await firstResponseMayFinish.promise;
+      if (!response.destroyed && !response.writableEnded) {
+        sendJson(response, 200, { proposal });
+      }
+      firstHandlerFinished.resolve();
       return;
     }
     sendJson(response, 200, { proposal: persisted });
   });
-  const client = new MissionControlClient({ baseUrl, apiKey: "proposal-secret" });
+  const client = new MissionControlClient({
+    baseUrl,
+    apiKey: "proposal-secret",
+    timeoutMs: 200,
+  });
 
-  const acknowledgement = await client.createProposal(input);
+  const acknowledgementPromise = client.createProposal(input);
+  await firstRequestPersisted.promise;
+  const acknowledgement = await acknowledgementPromise;
+  firstResponseMayFinish.resolve();
+  await firstHandlerFinished.promise;
 
   assert.equal(proposalsByIdempotencyKey.size, 1);
   assert.deepEqual(requests, [input, input]);
