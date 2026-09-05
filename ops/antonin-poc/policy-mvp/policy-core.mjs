@@ -116,6 +116,40 @@ export function evaluateTask(task, options = {}) {
   };
 }
 
+/**
+ * A proposal forecast is an advisory view of today's admission policy. It
+ * intentionally does not invoke the later route planner or any provider.
+ */
+export function forecastProposalRoute(proposal, options = {}) {
+  if (proposal === null || typeof proposal !== "object") return null;
+  const task = {
+    title: proposal.title,
+    description: `${proposal.objective}\n${proposal.context}`,
+    priority: proposal.risk === "critical" ? "critical" : proposal.risk,
+    metadata: { proposal_forecast: true },
+  };
+  const decision = evaluateTask(task, options);
+  if (decision.status !== "execute_local" || !decision.route) return null;
+  const parsed = parseRoute(decision.route);
+  if (!parsed) return null;
+  const model = parsed.detail.trim();
+  if (model === "") return null;
+  const runtime =
+    parsed.provider === "ollama"
+      ? "local"
+      : parsed.provider === "codex"
+        ? "codex"
+        : parsed.provider === "claude-code"
+          ? "claude"
+          : null;
+  if (!runtime) return null;
+  return {
+    runtime,
+    model,
+    reason: decision.reasonCode,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // §3 failure taxonomy
 // ---------------------------------------------------------------------------

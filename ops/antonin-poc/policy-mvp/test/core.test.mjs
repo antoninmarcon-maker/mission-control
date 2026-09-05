@@ -24,6 +24,7 @@ import {
   classifyFailure,
   completionIdentityFields,
   evaluateTask,
+  forecastProposalRoute,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
@@ -78,6 +79,31 @@ test("policy routes a medium-priority simple local sort to Ollama and a distinct
   assert.equal(
     riskClassOfDecision({ status: "awaiting_owner" }),
     "sensitive",
+  );
+});
+
+test("proposal route forecast reflects the policy result without a provider guess", () => {
+  assert.deepEqual(
+    forecastProposalRoute({
+      title: "Simple local sort",
+      objective: "Sort harmless labels.",
+      context: "Routine mechanical cleanup.",
+      risk: "medium",
+    }),
+    {
+      runtime: "local",
+      model: "qwen2.5-coder:7b",
+      reason: "eligible_mechanical_task",
+    },
+  );
+  assert.equal(
+    forecastProposalRoute({
+      title: "Deploy preview",
+      objective: "Deploy the preview.",
+      context: "Routine deployment.",
+      risk: "medium",
+    }),
+    null,
   );
 });
 
