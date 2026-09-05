@@ -4,10 +4,22 @@ import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import { apiFetch } from '@/lib/api-client'
 import { MODEL_CATALOG } from '@/lib/models'
+import type { TaskProposal } from '@/lib/task-proposals'
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue | undefined }
 type DashboardLayoutUpdater = string[] | null | ((current: string[] | null) => string[] | null)
+
+function deduplicateProposals(proposals: TaskProposal[]) {
+  return [...new Map(proposals.map((proposal) => [proposal.id, proposal])).values()]
+}
+
+function upsertProposal(proposals: TaskProposal[], proposal: TaskProposal) {
+  const deduplicated = deduplicateProposals(proposals)
+  const index = deduplicated.findIndex((current) => current.id === proposal.id)
+  if (index === -1) return [proposal, ...deduplicated]
+  return deduplicated.map((current) => current.id === proposal.id ? proposal : current)
+}
 
 // Enhanced types for Mission Control
 export interface Session {
@@ -422,6 +434,13 @@ interface MissionControlStore {
   addTask: (task: Task) => void
   updateTask: (taskId: number, updates: Partial<Task>) => void
   deleteTask: (taskId: number) => void
+
+  // One-click task proposal authorization queue
+  proposals: TaskProposal[]
+  setProposals: (proposals: TaskProposal[]) => void
+  addProposal: (proposal: TaskProposal) => void
+  updateProposal: (proposal: TaskProposal) => void
+  removeProposal: (proposalId: number) => void
 
   // Mission Control Phase 2 - Agents
   agents: Agent[]
@@ -1024,6 +1043,19 @@ export const useMissionControl = create<MissionControlStore>()(
         tasks: state.tasks.filter((task) => task.id !== taskId),
         selectedTask: state.selectedTask?.id === taskId ? null : state.selectedTask
       })),
+
+    // One-click task proposal authorization queue
+    proposals: [],
+    setProposals: (proposals) => set({ proposals: deduplicateProposals(proposals) }),
+    addProposal: (proposal) => set((state) => ({
+      proposals: upsertProposal(state.proposals, proposal),
+    })),
+    updateProposal: (proposal) => set((state) => ({
+      proposals: upsertProposal(state.proposals, proposal),
+    })),
+    removeProposal: (proposalId) => set((state) => ({
+      proposals: state.proposals.filter((proposal) => proposal.id !== proposalId),
+    })),
 
     // Mission Control Phase 2 - Agents
     agents: [],

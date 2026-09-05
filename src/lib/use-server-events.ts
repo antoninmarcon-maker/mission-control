@@ -3,6 +3,8 @@
 import { useEffect, useRef } from 'react'
 import { useMissionControl } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
+import { apiFetch } from '@/lib/api-client'
+import type { TaskProposal } from '@/lib/task-proposals'
 
 const log = createClientLogger('SSE')
 
@@ -38,6 +40,8 @@ export function useServerEvents() {
     addChatMessage,
     addNotification,
     addActivity,
+    setProposals,
+    removeProposal,
   } = useMissionControl()
 
   useEffect(() => {
@@ -123,6 +127,20 @@ export function useServerEvents() {
           }
           break
 
+        // Proposal events contain only invalidation-safe fields. Reload pending
+        // proposals rather than putting private context in the event stream.
+        case 'proposal.created':
+        case 'proposal.updated':
+          void apiFetch<{ proposals?: TaskProposal[] }>('/api/task-proposals?status=pending&limit=20')
+            .then((data) => setProposals(data.proposals ?? []))
+            .catch(() => {})
+          break
+        case 'proposal.accepted':
+        case 'proposal.dismissed':
+        case 'proposal.expired':
+          if (typeof event.data?.id === 'number') removeProposal(event.data.id)
+          break
+
         // Agent events
         case 'agent.created':
           addAgent(event.data)
@@ -206,5 +224,7 @@ export function useServerEvents() {
     addChatMessage,
     addNotification,
     addActivity,
+    setProposals,
+    removeProposal,
   ])
 }

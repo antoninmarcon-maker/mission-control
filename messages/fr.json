@@ -740,6 +740,20 @@
     "workspaceAccess": "Accès au workspace",
     "workspaceFilesDesc": "Fichiers du workspace de l'agent"
   },
+  "taskProposals": {
+    "title": "Propositions",
+    "empty": "Aucune proposition en attente",
+    "validateLaunch": "Valider et lancer",
+    "modify": "Modifier",
+    "dismiss": "Refuser",
+    "context": "Contexte",
+    "whyNow": "Pourquoi maintenant",
+    "forecast": "Exécuteur pressenti",
+    "forecastDisclaimer": "L’orchestrateur revérifie l’exécuteur au lancement.",
+    "accepted": "Tâche lancée",
+    "stale": "Cette proposition a changé. La dernière version a été chargée.",
+    "failed": "La proposition n’a pas pu être mise à jour. Réessayez."
+  },
   "taskBoard": {
     "title": "Tableau des tâches",
     "allProjects": "Tous les projets",

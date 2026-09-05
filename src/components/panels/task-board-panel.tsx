@@ -16,6 +16,7 @@ import { AgentAvatar } from '@/components/ui/agent-avatar'
 import { MarkdownRenderer } from '@/components/markdown-renderer'
 import { Button } from '@/components/ui/button'
 import { TaskClarification } from './task-clarification'
+import { ProposalRail } from '@/components/task-proposals/proposal-rail'
 import { ProjectManagerModal } from '@/components/modals/project-manager-modal'
 import { SessionMessage, shouldShowTimestamp, type SessionTranscriptMessage } from '@/components/chat/session-message'
 
@@ -937,6 +938,8 @@ export function TaskBoardPanel() {
           </Button>
         </div>
       )}
+
+      <ProposalRail />
 
       {/* Kanban Board */}
       <div className="flex-1 min-h-0 flex gap-4 p-4 overflow-x-auto" role="region" aria-label={t('taskBoard')}>

@@ -740,6 +740,20 @@
     "workspaceAccess": "الوصول لمساحة العمل",
     "workspaceFilesDesc": "ملفات مساحة عمل الوكيل"
   },
+  "taskProposals": {
+    "title": "Proposals",
+    "empty": "No pending proposals",
+    "validateLaunch": "Validate and launch",
+    "modify": "Modify",
+    "dismiss": "Dismiss",
+    "context": "Context",
+    "whyNow": "Why now",
+    "forecast": "Expected route",
+    "forecastDisclaimer": "The orchestrator rechecks the route at launch.",
+    "accepted": "Task launched",
+    "stale": "This proposal changed. The latest version has been loaded.",
+    "failed": "The proposal could not be updated. Try again."
+  },
   "taskBoard": {
     "title": "لوحة المهام",
     "allProjects": "جميع المشاريع",
