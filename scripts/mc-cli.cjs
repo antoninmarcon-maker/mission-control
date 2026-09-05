@@ -54,6 +54,7 @@ Groups:
                memory get|set|clear / soul get|set|templates / attribution
   tasks        list/get/create/update/delete/queue
                comments list|add / broadcast
+  proposals    list/create
   sessions     list/control/continue/transcript
   connect      register/list/disconnect
   tokens       list/stats/by-agent/agent-costs/task-costs/export/rotate
@@ -79,6 +80,8 @@ Examples:
   mc tasks queue --agent Aegis --max-capacity 2
   mc tasks comments list --id 42
   mc tasks comments add --id 42 --content "Looks good"
+  mc proposals list --status pending --source-type chat --json
+  mc proposals create --json-file /absolute/path/to/proposal.json
   mc sessions transcript --kind claude-code --id abc123
   mc tokens agent-costs --timeframe week
   mc tokens export --format csv
@@ -265,20 +268,90 @@ async function sseStream({ baseUrl, apiKey, cookie, route, timeoutMs, onEvent, o
   }
 }
 
-function printResult(result, asJson) {
+function redactApiKey(value, apiKey) {
+  let redacted = String(value);
+  if (apiKey) redacted = redacted.split(apiKey).join('***REDACTED***');
+  return redacted.replace(/((?:x-api-key|api[_-]?key|authorization)\s*[:=]\s*(?:bearer\s+)?)\S+/gi, '$1***REDACTED***');
+}
+
+function redactErrorData(data, apiKey) {
+  if (typeof data === 'string') return redactApiKey(data, apiKey);
+  if (Array.isArray(data)) return data.map(value => redactErrorData(value, apiKey));
+  if (data && typeof data === 'object') {
+    return Object.fromEntries(Object.entries(data).map(([key, value]) => [key, redactErrorData(value, apiKey)]));
+  }
+  return data;
+}
+
+function printResult(result, asJson, apiKey) {
+  const safeResult = result.ok ? result : { ...result, data: redactErrorData(result.data, apiKey) };
   if (asJson) {
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify(safeResult, null, 2));
     return;
   }
-  if (result.ok) {
-    console.log(`OK ${result.status} ${result.method} ${result.url}`);
-    if (result.data && Object.keys(result.data).length > 0) {
-      console.log(JSON.stringify(result.data, null, 2));
+  if (safeResult.ok) {
+    console.log(`OK ${safeResult.status} ${safeResult.method} ${safeResult.url}`);
+    if (safeResult.data && Object.keys(safeResult.data).length > 0) {
+      console.log(JSON.stringify(safeResult.data, null, 2));
     }
     return;
   }
-  console.error(`ERROR ${result.status || 'NETWORK'} ${result.method} ${result.url}`);
-  console.error(JSON.stringify(result.data, null, 2));
+  console.error(`ERROR ${safeResult.status || 'NETWORK'} ${safeResult.method} ${safeResult.url}`);
+  console.error(JSON.stringify(safeResult.data, null, 2));
+}
+
+function requireProposalJsonFile(flags) {
+  const file = required(flags, 'json-file');
+  if (!path.isAbsolute(file)) throw new Error('--json-file must be an absolute path');
+  const stats = fs.statSync(file);
+  if (!stats.isFile()) throw new Error('--json-file must point to a file');
+  if (stats.size > 64 * 1024) throw new Error('--json-file must be 64 KiB or smaller');
+  let proposal;
+  try {
+    proposal = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    throw new Error('--json-file must contain valid JSON');
+  }
+  validateTaskProposal(proposal);
+  return proposal;
+}
+
+function validateTaskProposal(proposal) {
+  if (!isPlainObject(proposal)) throw new Error('--json-file must contain a proposal object');
+  const allowed = new Set(['sourceType', 'sourceRef', 'idempotencyKey', 'title', 'objective', 'context', 'rationale', 'risk', 'routeForecast', 'projectId', 'metadata', 'expiresAt']);
+  for (const key of Object.keys(proposal)) {
+    if (!allowed.has(key)) throw new Error(`Unknown proposal field: ${key}`);
+  }
+  const requiredText = [
+    ['sourceRef', 500], ['idempotencyKey', 240], ['title', 240], ['objective', 2000], ['context', 8000], ['rationale', 2000],
+  ];
+  if (!['chat', 'event'].includes(proposal.sourceType)) throw new Error('Invalid proposal sourceType');
+  for (const [field, maxLength] of requiredText) {
+    const value = proposal[field];
+    if (typeof value !== 'string' || value.trim().length === 0 || value.trim().length > maxLength) throw new Error(`Invalid proposal ${field}`);
+  }
+  if (!['low', 'medium', 'high', 'critical'].includes(proposal.risk)) throw new Error('Invalid proposal risk');
+  if (proposal.routeForecast !== undefined) {
+    if (!isPlainObject(proposal.routeForecast)) throw new Error('Invalid proposal routeForecast');
+    const allowedRoute = new Set(['runtime', 'model', 'reason']);
+    for (const key of Object.keys(proposal.routeForecast)) {
+      if (!allowedRoute.has(key)) throw new Error(`Unknown routeForecast field: ${key}`);
+    }
+    if (!['local', 'codex', 'claude'].includes(proposal.routeForecast.runtime)) throw new Error('Invalid proposal routeForecast runtime');
+    for (const [field, maxLength] of [['reason', 500], ['model', 200]]) {
+      const value = proposal.routeForecast[field];
+      if (field === 'model' && value === undefined) continue;
+      if (typeof value !== 'string' || value.trim().length === 0 || value.trim().length > maxLength) throw new Error(`Invalid proposal routeForecast ${field}`);
+    }
+  }
+  for (const field of ['projectId', 'expiresAt']) {
+    if (proposal[field] !== undefined && (!Number.isSafeInteger(proposal[field]) || proposal[field] <= 0)) throw new Error(`Invalid proposal ${field}`);
+  }
+  if (proposal.metadata !== undefined && !isPlainObject(proposal.metadata)) throw new Error('Invalid proposal metadata');
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
 
 // --- Command handlers ---
@@ -418,6 +491,22 @@ const commands = {
       }
       throw new Error(`Unknown tasks comments subcommand: ${sub}. Use list|add`);
     },
+  },
+
+  proposals: {
+    list: (flags) => {
+      const params = new URLSearchParams();
+      if (flags.status) params.set('status', String(flags.status));
+      if (flags['source-type']) params.set('source_type', String(flags['source-type']));
+      if (flags['source-ref']) params.set('source_ref', String(flags['source-ref']));
+      if (flags['project-id']) params.set('project_id', String(flags['project-id']));
+      if (flags.limit) params.set('limit', String(flags.limit));
+      if (flags.offset) params.set('offset', String(flags.offset));
+      if (flags.summary) params.set('summary', '1');
+      const query = params.toString();
+      return { method: 'GET', route: `/api/task-proposals${query ? `?${query}` : ''}` };
+    },
+    create: (flags) => ({ method: 'POST', route: '/api/task-proposals', body: requireProposalJsonFile(flags) }),
   },
 
   sessions: {
@@ -661,7 +750,7 @@ async function run() {
       const route = String(required(parsed.flags, 'path'));
       const body = bodyFromFlags(parsed.flags);
       const result = await httpRequest({ baseUrl, apiKey, cookie: profile.cookie, method, route, body, timeoutMs });
-      printResult(result, asJson);
+      printResult(result, asJson, apiKey);
       process.exit(result.ok ? EXIT.OK : mapStatusToExit(result.status));
     }
 
@@ -698,7 +787,7 @@ async function run() {
 
     // If handler returned an http result directly (auth login/logout)
     if (result_or_config && 'ok' in result_or_config && 'status' in result_or_config) {
-      printResult(result_or_config, asJson);
+      printResult(result_or_config, asJson, apiKey);
       process.exit(result_or_config.ok ? EXIT.OK : mapStatusToExit(result_or_config.status));
     }
 
@@ -714,10 +803,10 @@ async function run() {
       timeoutMs,
     });
 
-    printResult(result, asJson);
+    printResult(result, asJson, apiKey);
     process.exit(result.ok ? EXIT.OK : mapStatusToExit(result.status));
   } catch (err) {
-    const message = err?.message || String(err);
+    const message = redactApiKey(err?.message || String(err), apiKey);
     if (asJson) {
       console.log(JSON.stringify({ ok: false, error: message }, null, 2));
     } else {

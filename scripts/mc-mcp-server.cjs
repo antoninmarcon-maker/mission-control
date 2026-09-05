@@ -64,13 +64,19 @@ async function api(method, route, body) {
     const text = await res.text();
     let data;
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}: ${text.slice(0, 200)}`);
+    if (!res.ok) throw new Error(redactApiKey(data.error || data.message || `HTTP ${res.status}: ${text.slice(0, 200)}`, config.apiKey));
     return data;
   } catch (err) {
     clearTimeout(timer);
     if (err?.name === 'AbortError') throw new Error('Request timeout (30s)');
-    throw err;
+    throw new Error(redactApiKey(err?.message || String(err), config.apiKey));
   }
+}
+
+function redactApiKey(value, apiKey) {
+  let redacted = String(value);
+  if (apiKey) redacted = redacted.split(apiKey).join('***REDACTED***');
+  return redacted.replace(/((?:x-api-key|api[_-]?key|authorization)\s*[:=]\s*(?:bearer\s+)?)\S+/gi, '$1***REDACTED***');
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +84,71 @@ async function api(method, route, body) {
 // ---------------------------------------------------------------------------
 
 const TOOLS = [
+  // --- Task proposals ---
+  {
+    name: 'task_proposals_create',
+    description: 'Create a task proposal for human validation. This never accepts or launches work.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        sourceType: { type: 'string', enum: ['chat', 'event'] },
+        sourceRef: { type: 'string', minLength: 1, maxLength: 500 },
+        idempotencyKey: { type: 'string', minLength: 1, maxLength: 240 },
+        title: { type: 'string', minLength: 1, maxLength: 240 },
+        objective: { type: 'string', minLength: 1, maxLength: 2000 },
+        context: { type: 'string', minLength: 1, maxLength: 8000 },
+        rationale: { type: 'string', minLength: 1, maxLength: 2000 },
+        risk: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
+        routeForecast: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            runtime: { type: 'string', enum: ['local', 'codex', 'claude'] },
+            model: { type: 'string', minLength: 1, maxLength: 200 },
+            reason: { type: 'string', minLength: 1, maxLength: 500 },
+          },
+          required: ['runtime', 'reason'],
+        },
+        projectId: { type: 'integer', minimum: 1 },
+        metadata: { type: 'object', additionalProperties: true },
+        expiresAt: { type: 'integer', minimum: 1 },
+      },
+      required: ['sourceType', 'sourceRef', 'idempotencyKey', 'title', 'objective', 'context', 'rationale', 'risk'],
+    },
+    handler: async proposal => api('POST', '/api/task-proposals', proposal),
+  },
+  {
+    name: 'task_proposals_list',
+    description: 'List task proposals. Agents can inspect proposals but cannot accept them.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        status: { type: 'string', enum: ['pending', 'accepted', 'dismissed', 'expired'] },
+        sourceType: { type: 'string', enum: ['chat', 'event'] },
+        sourceRef: { type: 'string', minLength: 1, maxLength: 500 },
+        projectId: { type: 'integer', minimum: 1 },
+        limit: { type: 'integer', minimum: 1, maximum: 200 },
+        offset: { type: 'integer', minimum: 0 },
+        summary: { type: 'boolean' },
+      },
+      required: [],
+    },
+    handler: async ({ status, sourceType, sourceRef, projectId, limit, offset, summary }) => {
+      const params = new URLSearchParams();
+      if (status !== undefined) params.set('status', status);
+      if (sourceType !== undefined) params.set('source_type', sourceType);
+      if (sourceRef !== undefined) params.set('source_ref', sourceRef);
+      if (projectId !== undefined) params.set('project_id', String(projectId));
+      if (limit !== undefined) params.set('limit', String(limit));
+      if (offset !== undefined) params.set('offset', String(offset));
+      if (summary !== undefined) params.set('summary', summary ? '1' : '0');
+      const query = params.toString();
+      return api('GET', `/api/task-proposals${query ? `?${query}` : ''}`);
+    },
+  },
+
   // --- Agents ---
   {
     name: 'mc_list_agents',
