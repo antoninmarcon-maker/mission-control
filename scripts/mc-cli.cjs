@@ -134,6 +134,7 @@ function saveProfile(profile) {
 }
 
 function mapStatusToExit(status) {
+  if (status === 0) return EXIT.NETWORK;
   if (status === 401) return EXIT.AUTH;
   if (status === 403) return EXIT.FORBIDDEN;
   if (status >= 500) return EXIT.SERVER;
@@ -268,23 +269,33 @@ async function sseStream({ baseUrl, apiKey, cookie, route, timeoutMs, onEvent, o
   }
 }
 
+function isSensitiveKey(key) {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+  return /^(?:xapikey|apikey|authorization|token|secret|cookie|password|credential|credentials|accesstoken|refreshtoken|privatekey|sessiontoken|bearertoken)$/.test(normalized);
+}
+
 function redactApiKey(value, apiKey) {
   let redacted = String(value);
   if (apiKey) redacted = redacted.split(apiKey).join('***REDACTED***');
-  return redacted.replace(/((?:x-api-key|api[_-]?key|authorization)\s*[:=]\s*(?:bearer\s+)?)\S+/gi, '$1***REDACTED***');
+  redacted = redacted.replace(/((?:["']?(?:x-api-key|api[_-]?key|authorization|token|secret|cookie|password|credentials?|access[_-]?token|refresh[_-]?token)["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}\]]+)/gi, '$1***REDACTED***');
+  return redacted.replace(/\bBearer\s+["']?[A-Za-z0-9._~+/=-]+["']?/gi, 'Bearer ***REDACTED***');
 }
 
 function redactErrorData(data, apiKey) {
   if (typeof data === 'string') return redactApiKey(data, apiKey);
   if (Array.isArray(data)) return data.map(value => redactErrorData(value, apiKey));
   if (data && typeof data === 'object') {
-    return Object.fromEntries(Object.entries(data).map(([key, value]) => [key, redactErrorData(value, apiKey)]));
+    return Object.fromEntries(Object.entries(data).map(([key, value]) => [key, isSensitiveKey(key) ? '***REDACTED***' : redactErrorData(value, apiKey)]));
   }
   return data;
 }
 
 function printResult(result, asJson, apiKey) {
-  const safeResult = result.ok ? result : { ...result, data: redactErrorData(result.data, apiKey) };
+  const safeResult = {
+    ...result,
+    data: redactErrorData(result.data, apiKey),
+    ...(result.setCookie ? { setCookie: '***REDACTED***' } : {}),
+  };
   if (asJson) {
     console.log(JSON.stringify(safeResult, null, 2));
     return;
@@ -352,6 +363,37 @@ function validateTaskProposal(proposal) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function optionalEnumFilter(flags, key, values) {
+  const value = flags[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '' || !values.includes(value)) throw new Error(`Invalid --${key}`);
+  return value;
+}
+
+function optionalTextFilter(flags, key, maxLength) {
+  const value = flags[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '' || value.length > maxLength) throw new Error(`Invalid --${key}`);
+  return value;
+}
+
+function optionalIntegerFilter(flags, key, minimum, maximum = Number.MAX_SAFE_INTEGER) {
+  const value = flags[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) throw new Error(`Invalid --${key}`);
+  const integer = Number(value);
+  if (!Number.isSafeInteger(integer) || integer < minimum || integer > maximum) throw new Error(`Invalid --${key}`);
+  return integer;
+}
+
+function optionalSummaryFilter(flags) {
+  const value = flags.summary;
+  if (value === undefined) return undefined;
+  if (value === true || value === 'true') return '1';
+  if (value === 'false') return '0';
+  throw new Error('Invalid --summary; use --summary, --summary true, or --summary false');
 }
 
 // --- Command handlers ---
@@ -496,13 +538,20 @@ const commands = {
   proposals: {
     list: (flags) => {
       const params = new URLSearchParams();
-      if (flags.status) params.set('status', String(flags.status));
-      if (flags['source-type']) params.set('source_type', String(flags['source-type']));
-      if (flags['source-ref']) params.set('source_ref', String(flags['source-ref']));
-      if (flags['project-id']) params.set('project_id', String(flags['project-id']));
-      if (flags.limit) params.set('limit', String(flags.limit));
-      if (flags.offset) params.set('offset', String(flags.offset));
-      if (flags.summary) params.set('summary', '1');
+      const status = optionalEnumFilter(flags, 'status', ['pending', 'accepted', 'dismissed', 'expired']);
+      const sourceType = optionalEnumFilter(flags, 'source-type', ['chat', 'event']);
+      const sourceRef = optionalTextFilter(flags, 'source-ref', 500);
+      const projectId = optionalIntegerFilter(flags, 'project-id', 1);
+      const limit = optionalIntegerFilter(flags, 'limit', 1, 200);
+      const offset = optionalIntegerFilter(flags, 'offset', 0);
+      const summary = optionalSummaryFilter(flags);
+      if (status !== undefined) params.set('status', status);
+      if (sourceType !== undefined) params.set('source_type', sourceType);
+      if (sourceRef !== undefined) params.set('source_ref', sourceRef);
+      if (projectId !== undefined) params.set('project_id', String(projectId));
+      if (limit !== undefined) params.set('limit', String(limit));
+      if (offset !== undefined) params.set('offset', String(offset));
+      if (summary !== undefined) params.set('summary', summary);
       const query = params.toString();
       return { method: 'GET', route: `/api/task-proposals${query ? `?${query}` : ''}` };
     },

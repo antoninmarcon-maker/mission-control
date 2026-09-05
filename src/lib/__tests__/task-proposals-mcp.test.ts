@@ -81,6 +81,18 @@ async function startApi(handler: (record: RequestRecord, response: ServerRespons
   }
 }
 
+async function closedLoopbackUrl() {
+  const server = createServer()
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('Expected TCP test server')
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  return `http://127.0.0.1:${address.port}`
+}
+
 async function runCli(args: string[], env: Record<string, string | undefined> = {}) {
   return await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [cliScript, ...args], { cwd: root, env: { ...process.env, ...env } })
@@ -262,5 +274,85 @@ describe('task proposal orchestrator interfaces', () => {
     const response = await mcp.request(1, 'tools/call', { name: 'task_proposals_list', arguments: {} })
     expect(response.result.content[0].text).not.toContain(apiKey)
     expect(response.result.content[0].text).toContain('***REDACTED***')
+  })
+
+  it('redacts nested sensitive fields and JSON-labelled bearer credentials while preserving error context', async () => {
+    const upstreamSecret = 'upstream-test-secret'
+    const bearerToken = 'Bearer upstream-test-token'
+    const api = await startApi((_request, response) => {
+      response.writeHead(400, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        error: {
+          message: 'Upstream proposal validation failed',
+          api_key: upstreamSecret,
+          apiKey: upstreamSecret,
+          'x-api-key': upstreamSecret,
+          authorization: bearerToken,
+          nested: [{ token: upstreamSecret }, { cookie: upstreamSecret }, { secret: upstreamSecret }, { access_token: upstreamSecret }, { refreshToken: upstreamSecret }],
+          diagnostic: `{"api_key":"${upstreamSecret}","authorization":"${bearerToken}"}`,
+        },
+      }))
+    })
+    cleanups.push(api.close)
+
+    const cli = await runCli(['proposals', 'list', '--url', api.baseUrl, '--api-key', apiKey, '--json'])
+    const cliOutput = `${cli.stdout}${cli.stderr}`
+    expect(cli.code).toBe(2)
+    expect(cliOutput).toContain('Upstream proposal validation failed')
+    expect(cliOutput).not.toContain(upstreamSecret)
+    expect(cliOutput).not.toContain(bearerToken)
+    expect(cliOutput).not.toContain('upstream-test-token')
+    expect(cliOutput).toContain('***REDACTED***')
+
+    const mcp = await startMcp(api.baseUrl)
+    cleanups.push(mcp.close)
+    const response = await mcp.request(1, 'tools/call', { name: 'task_proposals_list', arguments: {} })
+    const mcpOutput = response.result.content[0].text
+    expect(mcpOutput).toContain('Upstream proposal validation failed')
+    expect(mcpOutput).not.toContain(upstreamSecret)
+    expect(mcpOutput).not.toContain(bearerToken)
+    expect(mcpOutput).not.toContain('upstream-test-token')
+    expect(mcpOutput).toContain('***REDACTED***')
+  })
+
+  it('rejects invalid proposal list filters before networking and encodes explicit summary booleans', async () => {
+    const api = await startApi((request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ proposals: [], total: 0, limit: 50, offset: 0, request: request.url }))
+    })
+    cleanups.push(api.close)
+
+    for (const args of [
+      ['--status'], ['--status', 'waiting'], ['--source-type'], ['--source-type', 'task'], ['--summary', '1'], ['--summary', 'yes'],
+    ]) {
+      const result = await runCli(['proposals', 'list', ...args, '--url', api.baseUrl, '--api-key', apiKey, '--json'])
+      expect(result.code).toBe(2)
+    }
+    expect(api.requests).toHaveLength(0)
+
+    const mcp = await startMcp(api.baseUrl)
+    cleanups.push(mcp.close)
+    const invalidMcp = await mcp.request(1, 'tools/call', { name: 'task_proposals_list', arguments: { status: true } })
+    expect(invalidMcp.result).toMatchObject({ isError: true, content: [{ type: 'text', text: expect.stringContaining('Invalid proposal filter: status') }] })
+    expect(api.requests).toHaveLength(0)
+
+    for (const [summary, expected] of [[[], 'summary=1'], [['true'], 'summary=1'], [['false'], 'summary=0']] as const) {
+      const result = await runCli(['proposals', 'list', '--summary', ...summary, '--url', api.baseUrl, '--api-key', apiKey, '--json'])
+      expect(result.code).toBe(0)
+      expect(api.requests.at(-1)?.url).toBe(`/api/task-proposals?${expected}`)
+    }
+  })
+
+  it('returns the network exit code for proposal commands when the endpoint is closed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'mc-proposal-'))
+    cleanups.push(() => rm(directory, { recursive: true, force: true }))
+    const file = join(directory, 'proposal.json')
+    await writeFile(file, JSON.stringify(proposal))
+    const baseUrl = await closedLoopbackUrl()
+
+    const list = await runCli(['proposals', 'list', '--url', baseUrl, '--api-key', apiKey, '--json'])
+    const create = await runCli(['proposals', 'create', '--json-file', file, '--url', baseUrl, '--api-key', apiKey, '--json'])
+    expect(list.code).toBe(5)
+    expect(create.code).toBe(5)
   })
 })

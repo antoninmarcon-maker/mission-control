@@ -64,8 +64,8 @@ async function api(method, route, body) {
     const text = await res.text();
     let data;
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    if (!res.ok) throw new Error(redactApiKey(data.error || data.message || `HTTP ${res.status}: ${text.slice(0, 200)}`, config.apiKey));
-    return data;
+    if (!res.ok) throw new Error(apiErrorMessage(data, text, res.status, config.apiKey));
+    return redactSensitiveData(data, config.apiKey);
   } catch (err) {
     clearTimeout(timer);
     if (err?.name === 'AbortError') throw new Error('Request timeout (30s)');
@@ -76,7 +76,66 @@ async function api(method, route, body) {
 function redactApiKey(value, apiKey) {
   let redacted = String(value);
   if (apiKey) redacted = redacted.split(apiKey).join('***REDACTED***');
-  return redacted.replace(/((?:x-api-key|api[_-]?key|authorization)\s*[:=]\s*(?:bearer\s+)?)\S+/gi, '$1***REDACTED***');
+  redacted = redacted.replace(/((?:["']?(?:x-api-key|api[_-]?key|authorization|token|secret|cookie|password|credentials?|access[_-]?token|refresh[_-]?token)["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}\]]+)/gi, '$1***REDACTED***');
+  return redacted.replace(/\bBearer\s+["']?[A-Za-z0-9._~+/=-]+["']?/gi, 'Bearer ***REDACTED***');
+}
+
+function isSensitiveKey(key) {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+  return /^(?:xapikey|apikey|authorization|token|secret|cookie|password|credential|credentials|accesstoken|refreshtoken|privatekey|sessiontoken|bearertoken)$/.test(normalized);
+}
+
+function redactSensitiveData(data, apiKey) {
+  if (typeof data === 'string') return redactApiKey(data, apiKey);
+  if (Array.isArray(data)) return data.map(value => redactSensitiveData(value, apiKey));
+  if (data && typeof data === 'object') {
+    return Object.fromEntries(Object.entries(data).map(([key, value]) => [key, isSensitiveKey(key) ? '***REDACTED***' : redactSensitiveData(value, apiKey)]));
+  }
+  return data;
+}
+
+function apiErrorMessage(data, text, status, apiKey) {
+  const message = data?.error ?? data?.message ?? `HTTP ${status}: ${text.slice(0, 200)}`;
+  const safe = redactSensitiveData(message, apiKey);
+  return typeof safe === 'string' ? safe : JSON.stringify(safe);
+}
+
+function proposalListRoute(filters) {
+  if (!filters || typeof filters !== 'object' || Array.isArray(filters)) throw new Error('Invalid proposal filters');
+  const allowed = new Set(['status', 'sourceType', 'sourceRef', 'projectId', 'limit', 'offset', 'summary']);
+  for (const key of Object.keys(filters)) {
+    if (!allowed.has(key)) throw new Error(`Unknown proposal filter: ${key}`);
+  }
+  const enumFilter = (key, values) => {
+    const value = filters[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || value.trim() === '' || !values.includes(value)) throw new Error(`Invalid proposal filter: ${key}`);
+    return value;
+  };
+  const integerFilter = (key, minimum, maximum = Number.MAX_SAFE_INTEGER) => {
+    const value = filters[key];
+    if (value === undefined) return undefined;
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid proposal filter: ${key}`);
+    return value;
+  };
+  const status = enumFilter('status', ['pending', 'accepted', 'dismissed', 'expired']);
+  const sourceType = enumFilter('sourceType', ['chat', 'event']);
+  const sourceRef = filters.sourceRef;
+  if (sourceRef !== undefined && (typeof sourceRef !== 'string' || sourceRef.trim() === '' || sourceRef.length > 500)) throw new Error('Invalid proposal filter: sourceRef');
+  const projectId = integerFilter('projectId', 1);
+  const limit = integerFilter('limit', 1, 200);
+  const offset = integerFilter('offset', 0);
+  if (filters.summary !== undefined && typeof filters.summary !== 'boolean') throw new Error('Invalid proposal filter: summary');
+  const params = new URLSearchParams();
+  if (status !== undefined) params.set('status', status);
+  if (sourceType !== undefined) params.set('source_type', sourceType);
+  if (sourceRef !== undefined) params.set('source_ref', sourceRef);
+  if (projectId !== undefined) params.set('project_id', String(projectId));
+  if (limit !== undefined) params.set('limit', String(limit));
+  if (offset !== undefined) params.set('offset', String(offset));
+  if (filters.summary !== undefined) params.set('summary', filters.summary ? '1' : '0');
+  const query = params.toString();
+  return `/api/task-proposals${query ? `?${query}` : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,18 +194,7 @@ const TOOLS = [
       },
       required: [],
     },
-    handler: async ({ status, sourceType, sourceRef, projectId, limit, offset, summary }) => {
-      const params = new URLSearchParams();
-      if (status !== undefined) params.set('status', status);
-      if (sourceType !== undefined) params.set('source_type', sourceType);
-      if (sourceRef !== undefined) params.set('source_ref', sourceRef);
-      if (projectId !== undefined) params.set('project_id', String(projectId));
-      if (limit !== undefined) params.set('limit', String(limit));
-      if (offset !== undefined) params.set('offset', String(offset));
-      if (summary !== undefined) params.set('summary', summary ? '1' : '0');
-      const query = params.toString();
-      return api('GET', `/api/task-proposals${query ? `?${query}` : ''}`);
-    },
+    handler: async filters => api('GET', proposalListRoute(filters)),
   },
 
   // --- Agents ---
