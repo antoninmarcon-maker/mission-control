@@ -1083,15 +1083,25 @@ export const useMissionControl = create<MissionControlStore>()(
         && get().proposalVersion === version
         && proposalScope(get().currentUser) === scope
         && [...request.consumers].some((consumer) => !consumer.aborted)
+      const reloadSuperseded = () => {
+        // A local mutation can invalidate the last SSE snapshot without
+        // scheduling another event. Carry its live consumers into one fresh
+        // reload; a newer request, scope change or cleanup ends this obligation.
+        if (proposalReload !== request || proposalScope(get().currentUser) !== scope
+          || get().proposalVersion === version) return false
+        const consumers = [...request.consumers].filter((consumer) => !consumer.aborted)
+        if (consumers.length === 0) return false
+        return Promise.all(consumers.map((consumer) => get().reloadProposals(consumer)))
+          .then((results) => results.some(Boolean))
+      }
       proposalReload = request
       request.promise = apiFetch<{ proposals?: TaskProposal[] }>('/api/task-proposals?status=pending&limit=20')
         .then((data) => {
-          if (!isCurrent()) return false
+          if (!isCurrent()) return reloadSuperseded()
           set({ proposals: deduplicateProposals(data.proposals ?? []) })
           return true
-        })
-        .catch((error: unknown) => {
-          if (!isCurrent()) return false
+        }, (error: unknown) => {
+          if (!isCurrent()) return reloadSuperseded()
           throw error
         })
         .finally(() => { if (proposalReload === request) proposalReload = null })

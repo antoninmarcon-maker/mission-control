@@ -245,3 +245,44 @@ it('coordinates the initial rail load with an SSE terminal invalidation', async 
   expect(screen.queryByRole('heading', { name: proposal.title })).not.toBeInTheDocument()
   expect(useMissionControl.getState().proposals).toEqual([])
 })
+
+it('converges to both proposals when saving A supersedes the SSE-created B reload', async () => {
+  const user = userEvent.setup()
+  let onmessage: ((event: MessageEvent<string>) => void) | null = null
+  class Events {
+    set onmessage(handler: typeof onmessage) { onmessage = handler }
+    close() {}
+  }
+  const edited = { ...proposal, title: 'Updated proposal A', revision: 'updated-a' }
+  const second = { ...proposal, id: 13, title: 'Proposal B', idempotencyKey: 'proposal-b' }
+  const mutation = deferredResponse()
+  const stale = deferredResponse()
+  const replacement = deferredResponse()
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(response({ proposals: [proposal] }))
+    .mockReturnValueOnce(mutation.promise)
+    .mockReturnValueOnce(stale.promise)
+    .mockReturnValueOnce(replacement.promise)
+  vi.stubGlobal('EventSource', Events)
+  vi.stubGlobal('fetch', fetchMock)
+  function Client() { useServerEvents(); return <ProposalRail /> }
+  render(<NextIntlClientProvider locale="en" messages={messages}><Client /></NextIntlClientProvider>)
+  await screen.findByRole('heading', { name: proposal.title })
+  await user.click(screen.getByRole('button', { name: 'Modify' }))
+  await user.clear(screen.getByLabelText('Title'))
+  await user.type(screen.getByLabelText('Title'), edited.title)
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  act(() => onmessage?.({ data: JSON.stringify({ type: 'proposal.created', data: { id: second.id } }) } as MessageEvent<string>))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+  await act(async () => { mutation.resolve(response({ proposal: edited })); await mutation.promise })
+  expect(screen.getByRole('heading', { name: edited.title })).toBeVisible()
+  await act(async () => { stale.resolve(response({ proposals: [proposal, second] })); await stale.promise })
+  expect(screen.getByRole('heading', { name: edited.title })).toBeVisible()
+  expect(screen.queryByRole('heading', { name: second.title })).not.toBeInTheDocument()
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+  await act(async () => { replacement.resolve(response({ proposals: [edited, second] })); await replacement.promise })
+  expect(screen.getByRole('heading', { name: edited.title })).toBeVisible()
+  expect(screen.getByRole('heading', { name: second.title })).toBeVisible()
+  expect(useMissionControl.getState().proposals).toEqual([edited, second])
+  expect(fetchMock).toHaveBeenCalledTimes(4)
+})
