@@ -248,3 +248,27 @@ it('returns null for missing forecast and never exposes extra descriptor content
   expect(malformed.status).toBe(404)
   expect(await malformed.text()).not.toContain('PRIVATE')
 })
+
+it.each(['final_route', 'route_forecast'])('refuses %s stored as a JSON-encoded string rather than an object', async (field) => {
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+  const descriptor = field === 'final_route'
+    ? { runtime: 'codex', reason: 'next_cloud_rung' }
+    : ownership.route_forecast
+  state.db.prepare(`UPDATE tasks SET metadata = json_set(metadata, '$.proposal.${field}', ?) WHERE id = ?`)
+    .run(JSON.stringify(descriptor), taskId)
+  const stored = state.db.prepare(`SELECT json_type(metadata, '$.proposal.${field}') AS type FROM tasks WHERE id = ?`).get(taskId) as { type: string }
+  expect(stored.type).toBe('text')
+  const response = await readAudit()
+  expect(response.status).toBe(404)
+  expect(await response.json()).toEqual({ error: 'Proposal audit not found' })
+})
+
+it('accepts a real final_route object with an explicitly null forecast', async () => {
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+  state.db.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.route_forecast', json('null')) WHERE id = ?").run(taskId)
+  const response = await readAudit()
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({ proposal: {
+    id: 12, route_forecast: null, final_route: { runtime: 'codex', reason: 'next_cloud_rung' },
+  } })
+})

@@ -30,6 +30,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         AND json_extract(metadata, '$.proposal.id') = ?
         AND json_type(metadata, '$.proposal.execution_owner') = 'text'
         AND json_extract(metadata, '$.proposal.execution_owner') = 'external_orchestrator'
+        AND json_type(metadata, '$.proposal.final_route') = 'object'
+        AND (
+          json_type(metadata, '$.proposal.route_forecast') IS NULL
+          OR json_type(metadata, '$.proposal.route_forecast') IN ('null', 'object')
+        )
         ELSE 0 END
   `).get(Number(taskId), ws.workspaceId, Number(proposalId)) as { route_forecast: string | null; final_route: string | null } | undefined
   if (row) {
