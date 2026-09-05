@@ -1,4 +1,5 @@
 import { validateLoopbackHttpUrl } from "./policy-core.mjs";
+import { assertRouteDescriptor } from "./receipt-ledger.mjs";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -9,6 +10,7 @@ const TASK_UPDATE_FIELDS = new Set([
   "assigned_to",
   "resolution",
   "metadata",
+  "proposal_final_route",
   "error_message",
 ]);
 
@@ -189,6 +191,14 @@ export class MissionControlClient {
         throw new TypeError(`unsupported task update field: ${field}`);
       }
     }
+    if (update.proposal_final_route !== undefined) {
+      if (update.metadata !== undefined) {
+        throw new TypeError("proposal_final_route cannot be combined with metadata");
+      }
+      const { proposal_id: proposalId, ...route } = update.proposal_final_route;
+      requirePositiveInteger(proposalId, "proposal_id");
+      assertRouteDescriptor(route, "proposal_final_route");
+    }
     const response = await this.#request(taskPath(taskId), {
       method: "PUT",
       body: update,
@@ -233,6 +243,16 @@ export class MissionControlClient {
       throw mutationResponseError(
         "Mission Control did not confirm completion metadata",
       );
+    }
+    if (update.proposal_final_route !== undefined) {
+      const { proposal_id: proposalId, ...route } = update.proposal_final_route;
+      const proposal = response.task.metadata?.proposal;
+      if (
+        proposal?.id !== proposalId || proposal?.execution_owner !== "external_orchestrator" ||
+        !sameJsonValue(proposal.final_route, route)
+      ) {
+        throw mutationResponseError("Mission Control did not confirm proposal final route");
+      }
     }
     return response;
   }

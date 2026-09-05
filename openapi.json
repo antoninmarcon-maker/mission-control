@@ -8517,6 +8517,7 @@
         ],
         "summary": "Update task",
         "operationId": "updateTask",
+        "description": "proposal_final_route atomically merges only proposal.final_route for an accepted, externally owned proposal. The proposal ID and execution owner are rechecked in the SQL update; malformed or changed metadata returns 409. Cannot be combined with metadata. Cloud model may be omitted when the runner does not declare it.",
         "parameters": [
           {
             "name": "id",
@@ -8563,6 +8564,17 @@
                   },
                   "metadata": {
                     "type": "object"
+                  },
+                  "proposal_final_route": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["proposal_id", "runtime", "reason"],
+                    "properties": {
+                      "proposal_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                      "runtime": { "type": "string", "enum": ["local", "codex", "claude"] },
+                      "model": { "type": "string", "minLength": 1, "maxLength": 200 },
+                      "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+                    }
                   }
                 }
               }

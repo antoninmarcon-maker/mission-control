@@ -48,7 +48,11 @@ import {
   resolveQuotaPolicy,
 } from "./quota-config.mjs";
 import { QuotaStore } from "./quota-store.mjs";
-import { ReceiptLedger } from "./receipt-ledger.mjs";
+import {
+  ReceiptLedger,
+  assertRouteDescriptor,
+  canonicalJson,
+} from "./receipt-ledger.mjs";
 import { ProposalCursorStore } from "./proposal-cursor-store.mjs";
 import { proposalCandidatesForTask } from "./proposal-engine.mjs";
 
@@ -80,6 +84,9 @@ const STABLE_RECEIPT_FIELDS = [
   "input_hash",
   "output_hash",
   "outcome",
+  "proposal_id",
+  "route_forecast",
+  "final_route",
 ];
 
 class CompletionPendingError extends Error {
@@ -395,6 +402,7 @@ function receiptInput({
     attempt: attempt.number,
     route_chain: attempt.routeChain,
     quota_snapshot_hash: attempt.quotaSnapshotHash,
+    ...(attempt.proposalAudit ?? {}),
   };
 }
 
@@ -526,10 +534,20 @@ function resolutionLimitError(provider) {
   return error;
 }
 
+function taskConfirmsProposalAudit(task, receipt) {
+  if (receipt.proposal_id === undefined) return true;
+  const proposal = task?.metadata?.proposal;
+  return proposal?.id === receipt.proposal_id &&
+    proposal?.execution_owner === "external_orchestrator" &&
+    canonicalJson(proposal.route_forecast ?? null) === canonicalJson(receipt.route_forecast) &&
+    canonicalJson(proposal.final_route) === canonicalJson(receipt.final_route);
+}
+
 function taskConfirmsCompletion(task, entry) {
   const expectedPolicyMetadata = entry.task_update.metadata?.policy_mvp;
   const actualPolicyMetadata = task?.metadata?.policy_mvp;
   return (
+    taskConfirmsProposalAudit(task, entry.receipt) &&
     task?.status === entry.task_update.status &&
     task?.assigned_to === entry.task_update.assigned_to &&
     task?.resolution === entry.task_update.resolution &&
@@ -544,6 +562,9 @@ function taskConfirmsCompletion(task, entry) {
 }
 
 function taskUpdateWithFreshMetadata(entry, task) {
+  if (!taskConfirmsProposalAudit(task, entry.receipt)) {
+    throw new Error("Mission Control proposal routing changed during completion");
+  }
   const freshMetadata =
     task?.metadata !== null &&
     typeof task?.metadata === "object" &&
@@ -587,7 +608,7 @@ async function receiptAlreadyStored(receiptLedger, expectedReceipt) {
     if (line === "") continue;
     const record = JSON.parse(line);
     if (STABLE_RECEIPT_FIELDS.every(
-      (field) => record[field] === expectedReceipt[field],
+      (field) => canonicalJson(record[field]) === canonicalJson(expectedReceipt[field]),
     )) {
       return record;
     }
@@ -1359,6 +1380,57 @@ async function runnerForRoute(route, normalized, dependencies) {
   });
 }
 
+async function persistProposalRoute({
+  task,
+  plan,
+  missionControl,
+  leaseStore,
+  lease,
+  owner,
+  recoveryLeaseTtlMs,
+}) {
+  const metadata = task.metadata;
+  if (metadata == null) return null;
+  if (typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new Error("invalid task metadata for proposal audit");
+  }
+  if (!Object.hasOwn(metadata, "proposal") || metadata.proposal === null) return null;
+  const proposal = metadata.proposal;
+  if (
+    typeof proposal !== "object" || Array.isArray(proposal) ||
+    !Number.isSafeInteger(proposal.id) || proposal.id <= 0 ||
+    proposal.execution_owner !== "external_orchestrator"
+  ) {
+    throw new Error("invalid externally owned proposal metadata");
+  }
+  const forecast = proposal.route_forecast ?? null;
+  if (forecast !== null) assertRouteDescriptor(forecast, "proposal.route_forecast");
+  const parsed = parseRoute(plan.route);
+  const finalRoute = {
+    runtime: parsed.provider === "ollama" ? "local" : parsed.provider === "claude-code" ? "claude" : "codex",
+    ...(parsed.provider === "ollama" ? { model: parsed.detail } : {}),
+    reason: plan.reasonCode,
+  };
+  assertRouteDescriptor(finalRoute, "proposal.final_route");
+  const leaseEntry = { task_id: String(task.id), owner, fencing_token: lease.fencing_token };
+  await renewForNetwork(leaseStore, leaseEntry, recoveryLeaseTtlMs);
+  const response = await withLocalCompletionGuard(leaseStore, leaseEntry, () =>
+    missionControl.updateTask(task.id, {
+      proposal_final_route: { proposal_id: proposal.id, ...finalRoute },
+    }),
+  );
+  const confirmed = response?.task?.metadata?.proposal;
+  if (
+    confirmed?.id !== proposal.id || confirmed?.execution_owner !== "external_orchestrator" ||
+    canonicalJson(confirmed.final_route) !== canonicalJson(finalRoute) ||
+    canonicalJson(confirmed.route_forecast ?? null) !== canonicalJson(forecast)
+  ) {
+    throw new Error("Mission Control did not confirm exact proposal routing metadata");
+  }
+  task.metadata = response.task.metadata;
+  return { proposal_id: proposal.id, route_forecast: forecast, final_route: finalRoute };
+}
+
 /**
  * §2.9 the passive sources, read once per invocation and only when Antonin has
  * turned them on. Their single job (§2.6) is to skip a provider we already
@@ -1773,6 +1845,18 @@ export async function processOne(config, dependencies = {}) {
         });
       }
 
+      // Audit writes are outside the provider fallback boundary: a refused or
+      // ambiguous acknowledgement must never spend a provider attempt.
+      let proposalAudit;
+      try {
+        proposalAudit = await persistProposalRoute({
+          task, plan, missionControl, leaseStore, lease,
+          owner: normalized.agent, recoveryLeaseTtlMs,
+        });
+      } catch (error) {
+        await releaseLeaseForCleanup(leaseStore, taskId, normalized.agent, lease.fencing_token);
+        throw new AttemptHandoffError(error);
+      }
       const provider = parseRoute(plan.route).provider;
       attempt = {
         number: plan.attempt,
@@ -1782,6 +1866,7 @@ export async function processOne(config, dependencies = {}) {
           plan.route,
         ]),
         quotaSnapshotHash: plan.snapshotId,
+        proposalAudit,
       };
       try {
         const runner = await runnerForRoute(plan.route, normalized, dependencies);
