@@ -24,6 +24,30 @@ function requirePositiveInteger(value, name) {
   }
 }
 
+function requireProposalCursor(cursor) {
+  if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
+    throw new TypeError("proposal cursor must be an object");
+  }
+  for (const field of ["updatedAt", "id"]) {
+    if (!Number.isSafeInteger(cursor[field]) || cursor[field] < 0) {
+      throw new TypeError(`proposal cursor ${field} must be a non-negative safe integer`);
+    }
+  }
+  return cursor;
+}
+
+function isProposalCursor(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Number.isSafeInteger(value.updatedAt) &&
+    value.updatedAt >= 0 &&
+    Number.isSafeInteger(value.id) &&
+    value.id >= 0
+  );
+}
+
 async function readBoundedText(response, maximumBytes) {
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
@@ -279,6 +303,64 @@ export class MissionControlClient {
     return (
       response.usage.find((record) => record?.sessionId === sessionId) ?? null
     );
+  }
+
+  async listProposalCandidates(cursor) {
+    const { updatedAt, id } = requireProposalCursor(cursor);
+    const query = new URLSearchParams({
+      proposal_candidate: "1",
+      updated_since: String(updatedAt),
+      after_id: String(id),
+      limit: "200",
+    });
+    const response = await this.#request(`/api/tasks?${query}`);
+    if (
+      response === null ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      !Array.isArray(response.tasks) ||
+      !isProposalCursor(response.nextCursor)
+    ) {
+      throw new Error("Mission Control returned an invalid proposal candidate response");
+    }
+    return { tasks: response.tasks, nextCursor: response.nextCursor };
+  }
+
+  async createProposal(input) {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("proposal input must be an object");
+    }
+    requireNonEmptyString(input.idempotencyKey, "proposal idempotencyKey");
+
+    try {
+      return await this.#createProposal(input);
+    } catch (error) {
+      if (!(error instanceof MissionControlRequestError) || !error.ambiguous) {
+        throw error;
+      }
+      return this.#createProposal(input);
+    }
+  }
+
+  async #createProposal(input) {
+    const response = await this.#request("/api/task-proposals", {
+      method: "POST",
+      body: input,
+    });
+    if (
+      response?.proposal === null ||
+      typeof response?.proposal !== "object" ||
+      Array.isArray(response.proposal) ||
+      !Number.isSafeInteger(response.proposal.id) ||
+      response.proposal.id <= 0 ||
+      typeof response.proposal.revision !== "string" ||
+      response.proposal.revision.trim() === ""
+    ) {
+      throw mutationResponseError(
+        "Mission Control returned an invalid proposal mutation response",
+      );
+    }
+    return response;
   }
 
   async #request(pathname, options = {}) {
