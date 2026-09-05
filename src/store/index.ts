@@ -856,7 +856,7 @@ export const useMissionControl = create<MissionControlStore>()(
     setCurrentUser: (user) => set((state) => ({
       currentUser: user,
       ...(proposalScope(user) !== proposalScope(state.currentUser)
-        ? { proposals: [], proposalVersion: state.proposalVersion + 1 }
+        ? { proposals: [], proposalVersion: state.proposalVersion + 1, tasks: [], selectedTask: null }
         : {}),
     })),
 

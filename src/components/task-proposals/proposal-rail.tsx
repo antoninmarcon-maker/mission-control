@@ -60,8 +60,12 @@ function ScopedProposalRail() {
     if (signal.aborted) return
     if (err instanceof ApiError && err.status === 409) {
       invalidateProposalReloads()
-      if (await load() && !signal.aborted) setError(t('stale'))
+      if (await load() && !signal.aborted) {
+        setError(t('stale'))
+        return true
+      }
     } else setError(t('failed'))
+    return false
   }, [invalidateProposalReloads, load, t])
 
   const accept = useCallback(async (proposal: TaskProposal) => {
@@ -98,7 +102,10 @@ function ScopedProposalRail() {
       setError(null)
       return true
     } catch (err) {
-      await handleFailure(err, signal)
+      if (await handleFailure(err, signal)) {
+        const latest = useMissionControl.getState().proposals.find((item) => item.id === proposal.id && item.status === 'pending')
+        if (latest && !signal.aborted) return { rebase: latest }
+      }
       return false
     }
   }, [handleFailure, updateProposal])

@@ -6,12 +6,13 @@ import type { TaskProposal } from '@/lib/task-proposals'
 import { Button } from '@/components/ui/button'
 
 export type ProposalEdit = Partial<Pick<TaskProposal, 'title' | 'objective' | 'context'>>
+type EditResult = boolean | void | { rebase: TaskProposal }
 
 export type ProposalCardProps = {
   proposal: TaskProposal
   compact?: boolean
   onAccept: (proposal: TaskProposal) => Promise<void>
-  onEdit: (proposal: TaskProposal, patch: ProposalEdit) => Promise<boolean | void>
+  onEdit: (proposal: TaskProposal, patch: ProposalEdit) => Promise<EditResult>
   onDismiss: (proposal: TaskProposal, reason?: string) => Promise<void>
 }
 
@@ -60,7 +61,7 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
     setEditing(false)
   }
 
-  async function run(action: () => Promise<boolean | void>) {
+  async function run(action: () => Promise<EditResult>) {
     setBusy(true)
     setFailure(false)
     try {
@@ -82,7 +83,16 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
       closeEditor()
       return
     }
-    if (await run(() => onEdit(editBase, patch)) !== false) closeEditor()
+    const result = await run(() => onEdit(editBase, patch))
+    if (result && typeof result === 'object') {
+      const latest = result.rebase
+      setDraft({
+        title: draft.title.trim() === editBase.title ? latest.title : draft.title,
+        objective: draft.objective.trim() === editBase.objective ? latest.objective : draft.objective,
+        context: draft.context.trim() === editBase.context ? latest.context : draft.context,
+      })
+      setEditBase(latest)
+    } else if (result !== false) closeEditor()
   }
 
   return (
@@ -101,6 +111,7 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
       <div className="mt-3 space-y-1 font-mono text-2xs text-muted-foreground">
         <p className="break-words">{proposal.sourceType} · {proposal.sourceRef} · {formatAge(proposal.createdAt, locale)}</p>
         {proposal.routeForecast && <p>{t('forecast')}: {proposal.routeForecast.runtime}{proposal.routeForecast.model ? ` / ${proposal.routeForecast.model}` : ''}</p>}
+        {proposal.routeForecast && <p className="font-sans">{proposal.routeForecast.reason}</p>}
         {proposal.routeForecast && <p className="font-sans text-muted-foreground">{t('forecastDisclaimer')}</p>}
       </div>
 

@@ -177,6 +177,38 @@ it('retains an active draft through a successful conflict refresh until it is ca
   expect(screen.getByLabelText('Title')).toHaveValue('Server title')
 })
 
+it('rebases a conflicted draft, adopts untouched server fields and saves against the refreshed revision', async () => {
+  const user = userEvent.setup()
+  const latest = { ...proposal, title: 'Server title', objective: 'Server objective', context: 'Server context', revision: 'server-revision' }
+  const requests: Record<string, unknown>[] = []
+  let reads = 0
+  vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+    if (init.method !== 'PUT') return response({ proposals: [reads++ === 0 ? proposal : latest] })
+    const body = JSON.parse(String(init.body))
+    requests.push(body)
+    return body.revision !== latest.revision
+      ? response({ error: 'Proposal changed' }, 409)
+      : response({ proposal: { ...latest, title: body.title, revision: 'saved-revision' } })
+  }))
+  renderRail()
+  await screen.findByRole('heading', { name: proposal.title })
+  await user.click(screen.getByRole('button', { name: 'Modify' }))
+  await user.clear(screen.getByLabelText('Title'))
+  await user.type(screen.getByLabelText('Title'), 'Local draft')
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(messages.taskProposals.stale)
+  expect(screen.getByLabelText('Title')).toHaveValue('Local draft')
+  expect(screen.getByLabelText('Objective')).toHaveValue('Server objective')
+  expect(screen.getByLabelText('Context')).toHaveValue('Server context')
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(screen.queryByLabelText('Title')).not.toBeInTheDocument())
+  expect(requests).toEqual([
+    { action: 'edit', revision: proposal.revision, title: 'Local draft' },
+    { action: 'edit', revision: 'server-revision', title: 'Local draft' },
+  ])
+  expect(screen.getByRole('heading', { name: 'Local draft' })).toBeVisible()
+})
+
 it('moves keyboard focus from acceptance to the launched task link', async () => {
   const user = userEvent.setup()
   vi.stubGlobal('fetch', vi.fn()

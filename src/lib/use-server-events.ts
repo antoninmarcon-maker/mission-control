@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
-import { useMissionControl } from '@/store'
+import { useMissionControl, type Task } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
+import { apiFetch, ApiError } from '@/lib/api-client'
 
 const log = createClientLogger('SSE')
 
@@ -49,6 +50,85 @@ export function useServerEvents() {
     let mounted = true
     const proposalLifetime = new AbortController()
     let proposalReloadTimeout: ReturnType<typeof setTimeout> | undefined
+    let needsProposalRecovery = false
+    let taskReloadTimeout: ReturnType<typeof setTimeout> | undefined
+    let activeTaskReads = 0
+    const deletedTasks = new Set<number>()
+    const taskReads = new Map<number, { version: number; dirty: boolean; inFlight: boolean; status?: Task['status'] }>()
+    const scopeIsCurrent = () => {
+      const user = useMissionControl.getState().currentUser
+      return mounted && `${user?.tenant_id}:${user?.workspace_id}:${user?.id}` === proposalScope
+    }
+    const isFullTask = (data: any): data is Task => typeof data?.id === 'number'
+      && typeof data.title === 'string' && typeof data.status === 'string'
+
+    function publishTask(task: Task) {
+      if (useMissionControl.getState().tasks.some((current) => current.id === task.id)) updateTask(task.id, task)
+      else addTask(task)
+    }
+
+    function scheduleTaskReads() {
+      if (!scopeIsCurrent() || taskReloadTimeout) return
+      taskReloadTimeout = setTimeout(() => {
+        taskReloadTimeout = undefined
+        for (const [id, job] of taskReads) {
+          if (activeTaskReads >= 4) break
+          if (!job.dirty || job.inFlight || deletedTasks.has(id)) continue
+          const version = job.version
+          const before = useMissionControl.getState().tasks.find((task) => task.id === id)
+          job.dirty = false
+          job.inFlight = true
+          activeTaskReads++
+          void apiFetch<{ task: Task & { workspace_id?: number } }>(`/api/tasks/${id}`, { signal: proposalLifetime.signal })
+            .then(({ task }) => {
+              if (!scopeIsCurrent() || deletedTasks.has(id) || job.version !== version) return
+              const current = useMissionControl.getState().tasks.find((item) => item.id === id)
+              // Local REST mutations also supersede this read, including deletes.
+              if (current !== before) return
+              if (!isFullTask(task) || task.id !== id || (job.status && task.status !== job.status)) return
+              const workspaceId = useMissionControl.getState().currentUser?.workspace_id
+              if (workspaceId !== undefined && task.workspace_id !== workspaceId) return
+              publishTask(task)
+            }, (error: unknown) => {
+              if (!scopeIsCurrent() || job.version !== version) return
+              if (error instanceof ApiError && error.status === 404) {
+                const current = useMissionControl.getState().tasks.find((item) => item.id === id)
+                if (current === before) {
+                  deletedTasks.add(id)
+                  deleteTask(id)
+                }
+              }
+              // A subsequent invalidation retries failures; do not poll in a loop.
+            })
+            .finally(() => {
+              job.inFlight = false
+              activeTaskReads--
+              if (!job.dirty) taskReads.delete(id)
+              if ([...taskReads.values()].some((read) => read.dirty)) scheduleTaskReads()
+            })
+        }
+      }, 25)
+    }
+
+    function hydrateTask(id: number) {
+      if (deletedTasks.has(id)) return
+      const job = taskReads.get(id) ?? { version: 0, dirty: false, inFlight: false }
+      job.version++
+      job.dirty = true
+      taskReads.set(id, job)
+      scheduleTaskReads()
+    }
+
+    function supersedeTaskRead(id: number, status?: Task['status']) {
+      const job = taskReads.get(id)
+      if (!job) return
+      job.version++
+      // A status-only event still needs the outstanding prose/metadata read.
+      job.dirty = status !== undefined
+      job.status = status
+      if (job.dirty) scheduleTaskReads()
+      else if (!job.inFlight) taskReads.delete(id)
+    }
 
     function scheduleProposalReload() {
       if (proposalReloadTimeout) clearTimeout(proposalReloadTimeout)
@@ -68,13 +148,18 @@ export function useServerEvents() {
       eventSourceRef.current = es
 
       es.onopen = () => {
-        if (!mounted) return
+        if (!mounted || eventSourceRef.current !== es) return
         sseReconnectAttemptsRef.current = 0
         setConnection({ sseConnected: true })
+        if (needsProposalRecovery) {
+          needsProposalRecovery = false
+          invalidateProposalReloads()
+          scheduleProposalReload()
+        }
       }
 
       es.onmessage = (event) => {
-        if (!mounted) return
+        if (!scopeIsCurrent() || eventSourceRef.current !== es) return
         try {
           const payload = JSON.parse(event.data) as ServerEvent
           dispatch(payload)
@@ -84,7 +169,8 @@ export function useServerEvents() {
       }
 
       es.onerror = () => {
-        if (!mounted) return
+        if (!mounted || eventSourceRef.current !== es) return
+        needsProposalRecovery = true
         setConnection({ sseConnected: false })
         es.close()
         eventSourceRef.current = null
@@ -115,15 +201,20 @@ export function useServerEvents() {
 
         // Task events
         case 'task.created':
-          addTask(event.data)
-          break
         case 'task.updated':
-          if (event.data?.id) {
-            updateTask(event.data.id, event.data)
+          if (typeof event.data?.id === 'number') {
+            const id = event.data.id
+            if (event.type === 'task.created') deletedTasks.delete(id)
+            if (deletedTasks.has(id)) break
+            if (isFullTask(event.data)) {
+              supersedeTaskRead(id)
+              publishTask(event.data)
+            } else hydrateTask(id)
           }
           break
         case 'task.status_changed':
           if (event.data?.id) {
+            supersedeTaskRead(event.data.id, event.data.status)
             const updates = {
               status: event.data.status,
               updated_at: event.data.updated_at,
@@ -134,6 +225,8 @@ export function useServerEvents() {
           break
         case 'task.deleted':
           if (event.data?.id) {
+            deletedTasks.add(event.data.id)
+            supersedeTaskRead(event.data.id)
             deleteTask(event.data.id)
           }
           break
@@ -221,6 +314,7 @@ export function useServerEvents() {
     return () => {
       mounted = false
       proposalLifetime.abort()
+      if (taskReloadTimeout) clearTimeout(taskReloadTimeout)
       if (proposalReloadTimeout) clearTimeout(proposalReloadTimeout)
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
       if (eventSourceRef.current) {

@@ -60,6 +60,7 @@ it('keeps the authorization decision visible while keeping private context discl
   expect(screen.getByText(/chat/)).toBeVisible()
   expect(screen.getByText('MEDIUM')).toBeVisible()
   expect(screen.getByText('The orchestrator rechecks the route at launch.')).toBeVisible()
+  expect(screen.getByText('The change is isolated.')).toBeVisible()
   expect(screen.queryByText('The callback URL is lost after a session expires.')).not.toBeInTheDocument()
 
   const acceptButton = screen.getByRole('button', { name: 'Validate and launch' })
