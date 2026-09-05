@@ -141,6 +141,7 @@ test("proposal client retries an ambiguous idempotent POST and returns the persi
   const firstRequestPersisted = deferred();
   const firstResponseMayFinish = deferred();
   const firstHandlerFinished = deferred();
+  const beforeAttempts = [];
   const input = proposalInput();
   t.after(() => firstResponseMayFinish.resolve());
   const baseUrl = await fakeHttpServer(t, async (request, response) => {
@@ -170,7 +171,11 @@ test("proposal client retries an ambiguous idempotent POST and returns the persi
     timeoutMs: 200,
   });
 
-  const acknowledgementPromise = client.createProposal(input);
+  const acknowledgementPromise = client.createProposal(input, {
+    beforeAttempt: async () => {
+      beforeAttempts.push(beforeAttempts.length + 1);
+    },
+  });
   await firstRequestPersisted.promise;
   const acknowledgement = await acknowledgementPromise;
   firstResponseMayFinish.resolve();
@@ -179,6 +184,7 @@ test("proposal client retries an ambiguous idempotent POST and returns the persi
   assert.equal(proposalsByIdempotencyKey.size, 1);
   assert.deepEqual(requests, [input, input]);
   assert.equal(requests[0].idempotencyKey, requests[1].idempotencyKey);
+  assert.deepEqual(beforeAttempts, [1, 2]);
   assert.deepEqual(acknowledgement, {
     proposal: proposalsByIdempotencyKey.get(input.idempotencyKey),
     created: false,

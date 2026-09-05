@@ -326,19 +326,31 @@ export class MissionControlClient {
     return { tasks: response.tasks, nextCursor: response.nextCursor };
   }
 
-  async createProposal(input) {
+  async createProposal(input, options = {}) {
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
       throw new TypeError("proposal input must be an object");
     }
     requireNonEmptyString(input.idempotencyKey, "proposal idempotencyKey");
+    if (
+      options.beforeAttempt !== undefined &&
+      typeof options.beforeAttempt !== "function"
+    ) {
+      throw new TypeError("proposal beforeAttempt must be a function");
+    }
+    const createAttempt = async () => {
+      if (options.beforeAttempt !== undefined) {
+        await options.beforeAttempt();
+      }
+      return this.#createProposal(input);
+    };
 
     try {
-      return await this.#createProposal(input);
+      return await createAttempt();
     } catch (error) {
       if (!(error instanceof MissionControlRequestError) || !error.ambiguous) {
         throw error;
       }
-      return this.#createProposal(input);
+      return createAttempt();
     }
   }
 

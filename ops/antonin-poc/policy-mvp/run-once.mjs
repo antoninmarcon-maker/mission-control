@@ -1972,6 +1972,14 @@ export async function proposeOnce(config, dependencies = {}) {
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? ((milliseconds) =>
     new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let lastProposalPostStartedAt = null;
+  const beforeProposalAttempt = async () => {
+    lastProposalPostStartedAt = await waitForProposalPostSlot(
+      lastProposalPostStartedAt,
+      now,
+      sleep,
+    );
+  };
   const cursor = await cursorStore.read();
   const page = await missionControl.listProposalCandidates(cursor);
   const counts = {
@@ -1980,7 +1988,6 @@ export async function proposeOnce(config, dependencies = {}) {
     duplicates: 0,
     skipped: 0,
   };
-  let lastProposalPostStartedAt = null;
 
   for (const task of page.tasks) {
     const candidates = extractCandidates(task).slice(0, 3);
@@ -1996,13 +2003,8 @@ export async function proposeOnce(config, dependencies = {}) {
         ...(routeForecast === null ? {} : { routeForecast }),
         metadata: { source_task_id: task.id },
       };
-      lastProposalPostStartedAt = await waitForProposalPostSlot(
-        lastProposalPostStartedAt,
-        now,
-        sleep,
-      );
       const created = proposalAcknowledgementCreated(
-        await missionControl.createProposal(proposal),
+        await missionControl.createProposal(proposal, { beforeAttempt: beforeProposalAttempt }),
       );
       if (created) counts.created += 1;
       else counts.duplicates += 1;

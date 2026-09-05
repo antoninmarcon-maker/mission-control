@@ -268,36 +268,70 @@ test("runCommand propose does not commit a page when a proposal acknowledgement 
   assert.deepEqual(calls.cursors, [oldCursor]);
 });
 
-test("runCommand propose spaces more than sixty proposal posts and commits once after the page", async (t) => {
+test("runCommand propose spaces every retried proposal POST and commits the full page once", async (t) => {
   const state = await temporaryPolicyState(t);
   let clock = 0;
-  const starts = [];
+  const postAttempts = [];
   const waits = [];
-  const { calls, dependencies } = proposalDependencies({
-    page: {
-      tasks: Array.from({ length: 61 }, (_, index) =>
-        proposalTask(index + 1, "failed"),
-      ),
-      nextCursor: { updatedAt: 1_788_560_061, id: 61 },
+  const commits = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, options) => {
+    if (options.method === "GET") {
+      return new Response(JSON.stringify({
+        tasks: Array.from({ length: 61 }, (_, index) =>
+          proposalTask(index + 1, "failed"),
+        ),
+        nextCursor: { updatedAt: 1_788_560_061, id: 61 },
+      }), { status: 200 });
+    }
+    const body = JSON.parse(options.body);
+    postAttempts.push({ at: clock, body });
+    const attemptsForKey = postAttempts.filter(
+      (attempt) => attempt.body.idempotencyKey === body.idempotencyKey,
+    ).length;
+    if (attemptsForKey === 1) {
+      throw new Error("synthetic ambiguous transport failure");
+    }
+    return new Response(JSON.stringify({
+      proposal: { id: postAttempts.length, revision: "ack" },
+    }), { status: 201 });
+  };
+  const dependencies = {
+    missionControl: new MissionControlClient({
+      baseUrl: "http://127.0.0.1:4318",
+      apiKey: "proposal-rate-secret",
+    }),
+    proposalCursorStore: {
+      async read() {
+        return { updatedAt: 1_788_560_000, id: 40 };
+      },
+      async commit(cursor) {
+        commits.push(cursor);
+        return cursor;
+      },
     },
     now: () => clock,
     sleep: async (milliseconds) => {
       waits.push(milliseconds);
       clock += milliseconds;
     },
-    createProposal: async () => {
-      starts.push(clock);
-      return { proposal: { id: 1, revision: "ack" }, created: true };
-    },
-  });
+  };
 
   const result = await runCommand("propose", proposalEnvironment(state), dependencies);
 
-  assert.equal(starts.length, 61);
-  assert.equal(waits.length, 60);
+  assert.equal(postAttempts.length, 122);
+  assert.equal(waits.length, 121);
   assert.ok(waits.every((milliseconds) => milliseconds > 1_000));
-  assert.ok(starts.slice(1).every((startedAt, index) => startedAt - starts[index] > 1_000));
-  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_061, id: 61 }]);
+  assert.ok(postAttempts.slice(1).every(
+    (attempt, index) => attempt.at - postAttempts[index].at >= 1_100,
+  ));
+  for (let index = 0; index < postAttempts.length; index += 2) {
+    assert.deepEqual(postAttempts[index + 1].body, postAttempts[index].body);
+  }
+  assert.deepEqual(commits, [{ updatedAt: 1_788_560_061, id: 61 }]);
   assert.deepEqual(result, {
     outcome: "proposals_scanned",
     scanned: 61,
@@ -306,6 +340,50 @@ test("runCommand propose spaces more than sixty proposal posts and commits once 
     skipped: 0,
     cursor: { updatedAt: 1_788_560_061, id: 61 },
   });
+});
+
+test("runCommand propose leaves its cursor unchanged when the retry gate fails", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let clock = 0;
+  const commits = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, options) => {
+    if (options.method === "GET") {
+      return new Response(JSON.stringify({
+        tasks: [proposalTask(41, "failed")],
+        nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+      }), { status: 200 });
+    }
+    throw new Error("synthetic ambiguous transport failure");
+  };
+  const dependencies = {
+    missionControl: new MissionControlClient({
+      baseUrl: "http://127.0.0.1:4318",
+      apiKey: "proposal-rate-secret",
+    }),
+    proposalCursorStore: {
+      async read() {
+        return { updatedAt: 1_788_560_000, id: 40 };
+      },
+      async commit(cursor) {
+        commits.push(cursor);
+        return cursor;
+      },
+    },
+    now: () => clock,
+    sleep: async () => {
+      throw new Error("proposal gate unavailable");
+    },
+  };
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal gate unavailable/,
+  );
+  assert.deepEqual(commits, []);
 });
 
 test("runCommand propose retries an incomplete page with the same proposal body and commits only after acknowledgements", async (t) => {
