@@ -10,6 +10,12 @@ function defaultSleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function requirePositiveInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive integer`);
+  }
+}
+
 function assertCursor(cursor) {
   if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
     throw new TypeError("proposal cursor must be an object");
@@ -37,6 +43,7 @@ export class ProposalCursorStore {
     this.sleep = options.sleep ?? defaultSleep;
     this.lockRetryMs = options.lockRetryMs ?? 10;
     this.lockMaxAttempts = options.lockMaxAttempts ?? 50;
+    requirePositiveInteger(this.lockMaxAttempts, "lockMaxAttempts");
   }
 
   async read() {
@@ -74,6 +81,10 @@ export class ProposalCursorStore {
         }
         await this.sleep(this.lockRetryMs);
       }
+    }
+
+    if (!acquired) {
+      throw new Error("proposal cursor lock is unavailable");
     }
 
     try {

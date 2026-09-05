@@ -88,3 +88,34 @@ test("proposal cursor refuses lexicographically older commits", async (t) => {
   );
   assert.deepEqual(await store.read(), { updatedAt: 1_788_560_000, id: 42 });
 });
+
+test("proposal cursor rejects invalid lock attempt limits", async (t) => {
+  const state = await temporaryPolicyState(t);
+
+  for (const lockMaxAttempts of [0, Number.NaN, 1.5]) {
+    assert.throws(
+      () => new ProposalCursorStore(state.stateDirectory, {
+        ...state.stateStoreOptions,
+        lockMaxAttempts,
+      }),
+      /lockMaxAttempts must be a positive integer/,
+    );
+  }
+});
+
+test("proposal cursor never writes when its existing lock cannot be acquired", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const store = new ProposalCursorStore(state.stateDirectory, {
+    ...state.stateStoreOptions,
+    lockMaxAttempts: 1,
+  });
+  await mkdir(state.stateDirectory, { recursive: true });
+  await mkdir(store.lockPath);
+
+  await assert.rejects(
+    store.commit({ updatedAt: 1_788_560_000, id: 42 }),
+    /proposal cursor lock is unavailable/,
+  );
+  await assert.rejects(stat(store.filePath), { code: "ENOENT" });
+  assert.deepEqual(await readdir(state.stateDirectory), [".proposal-cursor.lock"]);
+});

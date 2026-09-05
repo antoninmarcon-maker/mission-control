@@ -106,24 +106,32 @@ test("proposal client fails closed on malformed candidate and proposal acknowled
 
 test("proposal client retries an ambiguous idempotent POST and returns the persisted acknowledgement", async (t) => {
   const requests = [];
+  const proposalsByIdempotencyKey = new Map();
   const input = proposalInput();
   const baseUrl = await fakeHttpServer(t, async (request, response) => {
     const body = await readJson(request);
     requests.push(body);
-    if (requests.length === 1) {
+    const persisted = proposalsByIdempotencyKey.get(body.idempotencyKey);
+    if (persisted === undefined) {
+      const proposal = {
+        ...body,
+        id: 91,
+        revision: "c6f1bd11-208b-451e-898a-26776a5e6635",
+      };
+      proposalsByIdempotencyKey.set(body.idempotencyKey, proposal);
       response.socket.destroy();
       return;
     }
-    sendJson(response, 200, {
-      proposal: { id: 91, revision: "c6f1bd11-208b-451e-898a-26776a5e6635" },
-    });
+    sendJson(response, 200, { proposal: persisted });
   });
   const client = new MissionControlClient({ baseUrl, apiKey: "proposal-secret" });
 
   const acknowledgement = await client.createProposal(input);
 
+  assert.equal(proposalsByIdempotencyKey.size, 1);
   assert.deepEqual(requests, [input, input]);
+  assert.equal(requests[0].idempotencyKey, requests[1].idempotencyKey);
   assert.deepEqual(acknowledgement, {
-    proposal: { id: 91, revision: "c6f1bd11-208b-451e-898a-26776a5e6635" },
+    proposal: proposalsByIdempotencyKey.get(input.idempotencyKey),
   });
 });
