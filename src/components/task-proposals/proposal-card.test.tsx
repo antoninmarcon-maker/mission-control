@@ -1,8 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { NextIntlClientProvider } from 'next-intl'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { TaskProposal } from '@/lib/task-proposals'
 import { ProposalCard } from './proposal-card'
+import french from '../../../messages/fr.json'
 
 const messages = {
   common: { save: 'Save changes', cancel: 'Cancel' },
@@ -12,6 +14,7 @@ const messages = {
     forecast: 'Expected route', forecastDisclaimer: 'The orchestrator rechecks the route at launch.',
     accepted: 'Task launched', stale: 'This proposal changed. The latest version has been loaded.',
     failed: 'The proposal could not be updated. Try again.',
+    editTitle: 'Title', editObjective: 'Objective',
   },
 }
 
@@ -29,17 +32,19 @@ const proposal: TaskProposal = {
 }
 
 function renderCard(overrides: Partial<React.ComponentProps<typeof ProposalCard>> = {}) {
-  return render(
+  const card = (props: typeof overrides) => (
     <NextIntlClientProvider locale="en" messages={messages}>
       <ProposalCard
         proposal={proposal}
         onAccept={async () => {}}
         onEdit={async () => {}}
         onDismiss={async () => {}}
-        {...overrides}
+        {...props}
       />
-    </NextIntlClientProvider>,
+    </NextIntlClientProvider>
   )
+  const view = render(card(overrides))
+  return { ...view, rerenderCard: (props: typeof overrides) => view.rerender(card({ ...overrides, ...props })) }
 }
 
 afterEach(() => vi.restoreAllMocks())
@@ -97,4 +102,57 @@ it('disables competing decisions while an acceptance is pending', async () => {
 it('renders an accepted proposal as a link to the launched task', () => {
   renderCard({ proposal: { ...proposal, status: 'accepted', taskId: 42 } })
   expect(screen.getByRole('link', { name: 'Task launched' })).toHaveAttribute('href', '?taskId=42')
+})
+
+it('initializes an idle editor from the latest proposal when opened', async () => {
+  const user = userEvent.setup()
+  const { rerenderCard } = renderCard()
+  rerenderCard({ proposal: { ...proposal, title: 'New server title', objective: 'New objective', context: 'New context', revision: 'latest' } })
+  await user.tab()
+  await user.tab()
+  await user.keyboard('{Enter}')
+  expect(screen.getByLabelText('Title')).toHaveValue('New server title')
+  expect(screen.getByLabelText('Objective')).toHaveValue('New objective')
+  expect(screen.getByLabelText('Context')).toHaveValue('New context')
+})
+
+it('keeps the original revision and base fields associated with an active draft', async () => {
+  const user = userEvent.setup()
+  const edit = vi.fn(async () => {})
+  const { rerenderCard } = renderCard({ onEdit: edit })
+  await user.click(screen.getByRole('button', { name: 'Modify' }))
+  await user.clear(screen.getByLabelText('Title'))
+  await user.type(screen.getByLabelText('Title'), 'My draft title')
+  rerenderCard({ proposal: { ...proposal, objective: 'Updated elsewhere', revision: 'new-revision' } })
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(edit).toHaveBeenCalledWith(expect.objectContaining({ revision: proposal.revision }), { title: 'My draft title' })
+})
+
+it.each(['Save changes', 'Cancel'])('restores keyboard focus to Modify after %s', async (action) => {
+  const user = userEvent.setup()
+  renderCard()
+  await user.tab()
+  await user.tab()
+  expect(screen.getByRole('button', { name: 'Modify' })).toHaveFocus()
+  await user.keyboard('{Enter}')
+  expect(screen.getByLabelText('Title')).toHaveFocus()
+  await user.type(screen.getByLabelText('Title'), ' updated')
+  await user.tab()
+  await user.tab()
+  await user.tab()
+  if (action === 'Cancel') await user.tab()
+  expect(screen.getByRole('button', { name: action })).toHaveFocus()
+  await user.keyboard('{Enter}')
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Modify' })).toHaveFocus())
+  expect(screen.queryByLabelText('Title')).not.toBeInTheDocument()
+})
+
+it('translates the title and objective editor labels in French', async () => {
+  const user = userEvent.setup()
+  render(<NextIntlClientProvider locale="fr" messages={french}>
+    <ProposalCard proposal={proposal} onAccept={async () => {}} onEdit={async () => {}} onDismiss={async () => {}} />
+  </NextIntlClientProvider>)
+  await user.click(screen.getByRole('button', { name: 'Modifier' }))
+  expect(screen.getByRole('textbox', { name: 'Titre' })).toBeVisible()
+  expect(screen.getByRole('textbox', { name: 'Objectif' })).toBeVisible()
 })

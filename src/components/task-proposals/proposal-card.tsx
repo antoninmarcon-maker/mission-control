@@ -1,7 +1,7 @@
 'use client'
 
 import { useLocale, useTranslations } from 'next-intl'
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import type { TaskProposal } from '@/lib/task-proposals'
 import { Button } from '@/components/ui/button'
 
@@ -11,7 +11,7 @@ export type ProposalCardProps = {
   proposal: TaskProposal
   compact?: boolean
   onAccept: (proposal: TaskProposal) => Promise<void>
-  onEdit: (proposal: TaskProposal, patch: ProposalEdit) => Promise<void>
+  onEdit: (proposal: TaskProposal, patch: ProposalEdit) => Promise<boolean | void>
   onDismiss: (proposal: TaskProposal, reason?: string) => Promise<void>
 }
 
@@ -31,13 +31,43 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
   const [busy, setBusy] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [editBase, setEditBase] = useState(proposal)
   const [draft, setDraft] = useState(() => ({ title: proposal.title, objective: proposal.objective, context: proposal.context }))
+  const [failure, setFailure] = useState(false)
+  const modifyRef = useRef<HTMLButtonElement>(null)
+  const titleRef = useRef<HTMLInputElement>(null)
+  const restoreEditorFocus = useRef(false)
   const isPending = proposal.status === 'pending'
 
-  async function run(action: () => Promise<void>) {
+  useLayoutEffect(() => {
+    if (editing) titleRef.current?.focus()
+    else if (restoreEditorFocus.current && !busy) {
+      modifyRef.current?.focus()
+      restoreEditorFocus.current = false
+    }
+  }, [editing, busy])
+
+  function openEditor() {
+    if (editing) return
+    setEditBase(proposal)
+    setDraft({ title: proposal.title, objective: proposal.objective, context: proposal.context })
+    setFailure(false)
+    setEditing(true)
+  }
+
+  function closeEditor() {
+    restoreEditorFocus.current = true
+    setEditing(false)
+  }
+
+  async function run(action: () => Promise<boolean | void>) {
     setBusy(true)
+    setFailure(false)
     try {
-      await action()
+      return await action()
+    } catch {
+      setFailure(true)
+      return false
     } finally {
       setBusy(false)
     }
@@ -45,21 +75,18 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
 
   async function saveEdit() {
     const patch: ProposalEdit = {}
-    if (draft.title.trim() !== proposal.title) patch.title = draft.title.trim()
-    if (draft.objective.trim() !== proposal.objective) patch.objective = draft.objective.trim()
-    if (draft.context.trim() !== proposal.context) patch.context = draft.context.trim()
+    if (draft.title.trim() !== editBase.title) patch.title = draft.title.trim()
+    if (draft.objective.trim() !== editBase.objective) patch.objective = draft.objective.trim()
+    if (draft.context.trim() !== editBase.context) patch.context = draft.context.trim()
     if (Object.keys(patch).length === 0) {
-      setEditing(false)
+      closeEditor()
       return
     }
-    await run(async () => {
-      await onEdit(proposal, patch)
-      setEditing(false)
-    })
+    if (await run(() => onEdit(editBase, patch)) !== false) closeEditor()
   }
 
   return (
-    <article className={`min-w-[min(22rem,calc(100vw-2rem))] max-w-[26rem] shrink-0 border border-border border-l-2 border-l-primary bg-card p-4 text-left ${compact ? 'p-3' : ''}`}>
+    <article className={`w-full max-w-full min-w-0 break-words border border-border border-l-2 border-l-primary bg-card text-left ${compact ? 'p-3' : 'p-4'}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-foreground">{proposal.title}</h3>
@@ -83,35 +110,37 @@ export function ProposalCard({ proposal, compact = false, onAccept, onEdit, onDi
         </a>
       ) : isPending && (
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <Button disabled={busy} size="sm" onClick={() => void run(() => onAccept(proposal))}>
+          <Button disabled={busy} className="h-auto min-h-8 max-w-full whitespace-normal" size="sm" onClick={() => void run(() => onAccept(proposal))}>
             {t('validateLaunch')}
           </Button>
-          <Button disabled={busy} size="sm" variant="outline" aria-expanded={editing} aria-controls={`proposal-editor-${proposal.id}`} onClick={() => setEditing(true)}>
+          <Button ref={modifyRef} disabled={busy} className="h-auto min-h-8 max-w-full whitespace-normal" size="sm" variant="outline" aria-expanded={editing} aria-controls={`proposal-editor-${proposal.id}`} onClick={openEditor}>
             {t('modify')}
           </Button>
-          <Button disabled={busy} size="sm" variant="ghost" onClick={() => void run(() => onDismiss(proposal))}>
+          <Button disabled={busy} className="h-auto min-h-8 max-w-full whitespace-normal" size="sm" variant="ghost" onClick={() => void run(() => onDismiss(proposal))}>
             {t('dismiss')}
           </Button>
         </div>
       )}
 
+      {failure && <p role="alert" className="mt-3 text-xs text-destructive">{t('failed')}</p>}
+
       {editing && isPending && (
         <form id={`proposal-editor-${proposal.id}`} className="mt-4 space-y-3 border-t border-border pt-3" onSubmit={(event) => { event.preventDefault(); void saveEdit() }}>
           <label className="block text-xs font-medium text-muted-foreground">
-            Title
-            <input className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} />
+            {t('editTitle')}
+            <input ref={titleRef} disabled={busy} className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} />
           </label>
           <label className="block text-xs font-medium text-muted-foreground">
-            Objective
-            <textarea className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" rows={2} value={draft.objective} onChange={(event) => setDraft({ ...draft, objective: event.target.value })} />
+            {t('editObjective')}
+            <textarea disabled={busy} className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" rows={2} value={draft.objective} onChange={(event) => setDraft({ ...draft, objective: event.target.value })} />
           </label>
           <label className="block text-xs font-medium text-muted-foreground">
             {t('context')}
-            <textarea className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" rows={3} value={draft.context} onChange={(event) => setDraft({ ...draft, context: event.target.value })} />
+            <textarea disabled={busy} className="mt-1 w-full border border-border bg-background px-2 py-1.5 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-primary" rows={3} value={draft.context} onChange={(event) => setDraft({ ...draft, context: event.target.value })} />
           </label>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button disabled={busy} size="sm" type="submit">{tc('save')}</Button>
-            <Button disabled={busy} size="sm" type="button" variant="ghost" onClick={() => setEditing(false)}>{tc('cancel')}</Button>
+            <Button disabled={busy} size="sm" type="button" variant="ghost" onClick={closeEditor}>{tc('cancel')}</Button>
           </div>
         </form>
       )}

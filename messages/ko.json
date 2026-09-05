@@ -741,6 +741,8 @@
     "workspaceFilesDesc": "에이전트 워크스페이스 디렉토리의 파일입니다."
   },
   "taskProposals": {
+    "editTitle": "Title",
+    "editObjective": "Objective",
     "title": "Proposals",
     "empty": "No pending proposals",
     "validateLaunch": "Validate and launch",

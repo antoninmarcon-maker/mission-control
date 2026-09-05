@@ -3,8 +3,6 @@
 import { useEffect, useRef } from 'react'
 import { useMissionControl } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
-import { apiFetch } from '@/lib/api-client'
-import type { TaskProposal } from '@/lib/task-proposals'
 
 const log = createClientLogger('SSE')
 
@@ -40,12 +38,25 @@ export function useServerEvents() {
     addChatMessage,
     addNotification,
     addActivity,
-    setProposals,
+    currentUser,
+    reloadProposals,
+    invalidateProposalReloads,
     removeProposal,
   } = useMissionControl()
+  const proposalScope = `${currentUser?.tenant_id}:${currentUser?.workspace_id}:${currentUser?.id}`
 
   useEffect(() => {
     let mounted = true
+    const proposalLifetime = new AbortController()
+    let proposalReloadTimeout: ReturnType<typeof setTimeout> | undefined
+
+    function scheduleProposalReload() {
+      if (proposalReloadTimeout) clearTimeout(proposalReloadTimeout)
+      proposalReloadTimeout = setTimeout(() => {
+        proposalReloadTimeout = undefined
+        void reloadProposals(proposalLifetime.signal).catch(() => {})
+      }, 25)
+    }
 
     function connect() {
       if (!mounted) return
@@ -131,14 +142,16 @@ export function useServerEvents() {
         // proposals rather than putting private context in the event stream.
         case 'proposal.created':
         case 'proposal.updated':
-          void apiFetch<{ proposals?: TaskProposal[] }>('/api/task-proposals?status=pending&limit=20')
-            .then((data) => setProposals(data.proposals ?? []))
-            .catch(() => {})
+          invalidateProposalReloads()
+          scheduleProposalReload()
           break
         case 'proposal.accepted':
         case 'proposal.dismissed':
         case 'proposal.expired':
-          if (typeof event.data?.id === 'number') removeProposal(event.data.id)
+          if (typeof event.data?.id === 'number') {
+            removeProposal(event.data.id)
+            scheduleProposalReload()
+          }
           break
 
         // Agent events
@@ -207,6 +220,8 @@ export function useServerEvents() {
 
     return () => {
       mounted = false
+      proposalLifetime.abort()
+      if (proposalReloadTimeout) clearTimeout(proposalReloadTimeout)
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
       if (eventSourceRef.current) {
         eventSourceRef.current.close()
@@ -224,7 +239,9 @@ export function useServerEvents() {
     addChatMessage,
     addNotification,
     addActivity,
-    setProposals,
+    proposalScope,
+    reloadProposals,
+    invalidateProposalReloads,
     removeProposal,
   ])
 }

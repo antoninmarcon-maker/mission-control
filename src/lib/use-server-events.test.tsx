@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { TaskProposal } from '@/lib/task-proposals'
 import { useMissionControl } from '@/store'
@@ -31,9 +31,109 @@ function EventClient() {
 }
 
 afterEach(() => {
+  cleanup()
   vi.unstubAllGlobals()
   FakeEventSource.instances = []
-  useMissionControl.setState({ proposals: [] } as never)
+  useMissionControl.setState({ proposals: [], currentUser: null })
+})
+
+function deferredResponse() {
+  let resolve!: (response: Response) => void
+  const promise = new Promise<Response>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+function emit(type: string, id = proposal.id) {
+  act(() => FakeEventSource.instances.at(-1)?.onmessage?.({
+    data: JSON.stringify({ type, data: { id } }),
+  } as MessageEvent<string>))
+}
+
+async function resolveProposals(pending: ReturnType<typeof deferredResponse>, proposals: TaskProposal[]) {
+  await act(async () => {
+    pending.resolve(new Response(JSON.stringify({ proposals })))
+    await pending.promise
+  })
+}
+
+it.each(['proposal.accepted', 'proposal.dismissed', 'proposal.expired'])(
+  'does not resurrect a proposal when a snapshot arrives after %s', async (terminal) => {
+    const delayed = deferredResponse()
+    const fetchMock = vi.fn().mockReturnValueOnce(delayed.promise)
+      .mockResolvedValue(new Response(JSON.stringify({ proposals: [] })))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    vi.stubGlobal('fetch', fetchMock)
+    useMissionControl.setState({ proposals: [proposal] })
+    render(<EventClient />)
+    emit('proposal.updated')
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    emit(terminal)
+    await resolveProposals(delayed, [proposal])
+    expect(useMissionControl.getState().proposals).toEqual([])
+  },
+)
+
+it('ignores an SSE reload after its hook is cleaned up', async () => {
+  const delayed = deferredResponse()
+  const fetchMock = vi.fn().mockReturnValue(delayed.promise)
+  vi.stubGlobal('EventSource', FakeEventSource)
+  vi.stubGlobal('fetch', fetchMock)
+  const view = render(<EventClient />)
+  emit('proposal.created')
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  view.unmount()
+  await resolveProposals(delayed, [proposal])
+  expect(useMissionControl.getState().proposals).toEqual([])
+})
+
+it('ignores a previous workspace snapshot after switching users workspace', async () => {
+  const delayed = deferredResponse()
+  const fetchMock = vi.fn().mockReturnValue(delayed.promise)
+  vi.stubGlobal('EventSource', FakeEventSource)
+  vi.stubGlobal('fetch', fetchMock)
+  const user = { id: 1, username: 'operator', display_name: 'Operator', role: 'admin' as const, workspace_id: 1 }
+  useMissionControl.getState().setCurrentUser(user)
+  render(<EventClient />)
+  emit('proposal.created')
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  act(() => useMissionControl.getState().setCurrentUser({ ...user, workspace_id: 2 }))
+  await resolveProposals(delayed, [proposal])
+  expect(useMissionControl.getState().proposals).toEqual([])
+})
+
+it('coalesces event bursts and rejects an obsolete snapshot before the next reload', async () => {
+  const first = deferredResponse()
+  const latest = deferredResponse()
+  const fetchMock = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(latest.promise)
+  vi.stubGlobal('EventSource', FakeEventSource)
+  vi.stubGlobal('fetch', fetchMock)
+  render(<EventClient />)
+  emit('proposal.created')
+  emit('proposal.updated')
+  emit('proposal.updated')
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  emit('proposal.updated')
+  emit('proposal.updated')
+  await resolveProposals(first, [proposal])
+  expect(useMissionControl.getState().proposals).toEqual([])
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+  await resolveProposals(latest, [{ ...proposal, title: 'Latest revision' }])
+  expect(useMissionControl.getState().proposals[0].title).toBe('Latest revision')
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+})
+
+it('does not restore a pending snapshot over a locally updated proposal', async () => {
+  const delayed = deferredResponse()
+  const fetchMock = vi.fn().mockReturnValue(delayed.promise)
+  vi.stubGlobal('EventSource', FakeEventSource)
+  vi.stubGlobal('fetch', fetchMock)
+  render(<EventClient />)
+  emit('proposal.updated')
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  const edited = { ...proposal, title: 'Locally edited title', revision: 'local-edit' }
+  act(() => useMissionControl.getState().updateProposal(edited))
+  await resolveProposals(delayed, [proposal])
+  expect(useMissionControl.getState().proposals).toEqual([edited])
 })
 
 it('deduplicates proposal store upserts by proposal id', () => {

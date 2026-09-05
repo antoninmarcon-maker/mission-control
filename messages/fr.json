@@ -741,6 +741,8 @@
     "workspaceFilesDesc": "Fichiers du workspace de l'agent"
   },
   "taskProposals": {
+    "editTitle": "Titre",
+    "editObjective": "Objectif",
     "title": "Propositions",
     "empty": "Aucune proposition en attente",
     "validateLaunch": "Valider et lancer",
