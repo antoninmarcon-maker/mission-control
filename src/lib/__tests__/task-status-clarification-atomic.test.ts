@@ -142,3 +142,46 @@ it('requires operator access and keeps agent writes restricted to their own task
   state.db.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run(state.agentName, taskId)
   expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
 })
+
+function beforeTaskUpdate(operation: () => void) {
+  const prepare = state.db.prepare.bind(state.db)
+  const spy = vi.spyOn(state.db, 'prepare').mockImplementation(((sql: string) => {
+    if (sql.includes('UPDATE tasks')) {
+      spy.mockRestore()
+      operation()
+    }
+    return prepare(sql)
+  }) as typeof state.db.prepare)
+}
+
+it('rejects an agent final-route write if assignment changes from A to B after authorization', async () => {
+  state.agentName = 'agent-A'
+  state.db.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run('agent-A', taskId)
+  beforeTaskUpdate(() => concurrent.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run('agent-B', taskId))
+  expect((await put({ proposal_final_route: routeDecision, title: 'Must not change' })).status).toBe(409)
+  const row = state.db.prepare('SELECT title, assigned_to, metadata FROM tasks WHERE id = ?').get(taskId) as any
+  expect(row.title).toBe('Task')
+  expect(row.assigned_to).toBe('agent-B')
+  expect(JSON.parse(row.metadata)).toEqual({ proposal: ownership })
+  expect(state.broadcast).not.toHaveBeenCalled()
+})
+
+it('rejects a concurrent proposal ID change from integer 1 to JSON true', async () => {
+  state.db.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.id', 1) WHERE id = ?").run(taskId)
+  beforeTaskUpdate(() => concurrent.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.id', json('true')) WHERE id = ?").run(taskId))
+  expect((await put({ proposal_final_route: { ...routeDecision, proposal_id: 1 } })).status).toBe(409)
+  expect(JSON.parse((state.db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(taskId) as any).metadata)).toEqual({ proposal: { ...ownership, id: true } })
+  expect(state.broadcast).not.toHaveBeenCalled()
+})
+
+it.each([
+  { role: 'admin', body: { proposal_final_route: routeDecision } },
+  { role: 'operator', body: { title: 'Ordinary update' } },
+])('preserves the existing assignment behavior outside non-admin route writes: %j', async ({ role, body }) => {
+  state.role = role
+  state.agentName = 'agent-A'
+  state.db.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run('agent-A', taskId)
+  beforeTaskUpdate(() => concurrent.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run('agent-B', taskId))
+  expect((await put(body)).status).toBe(200)
+  expect((state.db.prepare('SELECT assigned_to FROM tasks WHERE id = ?').get(taskId) as any).assigned_to).toBe('agent-B')
+})

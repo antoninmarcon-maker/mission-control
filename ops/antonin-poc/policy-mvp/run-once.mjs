@@ -771,7 +771,18 @@ async function reconcileCompletion({
   }
 
   if (!current.phases.receipt_confirmed) {
+    if (current.receipt.proposal_id !== undefined) {
+      await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
+    }
     current = await withLocalCompletionGuard(leaseStore, current, async () => {
+      // Task confirmation can predate a crashed/failed receipt append. Its
+      // durable flag does not prove that the remote proposal is still current.
+      if (current.receipt.proposal_id !== undefined) {
+        const task = await missionControl.getTask(current.task_api_id);
+        if (!taskConfirmsProposalAudit(task, current.receipt)) {
+          throw new Error("Mission Control proposal routing changed before receipt confirmation");
+        }
+      }
       let storedReceipt = await receiptAlreadyStored(
         receiptLedger,
         current.receipt,

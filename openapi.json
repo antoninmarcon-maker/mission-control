@@ -8572,11 +8572,12 @@
                     "properties": {
                       "proposal_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
                       "runtime": { "type": "string", "enum": ["local", "codex", "claude"] },
-                      "model": { "type": "string", "minLength": 1, "maxLength": 200 },
-                      "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+                      "model": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "\\S" },
+                      "reason": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" }
                     }
                   }
-                }
+                },
+                "not": { "required": ["metadata", "proposal_final_route"] }
               }
             }
           }
@@ -8596,6 +8597,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid update payload, including blank route descriptors or combining metadata with proposal_final_route."
+          },
+          "409": {
+            "description": "Proposal metadata is invalid, its typed identity or external ownership changed, the authenticated agent no longer owns the assignment, or clarification blocks the requested transition. No update was applied."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"

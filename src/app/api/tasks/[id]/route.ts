@@ -315,6 +315,10 @@ export async function PUT(
     updateParams.push(now);
     updateParams.push(taskId, workspaceId);
     if (proposal_final_route !== undefined) updateParams.push(proposal_final_route.proposal_id);
+    const routeAgentName = proposal_final_route !== undefined && auth.user.role !== 'admin'
+      ? auth.user.agent_name || null
+      : null;
+    if (routeAgentName !== null) updateParams.push(routeAgentName);
     
     if (fieldsToUpdate.length === 1) { // Only updated_at
       return NextResponse.json({
@@ -330,9 +334,12 @@ export async function PUT(
       ${proposal_final_route !== undefined ? `AND CASE WHEN json_valid(metadata) THEN
         json_type(metadata) = 'object'
         AND json_type(metadata, '$.proposal') = 'object'
+        AND json_type(metadata, '$.proposal.id') = 'integer'
         AND json_extract(metadata, '$.proposal.id') = ?
+        AND json_type(metadata, '$.proposal.execution_owner') = 'text'
         AND json_extract(metadata, '$.proposal.execution_owner') = 'external_orchestrator'
         ELSE 0 END` : ''}
+      ${routeAgentName !== null ? 'AND assigned_to = ?' : ''}
       ${normalizedStatus && ['in_progress', 'review', 'quality_review', 'done'].includes(normalizedStatus) ? `AND ${CLARIFICATION_READY_SQL}` : ''}
     `);
     

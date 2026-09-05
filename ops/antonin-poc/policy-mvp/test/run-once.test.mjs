@@ -3259,6 +3259,39 @@ test("an accepted proposal without a forecast audits the actual local route with
   await assertLeaseReleased(state);
 });
 
+test("a pending receipt revalidates proposal routing even after task confirmation", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { task: { metadata: { proposal: structuredClone(acceptedProposal) } } });
+  let providerCalls = 0;
+  let appendCalls = 0;
+  const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
+  const append = ledger.append.bind(ledger);
+  ledger.append = async (receipt) => {
+    appendCalls += 1;
+    if (appendCalls === 1) throw new Error("receipt temporarily unavailable");
+    return append(receipt);
+  };
+  const dependencies = {
+    receiptLedger: ledger,
+    ollama: { async complete() { providerCalls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+  };
+  const config = processConfig(state, { mcUrl: servers.mcUrl });
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation/);
+  const journal = JSON.parse(await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"));
+  assert.equal(Object.values(journal.entries)[0].phases.task_confirmed, true);
+  assert.equal(Object.values(journal.entries)[0].phases.receipt_confirmed, false);
+  servers.task().metadata.proposal.final_route = { runtime: "codex", reason: "concurrent_route" };
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation.*proposal routing/);
+  assert.equal(providerCalls, 1);
+  assert.equal(appendCalls, 1);
+  assert.equal(servers.tokenRecords.length, 1);
+  assert.equal((await ledger.verify()).records, 0);
+  servers.task().metadata.proposal.final_route = { runtime: "local", model: "qwen2.5-coder:7b", reason: "first_rung" };
+  assert.equal((await processOne(config, dependencies)).outcome, "review");
+  assert.equal(providerCalls, 1);
+  assert.equal((await ledger.verify()).records, 1);
+});
+
 test("a proposal forecast cannot override the current risk policy", async (t) => {
   const state = await temporaryPolicyState(t);
   const servers = await ladderServers(t, { task: { priority: "high", metadata: { proposal: structuredClone(acceptedProposal) } } });
