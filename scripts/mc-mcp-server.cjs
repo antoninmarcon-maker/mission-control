@@ -65,7 +65,7 @@ async function api(method, route, body) {
     let data;
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
     if (!res.ok) throw new Error(apiErrorMessage(data, text, res.status, config.apiKey));
-    return redactSensitiveData(data, config.apiKey);
+    return data;
   } catch (err) {
     clearTimeout(timer);
     if (err?.name === 'AbortError') throw new Error('Request timeout (30s)');

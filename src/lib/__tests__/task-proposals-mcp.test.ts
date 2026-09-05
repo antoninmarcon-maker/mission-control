@@ -355,4 +355,37 @@ describe('task proposal orchestrator interfaces', () => {
     expect(list.code).toBe(5)
     expect(create.code).toBe(5)
   })
+
+  it('preserves exact 2xx proposal and raw responses even when their fields resemble credentials', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'mc-proposal-'))
+    cleanups.push(() => rm(directory, { recursive: true, force: true }))
+    const file = join(directory, 'proposal.json')
+    await writeFile(file, JSON.stringify(proposal))
+    const proposalResponse = {
+      proposal: {
+        id: 73,
+        title: 'token: Identifier',
+        routeForecast: { runtime: 'codex', reason: 'token: Identifier' },
+      },
+    }
+    const keyResponse = { api_key: 'explicitly-requested-api-key', created: true }
+    const api = await startApi((request, response) => {
+      response.writeHead(201, { 'content-type': 'application/json' })
+      response.end(JSON.stringify(request.url === '/api/keys' ? keyResponse : proposalResponse))
+    })
+    cleanups.push(api.close)
+
+    const cliProposal = await runCli(['proposals', 'create', '--json-file', file, '--url', api.baseUrl, '--api-key', apiKey, '--json'])
+    expect(cliProposal.code).toBe(0)
+    expect(JSON.parse(cliProposal.stdout).data).toEqual(proposalResponse)
+
+    const mcp = await startMcp(api.baseUrl)
+    cleanups.push(mcp.close)
+    const mcpProposal = await mcp.request(1, 'tools/call', { name: 'task_proposals_create', arguments: proposal })
+    expect(JSON.parse(mcpProposal.result.content[0].text)).toEqual(proposalResponse)
+
+    const cliRaw = await runCli(['raw', '--method', 'POST', '--path', '/api/keys', '--body', '{}', '--url', api.baseUrl, '--api-key', apiKey, '--json'])
+    expect(cliRaw.code).toBe(0)
+    expect(JSON.parse(cliRaw.stdout).data).toEqual(keyResponse)
+  })
 })

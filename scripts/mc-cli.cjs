@@ -291,7 +291,7 @@ function redactErrorData(data, apiKey) {
 }
 
 function printResult(result, asJson, apiKey) {
-  const safeResult = {
+  const safeResult = result.ok ? result : {
     ...result,
     data: redactErrorData(result.data, apiKey),
     ...(result.setCookie ? { setCookie: '***REDACTED***' } : {}),
