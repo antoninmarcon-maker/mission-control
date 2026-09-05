@@ -135,13 +135,17 @@ function proposalDependencies({
   page,
   createProposal,
   forecastProposalRoute,
+  now,
+  sleep,
 } = {}) {
   const calls = {
     commits: [],
     cursors: [],
     proposals: [],
     logs: [],
+    waits: [],
   };
+  let clock = 0;
   return {
     calls,
     dependencies: {
@@ -165,6 +169,11 @@ function proposalDependencies({
         },
       },
       forecastProposalRoute,
+      now: now ?? (() => clock),
+      sleep: sleep ?? (async (milliseconds) => {
+        calls.waits.push(milliseconds);
+        clock += milliseconds;
+      }),
       log(entry) {
         calls.logs.push(entry);
       },
@@ -259,25 +268,184 @@ test("runCommand propose does not commit a page when a proposal acknowledgement 
   assert.deepEqual(calls.cursors, [oldCursor]);
 });
 
-test("runCommand propose preserves a deterministic idempotency key across a client retry", async (t) => {
+test("runCommand propose spaces more than sixty proposal posts and commits once after the page", async (t) => {
   const state = await temporaryPolicyState(t);
-  const postedKeys = [];
-  const { dependencies } = proposalDependencies({
+  let clock = 0;
+  const starts = [];
+  const waits = [];
+  const { calls, dependencies } = proposalDependencies({
     page: {
-      tasks: [proposalTask(41, "failed")],
-      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+      tasks: Array.from({ length: 61 }, (_, index) =>
+        proposalTask(index + 1, "failed"),
+      ),
+      nextCursor: { updatedAt: 1_788_560_061, id: 61 },
     },
-    createProposal: async (proposal) => {
-      postedKeys.push(proposal.idempotencyKey);
-      postedKeys.push(proposal.idempotencyKey);
+    now: () => clock,
+    sleep: async (milliseconds) => {
+      waits.push(milliseconds);
+      clock += milliseconds;
+    },
+    createProposal: async () => {
+      starts.push(clock);
       return { proposal: { id: 1, revision: "ack" }, created: true };
     },
   });
 
-  await runCommand("propose", proposalEnvironment(state), dependencies);
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
 
-  assert.equal(postedKeys.length, 2);
-  assert.equal(postedKeys[0], postedKeys[1]);
+  assert.equal(starts.length, 61);
+  assert.equal(waits.length, 60);
+  assert.ok(waits.every((milliseconds) => milliseconds > 1_000));
+  assert.ok(starts.slice(1).every((startedAt, index) => startedAt - starts[index] > 1_000));
+  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_061, id: 61 }]);
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 61,
+    created: 61,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_061, id: 61 },
+  });
+});
+
+test("runCommand propose retries an incomplete page with the same proposal body and commits only after acknowledgements", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const oldCursor = { updatedAt: 1_788_560_000, id: 40 };
+  const nextCursor = { updatedAt: 1_788_560_042, id: 42 };
+  const posted = [];
+  const commits = [];
+  let cursor = oldCursor;
+  let postCount = 0;
+  let clock = 0;
+  const dependencies = {
+    proposalCursorStore: {
+      async read() {
+        return cursor;
+      },
+      async commit(next) {
+        commits.push(next);
+        cursor = next;
+        return next;
+      },
+    },
+    missionControl: {
+      async listProposalCandidates(receivedCursor) {
+        assert.deepEqual(receivedCursor, oldCursor);
+        return {
+          tasks: [proposalTask(41, "failed"), proposalTask(42, "awaiting_owner")],
+          nextCursor,
+        };
+      },
+      async createProposal(proposal) {
+        posted.push(proposal);
+        postCount += 1;
+        if (postCount === 2) throw new Error("proposal post rejected");
+        return {
+          proposal: { id: postCount, revision: "ack" },
+          created: postCount !== 3,
+        };
+      },
+    },
+    now: () => clock,
+    sleep: async (milliseconds) => {
+      clock += milliseconds;
+    },
+  };
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal post rejected/,
+  );
+  assert.deepEqual(commits, []);
+
+  assert.deepEqual(
+    await runCommand("propose", proposalEnvironment(state), dependencies),
+    {
+      outcome: "proposals_scanned",
+      scanned: 2,
+      created: 1,
+      duplicates: 1,
+      skipped: 0,
+      cursor: nextCursor,
+    },
+  );
+  assert.deepEqual(posted[2], posted[0]);
+  assert.deepEqual(commits, [nextCursor]);
+});
+
+test("propose CLI writes only structured scan IDs and counts to stderr", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const apiKey = "proposal-cli-secret";
+  const baseUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET") {
+      sendJson(response, 200, {
+        tasks: [proposalTask(41, "failed", { title: "Private task title" })],
+        nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+      });
+      return;
+    }
+    await readJson(request);
+    sendJson(response, 201, { proposal: { id: 1, revision: "ack" } });
+  });
+
+  const result = await execFile(process.execPath, [runOncePath, "propose"], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      ...proposalEnvironment(state),
+      MC_URL: baseUrl,
+      MC_API_KEY: apiKey,
+    },
+  });
+
+  assert.deepEqual(JSON.parse(result.stdout), {
+    outcome: "proposals_scanned",
+    scanned: 1,
+    created: 1,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_041, id: 41 },
+  });
+  assert.deepEqual(JSON.parse(result.stderr), {
+    event: "proposal_scan",
+    taskIds: [41],
+    scanned: 1,
+    created: 1,
+    duplicates: 0,
+    skipped: 0,
+  });
+  assert.equal(result.stdout.includes(apiKey), false);
+  assert.equal(result.stderr.includes(apiKey), false);
+  assert.equal(result.stderr.includes("Private task title"), false);
+});
+
+test("propose CLI redacts rejected scan details from stderr", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const apiKey = "proposal-cli-secret";
+  const baseUrl = await fakeHttpServer(t, (_request, response) => {
+    sendJson(response, 500, {
+      error: `Private task title and ${apiKey} must not be logged`,
+    });
+  });
+
+  await assert.rejects(
+    execFile(process.execPath, [runOncePath, "propose"], {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        ...proposalEnvironment(state),
+        MC_URL: baseUrl,
+        MC_API_KEY: apiKey,
+      },
+    }),
+    (error) => {
+      assert.equal(error.stdout, "");
+      assert.deepEqual(JSON.parse(error.stderr), { error: "proposal scan failed" });
+      assert.equal(error.stderr.includes(apiKey), false);
+      assert.equal(error.stderr.includes("Private task title"), false);
+      return true;
+    },
+  );
 });
 
 test("runCommand propose commits an empty page with zero counts", async (t) => {

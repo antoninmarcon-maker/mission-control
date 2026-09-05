@@ -64,6 +64,7 @@ const MAX_RESOLUTION_LENGTH = 5_000;
 const DEFAULT_NETWORK_TIMEOUT_MS = 120_000;
 const NETWORK_LEASE_MARGIN_MS = 1_000;
 const MAX_ERROR_LENGTH = 320;
+const PROPOSAL_POST_INTERVAL_MS = 1_100;
 const COMPLETION_JOURNAL_VERSION = 1;
 const COMPLETION_METADATA_FIELDS = [
   "completion_id",
@@ -1944,6 +1945,19 @@ function safeProposalForecast(proposal, config, forecaster) {
   }
 }
 
+async function waitForProposalPostSlot(lastStartedAt, now, sleep) {
+  while (true) {
+    const startedAt = now();
+    if (
+      lastStartedAt === null ||
+      startedAt - lastStartedAt >= PROPOSAL_POST_INTERVAL_MS
+    ) {
+      return startedAt;
+    }
+    await sleep(PROPOSAL_POST_INTERVAL_MS - (startedAt - lastStartedAt));
+  }
+}
+
 export async function proposeOnce(config, dependencies = {}) {
   const cursorStore =
     dependencies.proposalCursorStore ??
@@ -1955,6 +1969,9 @@ export async function proposeOnce(config, dependencies = {}) {
     dependencies.proposalCandidatesForTask ?? proposalCandidatesForTask;
   const forecast = dependencies.forecastProposalRoute ?? forecastProposalRoute;
   const log = dependencies.log ?? (() => {});
+  const now = dependencies.now ?? Date.now;
+  const sleep = dependencies.sleep ?? ((milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)));
   const cursor = await cursorStore.read();
   const page = await missionControl.listProposalCandidates(cursor);
   const counts = {
@@ -1963,6 +1980,7 @@ export async function proposeOnce(config, dependencies = {}) {
     duplicates: 0,
     skipped: 0,
   };
+  let lastProposalPostStartedAt = null;
 
   for (const task of page.tasks) {
     const candidates = extractCandidates(task).slice(0, 3);
@@ -1978,6 +1996,11 @@ export async function proposeOnce(config, dependencies = {}) {
         ...(routeForecast === null ? {} : { routeForecast }),
         metadata: { source_task_id: task.id },
       };
+      lastProposalPostStartedAt = await waitForProposalPostSlot(
+        lastProposalPostStartedAt,
+        now,
+        sleep,
+      );
       const created = proposalAcknowledgementCreated(
         await missionControl.createProposal(proposal),
       );
@@ -2067,12 +2090,20 @@ export async function runCommand(command, environment = process.env, dependencie
 }
 
 async function main() {
+  const command = process.argv[2];
   try {
-    const result = await runCommand(process.argv[2]);
+    const result = await runCommand(command, process.env, {
+      log: (entry) => process.stderr.write(`${JSON.stringify(entry)}\n`),
+    });
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     process.stderr.write(
-      `${JSON.stringify({ error: safeErrorMessage(error, process.env.MC_API_KEY ?? "") })}\n`,
+      `${JSON.stringify({
+        error:
+          command === "propose"
+            ? "proposal scan failed"
+            : safeErrorMessage(error, process.env.MC_API_KEY ?? ""),
+      })}\n`,
     );
     process.exitCode = 1;
   }
