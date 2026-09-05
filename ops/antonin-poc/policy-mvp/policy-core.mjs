@@ -150,6 +150,8 @@ export function forecastProposalRoute(proposal, options = {}) {
   };
 }
 
+export const forecastRouteForProposal = forecastProposalRoute;
+
 // ---------------------------------------------------------------------------
 // §3 failure taxonomy
 // ---------------------------------------------------------------------------

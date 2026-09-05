@@ -116,6 +116,22 @@ test("handles only structured review rejections and required follow-ups", () => 
   assert.equal(proposal.rationale, "A structured review rejection requires a follow-up.");
 });
 
+test("approved review feedback arrays never create candidates from their indexes", () => {
+  for (const status of ["review", "quality_review"]) {
+    assert.deepEqual(proposalCandidatesForTask({
+      id: 17,
+      status,
+      title: "Routine report",
+      metadata: {
+        review_feedback: [
+          { status: "approved", reason: "Approved first pass." },
+          { status: "approved", reason: "Approved second pass." },
+        ],
+      },
+    }), [], status);
+  }
+});
+
 test("returns at most three complete, bounded candidates", () => {
   const tooLong = "x".repeat(9_000);
   const candidates = proposalCandidatesForTask({
@@ -160,6 +176,33 @@ test("does not let malformed actions consume the three-proposal cap", () => {
   });
 
   assert.deepEqual(candidates.map((candidate) => candidate.title), ["First", "Second", "Third"]);
+});
+
+test("uses the default rationale only when a structured next action omits it", () => {
+  const action = {
+    title: "Repair callback",
+    objective: "Preserve callbackUrl",
+    context: "Finding A3",
+    risk: "medium",
+  };
+  const task = (nextAction) => ({
+    id: 18,
+    status: "done",
+    title: "Audit auth",
+    metadata: { next_actions: [nextAction] },
+  });
+
+  assert.equal(
+    proposalCandidatesForTask(task(action))[0].rationale,
+    "A validated next action was supplied by the completed task.",
+  );
+  for (const rationale of ["", 12, {}]) {
+    assert.deepEqual(
+      proposalCandidatesForTask(task({ ...action, rationale })),
+      [],
+      `rationale ${JSON.stringify(rationale)} is rejected`,
+    );
+  }
 });
 
 test("normalizes action content before hashing and fails closed on hostile metadata", () => {

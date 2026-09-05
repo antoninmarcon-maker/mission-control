@@ -25,6 +25,7 @@ import {
   completionIdentityFields,
   evaluateTask,
   forecastProposalRoute,
+  forecastRouteForProposal,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
@@ -104,6 +105,21 @@ test("proposal route forecast reflects the policy result without a provider gues
       risk: "medium",
     }),
     null,
+  );
+});
+
+test("forecastRouteForProposal is the public alias of the canonical forecaster", () => {
+  const proposal = {
+    title: "Simple local sort",
+    objective: "Sort harmless labels.",
+    context: "Routine mechanical cleanup.",
+    risk: "medium",
+  };
+
+  assert.equal(forecastRouteForProposal, forecastProposalRoute);
+  assert.deepEqual(
+    forecastRouteForProposal(proposal),
+    forecastProposalRoute(proposal),
   );
 });
 

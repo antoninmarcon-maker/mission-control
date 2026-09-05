@@ -81,7 +81,7 @@ function reviewDetails(metadata) {
   };
 
   const feedback = metadata.review_feedback;
-  if (Array.isArray(feedback)) feedback.forEach(collect);
+  if (Array.isArray(feedback)) feedback.forEach((entry) => collect(entry));
   else collect(feedback);
 
   if (Array.isArray(metadata.aegis_rejections)) {
@@ -98,11 +98,11 @@ function structuredNextActions(metadata) {
     const title = normalizeText(action.title, MAX_TITLE_LENGTH);
     const objective = normalizeText(action.objective, MAX_OBJECTIVE_LENGTH);
     const context = normalizeText(action.context, MAX_CONTEXT_LENGTH);
-    const rationale =
-      normalizeText(action.rationale, MAX_RATIONALE_LENGTH) ??
-      "A validated next action was supplied by the completed task.";
+    const rationale = Object.hasOwn(action, "rationale")
+      ? normalizeText(action.rationale, MAX_RATIONALE_LENGTH)
+      : "A validated next action was supplied by the completed task.";
     const risk = typeof action.risk === "string" ? action.risk.toLowerCase() : null;
-    if (!title || !objective || !context || !RISKS.has(risk)) continue;
+    if (!title || !objective || !context || !rationale || !RISKS.has(risk)) continue;
     actions.push({ title, objective, context, rationale, risk });
     if (actions.length === MAX_CANDIDATES) break;
   }
