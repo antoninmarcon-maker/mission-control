@@ -185,3 +185,66 @@ it.each([
   expect((await put(body)).status).toBe(200)
   expect((state.db.prepare('SELECT assigned_to FROM tasks WHERE id = ?').get(taskId) as any).assigned_to).toBe('agent-B')
 })
+
+it.each(['review', 'quality_review', 'done', 'awaiting_owner', 'failed', 'inbox'])('freezes final_route once the task leaves execution states: %s', async (status) => {
+  state.db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, taskId)
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(409)
+})
+
+it('atomically freezes final_route when completion wins the race', async () => {
+  beforeTaskUpdate(() => concurrent.prepare("UPDATE tasks SET status = 'review' WHERE id = ?").run(taskId))
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(409)
+  expect(JSON.parse((state.db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(taskId) as any).metadata)).toEqual({ proposal: ownership })
+})
+
+it.each(['assigned', 'in_progress'])('allows route audit in actual pre-provider state %s', async (status) => {
+  state.db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, taskId)
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+})
+
+async function readAudit(proposalId: number | string = 12) {
+  const { GET } = await import('@/app/api/tasks/[id]/proposal-audit/route')
+  return GET(new NextRequest(`http://localhost/api/tasks/${taskId}/proposal-audit?proposal_id=${proposalId}`), { params: Promise.resolve({ id: String(taskId) }) })
+}
+
+it('exposes only proposal route audit to the original agent after reviewer handoff', async () => {
+  state.agentName = 'original-agent'
+  state.db.prepare('UPDATE tasks SET assigned_to = ? WHERE id = ?').run(state.agentName, taskId)
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+  expect((await put({ status: 'review', assigned_to: 'reviewer' })).status).toBe(200)
+  const { GET } = await import('@/app/api/tasks/[id]/route')
+  expect((await GET(new NextRequest(`http://localhost/api/tasks/${taskId}`), { params: Promise.resolve({ id: String(taskId) }) })).status).toBe(403)
+  const response = await readAudit()
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({ proposal: {
+    id: 12, route_forecast: ownership.route_forecast, final_route: { runtime: 'codex', reason: 'next_cloud_rung' },
+  } })
+})
+
+it.each(['workspace', 'owner', 'id', 'malformed', 'boolean', 'viewer'])('refuses minimal audit outside its validated scope: %s', async (scenario) => {
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+  if (scenario === 'workspace') state.workspace = 2
+  if (scenario === 'owner') state.db.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.execution_owner', 'internal')").run()
+  if (scenario === 'malformed') state.db.prepare("UPDATE tasks SET metadata = 'bad'").run()
+  if (scenario === 'boolean') state.db.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.id', json('true'))").run()
+  if (scenario === 'viewer') state.role = 'viewer'
+  const response = await readAudit(scenario === 'id' || scenario === 'boolean' ? 1 : 12)
+  expect(response.status).toBe(scenario === 'viewer' ? 403 : 404)
+  expect(await response.json()).not.toHaveProperty('proposal')
+})
+
+it.each(['', '0', '1x', '9007199254740992'])('rejects malformed proposal audit ID %s', async (id) => {
+  expect((await readAudit(id)).status).toBe(400)
+})
+
+it('returns null for missing forecast and never exposes extra descriptor content', async () => {
+  expect((await put({ proposal_final_route: routeDecision })).status).toBe(200)
+  state.db.prepare("UPDATE tasks SET metadata = json_remove(metadata, '$.proposal.route_forecast')").run()
+  const response = await readAudit()
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({ proposal: { id: 12, route_forecast: null, final_route: { runtime: 'codex', reason: 'next_cloud_rung' } } })
+  state.db.prepare("UPDATE tasks SET metadata = json_set(metadata, '$.proposal.final_route.context', 'PRIVATE')").run()
+  const malformed = await readAudit()
+  expect(malformed.status).toBe(404)
+  expect(await malformed.text()).not.toContain('PRIVATE')
+})

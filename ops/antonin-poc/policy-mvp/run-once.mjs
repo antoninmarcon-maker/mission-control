@@ -537,8 +537,12 @@ function resolutionLimitError(provider) {
 function taskConfirmsProposalAudit(task, receipt) {
   if (receipt.proposal_id === undefined) return true;
   const proposal = task?.metadata?.proposal;
+  return proposal?.execution_owner === "external_orchestrator" &&
+    proposalAuditMatches(proposal, receipt);
+}
+
+function proposalAuditMatches(proposal, receipt) {
   return proposal?.id === receipt.proposal_id &&
-    proposal?.execution_owner === "external_orchestrator" &&
     canonicalJson(proposal.route_forecast ?? null) === canonicalJson(receipt.route_forecast) &&
     canonicalJson(proposal.final_route) === canonicalJson(receipt.final_route);
 }
@@ -773,16 +777,16 @@ async function reconcileCompletion({
   if (!current.phases.receipt_confirmed) {
     if (current.receipt.proposal_id !== undefined) {
       await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
-    }
-    current = await withLocalCompletionGuard(leaseStore, current, async () => {
       // Task confirmation can predate a crashed/failed receipt append. Its
       // durable flag does not prove that the remote proposal is still current.
-      if (current.receipt.proposal_id !== undefined) {
-        const task = await missionControl.getTask(current.task_api_id);
-        if (!taskConfirmsProposalAudit(task, current.receipt)) {
-          throw new Error("Mission Control proposal routing changed before receipt confirmation");
-        }
+      const proposal = await missionControl.getProposalAudit(current.task_api_id, current.receipt.proposal_id);
+      if (!proposalAuditMatches(proposal, current.receipt)) {
+        throw new Error("Mission Control proposal routing changed before receipt confirmation");
       }
+    }
+    // Network work never holds the state-wide lock. Revalidate fencing after
+    // readback before touching the local ledger or confirming the journal.
+    current = await withLocalCompletionGuard(leaseStore, current, async () => {
       let storedReceipt = await receiptAlreadyStored(
         receiptLedger,
         current.receipt,
@@ -1425,21 +1429,21 @@ async function persistProposalRoute({
   assertRouteDescriptor(finalRoute, "proposal.final_route");
   const leaseEntry = { task_id: String(task.id), owner, fencing_token: lease.fencing_token };
   await renewForNetwork(leaseStore, leaseEntry, recoveryLeaseTtlMs);
-  const response = await withLocalCompletionGuard(leaseStore, leaseEntry, () =>
-    missionControl.updateTask(task.id, {
-      proposal_final_route: { proposal_id: proposal.id, ...finalRoute },
-    }),
-  );
-  const confirmed = response?.task?.metadata?.proposal;
-  if (
-    confirmed?.id !== proposal.id || confirmed?.execution_owner !== "external_orchestrator" ||
-    canonicalJson(confirmed.final_route) !== canonicalJson(finalRoute) ||
-    canonicalJson(confirmed.route_forecast ?? null) !== canonicalJson(forecast)
-  ) {
-    throw new Error("Mission Control did not confirm exact proposal routing metadata");
-  }
-  task.metadata = response.task.metadata;
-  return { proposal_id: proposal.id, route_forecast: forecast, final_route: finalRoute };
+  const response = await missionControl.updateTask(task.id, {
+    proposal_final_route: { proposal_id: proposal.id, ...finalRoute },
+  });
+  return withLocalCompletionGuard(leaseStore, leaseEntry, () => {
+    const confirmed = response?.task?.metadata?.proposal;
+    if (
+      confirmed?.id !== proposal.id || confirmed?.execution_owner !== "external_orchestrator" ||
+      canonicalJson(confirmed.final_route) !== canonicalJson(finalRoute) ||
+      canonicalJson(confirmed.route_forecast ?? null) !== canonicalJson(forecast)
+    ) {
+      throw new Error("Mission Control did not confirm exact proposal routing metadata");
+    }
+    task.metadata = response.task.metadata;
+    return { proposal_id: proposal.id, route_forecast: forecast, final_route: finalRoute };
+  });
 }
 
 /**

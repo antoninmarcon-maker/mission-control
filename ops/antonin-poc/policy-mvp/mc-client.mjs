@@ -269,6 +269,20 @@ export class MissionControlClient {
     return response.task;
   }
 
+  async getProposalAudit(taskId, proposalId) {
+    requirePositiveInteger(proposalId, "proposal_id");
+    const response = await this.#request(taskPath(taskId, `/proposal-audit?proposal_id=${proposalId}`));
+    const proposal = response?.proposal;
+    if (proposal === null || typeof proposal !== "object" || Array.isArray(proposal) ||
+      proposal.id !== proposalId || !Object.hasOwn(proposal, "route_forecast") ||
+      Object.keys(proposal).some((key) => !["id", "route_forecast", "final_route"].includes(key))) {
+      throw new Error("Mission Control returned an invalid proposal audit");
+    }
+    if (proposal.route_forecast !== null) assertRouteDescriptor(proposal.route_forecast, "proposal.route_forecast");
+    assertRouteDescriptor(proposal.final_route, "proposal.final_route");
+    return proposal;
+  }
+
   async addComment(taskId, content) {
     requireNonEmptyString(content, "comment content");
     return this.#request(taskPath(taskId, "/comments"), {

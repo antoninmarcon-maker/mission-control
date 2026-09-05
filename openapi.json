@@ -98,6 +98,29 @@
     }
   ],
   "paths": {
+    "/api/tasks/{id}/proposal-audit": {
+      "get": {
+        "tags": ["Tasks"],
+        "summary": "Read minimal proposal routing audit",
+        "operationId": "getTaskProposalAudit",
+        "x-required-role": "operator",
+        "description": "Workspace-scoped operator readback, available to the original agent after reviewer reassignment. No assignee check applies to this minimal projection. One SQL read requires valid metadata, an object proposal, an exact integer proposal ID and text external_orchestrator ownership. Returns only proposal ID and validated routing descriptors, never task title, context, objective, rationale or other metadata. Responses are not cached.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } },
+          { "name": "proposal_id", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Minimal proposal audit",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskProposalAudit" } } }
+          },
+          "400": { "description": "Invalid task/proposal ID or missing workspace context." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "description": "No matching externally owned proposal audit in this workspace, or malformed/missing routing descriptors." }
+        }
+      }
+    },
     "/api/tasks/{id}/clarification": {
       "post": {
         "tags": [
@@ -8517,7 +8540,7 @@
         ],
         "summary": "Update task",
         "operationId": "updateTask",
-        "description": "proposal_final_route atomically merges only proposal.final_route for an accepted, externally owned proposal. The proposal ID and execution owner are rechecked in the SQL update; malformed or changed metadata returns 409. Cannot be combined with metadata. Cloud model may be omitted when the runner does not declare it.",
+        "description": "proposal_final_route atomically merges only proposal.final_route for an accepted, externally owned proposal while status is assigned or in_progress. Other lifecycle states freeze the route and return 409. The status, typed proposal ID, execution owner and authenticated non-admin agent assignment are rechecked in the SQL update; malformed or changed metadata returns 409. Cannot be combined with metadata. Cloud model may be omitted when the runner does not declare it.",
         "parameters": [
           {
             "name": "id",
@@ -12983,6 +13006,33 @@
               "answeredAt": {
                 "type": "integer"
               }
+            }
+          }
+        }
+      },
+      "TaskProposalAuditRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runtime", "reason"],
+        "properties": {
+          "runtime": { "type": "string", "enum": ["local", "codex", "claude"] },
+          "model": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "\\S" },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" }
+        }
+      },
+      "TaskProposalAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["proposal"],
+        "properties": {
+          "proposal": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "route_forecast", "final_route"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+              "route_forecast": { "anyOf": [{ "$ref": "#/components/schemas/TaskProposalAuditRoute" }, { "type": "null" }] },
+              "final_route": { "$ref": "#/components/schemas/TaskProposalAuditRoute" }
             }
           }
         }

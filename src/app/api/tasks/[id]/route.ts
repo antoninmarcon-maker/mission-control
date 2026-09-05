@@ -160,6 +160,7 @@ export async function PUT(
       let storedMetadata;
       try { storedMetadata = JSON.parse(currentTask.metadata || 'null'); } catch { /* refused below */ }
       if (
+        !['assigned', 'in_progress'].includes(currentTask.status) ||
         storedMetadata === null || typeof storedMetadata !== 'object' || Array.isArray(storedMetadata) ||
         storedMetadata.proposal?.id !== proposal_final_route.proposal_id ||
         storedMetadata.proposal?.execution_owner !== 'external_orchestrator'
@@ -332,7 +333,8 @@ export async function PUT(
       SET ${fieldsToUpdate.join(', ')}
       WHERE id = ? AND workspace_id = ?
       ${proposal_final_route !== undefined ? `AND CASE WHEN json_valid(metadata) THEN
-        json_type(metadata) = 'object'
+        status IN ('assigned', 'in_progress')
+        AND json_type(metadata) = 'object'
         AND json_type(metadata, '$.proposal') = 'object'
         AND json_type(metadata, '$.proposal.id') = 'integer'
         AND json_extract(metadata, '$.proposal.id') = ?

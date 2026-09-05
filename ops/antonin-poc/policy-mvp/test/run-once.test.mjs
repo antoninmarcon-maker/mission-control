@@ -3134,11 +3134,23 @@ async function ladderServers(t, options = {}) {
       sendJson(response, 200, { success: true, record });
       return;
     }
+    if (request.method === "GET" && request.url === "/api/tasks/42/proposal-audit?proposal_id=12") {
+      await options.beforeAuditRead?.();
+      const proposal = taskState.metadata.proposal;
+      sendJson(response, 200, { proposal: { id: proposal.id, route_forecast: proposal.route_forecast ?? null, final_route: proposal.final_route } });
+      return;
+    }
+    if (options.agentScoped && taskState.assigned_to !== "antonin-policy-engine") {
+      sendJson(response, 403, { error: "agent cannot access another assignee's task" });
+      return;
+    }
     if (request.method === "GET" && request.url === "/api/tasks/42") {
+      if (taskState.status === "review") await options.beforeAuditRead?.();
       sendJson(response, 200, { task: taskState });
       return;
     }
     if (body?.proposal_final_route) {
+      await options.beforeRoutePut?.();
       if (options.rejectRoute) {
         sendJson(response, 409, { error: "proposal route changed" });
         return;
@@ -3291,6 +3303,69 @@ test("a pending receipt revalidates proposal routing even after task confirmatio
   assert.equal(providerCalls, 1);
   assert.equal((await ledger.verify()).records, 1);
 });
+
+test("an agent-scoped policy run completes its receipt after handing the task to a distinct reviewer", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { agentScoped: true, task: {
+    status: "in_progress", assigned_to: "antonin-policy-engine", metadata: { proposal: structuredClone(acceptedProposal) },
+  } });
+  const result = await processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+    ollama: { async complete() { return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+  });
+  assert.equal(result.outcome, "review");
+  assert.equal(servers.task().assigned_to, "poc-aegis-cloud");
+  assert.equal((await new ReceiptLedger(state.stateDirectory, state.stateStoreOptions).verify()).records, 1);
+  assert.equal(servers.mcRequests.filter((request) => request.url?.includes("proposal-audit")).length, 1);
+});
+
+for (const boundary of ["beforeRoutePut", "beforeAuditRead"]) {
+  for (const stale of [false, true]) {
+    test(`proposal network ${boundary} does not hold the global lease lock; stale=${stale}`, async (t) => {
+      const state = await temporaryPolicyState(t);
+      let instant = Date.now();
+      const options = { ...state.stateStoreOptions, now: () => instant, lockMaxAttempts: 2, lockRetryMs: 1 };
+      const leaseStore = new LeaseStore(state.stateDirectory, options);
+      const peerStore = new LeaseStore(state.stateDirectory, options);
+      let started;
+      const reached = new Promise((resolve) => { started = resolve; });
+      let release;
+      const suspended = new Promise((resolve) => { release = resolve; });
+      const servers = await ladderServers(t, {
+        task: { metadata: { proposal: structuredClone(acceptedProposal) } },
+        [boundary]: async () => { started(); await suspended; },
+      });
+      let calls = 0;
+      const processing = processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+        leaseStore,
+        ollama: { async complete() { calls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+      });
+      // Attach rejection handling while network work is deliberately suspended.
+      const settled = processing.then((value) => ({ value }), (error) => ({ error }));
+      try {
+        await Promise.race([reached, settled.then(() => { throw new Error("network boundary not reached"); })]);
+        const independent = await peerStore.acquire("independent", "peer", { ttlMs: 10000 });
+        assert.equal(independent.fencing_token, 1);
+        await peerStore.renew("independent", "peer", 1, 10000);
+        if (stale) {
+          instant += 1_000_000;
+          assert.equal((await peerStore.acquire("42", "new-owner", { ttlMs: 10000 })).fencing_token, 2);
+        }
+      } finally {
+        release();
+        await settled;
+      }
+      const outcome = await settled;
+      if (stale) {
+        assert.match(outcome.error?.message ?? "", /lease is not current/);
+        assert.equal(calls, boundary === "beforeRoutePut" ? 0 : 1);
+        assert.equal((await new ReceiptLedger(state.stateDirectory, state.stateStoreOptions).verify()).records, 0);
+      } else {
+        assert.equal(outcome.error, undefined);
+        assert.equal(outcome.value.outcome, "review");
+      }
+    });
+  }
+}
 
 test("a proposal forecast cannot override the current risk policy", async (t) => {
   const state = await temporaryPolicyState(t);
