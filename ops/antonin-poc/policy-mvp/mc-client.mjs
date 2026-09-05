@@ -343,10 +343,12 @@ export class MissionControlClient {
   }
 
   async #createProposal(input) {
-    const response = await this.#request("/api/task-proposals", {
+    const acknowledgement = await this.#request("/api/task-proposals", {
       method: "POST",
       body: input,
+      includeStatus: true,
     });
+    const { data: response, status } = acknowledgement;
     if (
       response?.proposal === null ||
       typeof response?.proposal !== "object" ||
@@ -360,7 +362,12 @@ export class MissionControlClient {
         "Mission Control returned an invalid proposal mutation response",
       );
     }
-    return response;
+    if (status !== 201 && status !== 200) {
+      throw mutationResponseError(
+        "Mission Control returned an invalid proposal acknowledgement status",
+      );
+    }
+    return { ...response, created: status === 201 };
   }
 
   async #request(pathname, options = {}) {
@@ -391,7 +398,9 @@ export class MissionControlClient {
     }
 
     if (response.status === 204) {
-      return null;
+      return options.includeStatus === true
+        ? { data: null, status: response.status }
+        : null;
     }
 
     const maximumBytes = response.ok
@@ -424,6 +433,6 @@ export class MissionControlClient {
         { ambiguous: false, status: response.status },
       );
     }
-    return data;
+    return options.includeStatus === true ? { data, status: response.status } : data;
   }
 }

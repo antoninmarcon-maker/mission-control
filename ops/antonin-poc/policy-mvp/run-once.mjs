@@ -24,6 +24,7 @@ import {
   classifyFailure,
   completionIdentityFields,
   evaluateTask,
+  forecastProposalRoute,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
@@ -48,6 +49,8 @@ import {
 } from "./quota-config.mjs";
 import { QuotaStore } from "./quota-store.mjs";
 import { ReceiptLedger } from "./receipt-ledger.mjs";
+import { ProposalCursorStore } from "./proposal-cursor-store.mjs";
+import { proposalCandidatesForTask } from "./proposal-engine.mjs";
 
 const DEFAULT_AGENT = "antonin-policy-engine";
 const DEFAULT_REVIEWER = "poc-aegis-cloud";
@@ -1915,7 +1918,90 @@ export async function processOne(config, dependencies = {}) {
   };
 }
 
-export async function runCommand(command, environment = process.env) {
+function proposalAcknowledgementCreated(acknowledgement) {
+  if (
+    acknowledgement === null ||
+    typeof acknowledgement !== "object" ||
+    Array.isArray(acknowledgement) ||
+    acknowledgement.proposal === null ||
+    typeof acknowledgement.proposal !== "object" ||
+    Array.isArray(acknowledgement.proposal) ||
+    typeof acknowledgement.created !== "boolean"
+  ) {
+    throw new Error("Mission Control returned an invalid proposal acknowledgement");
+  }
+  return acknowledgement.created;
+}
+
+function safeProposalForecast(proposal, config, forecaster) {
+  try {
+    return forecaster(proposal, {
+      localModel: config.localModel,
+      reviewer: config.reviewer,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export async function proposeOnce(config, dependencies = {}) {
+  const cursorStore =
+    dependencies.proposalCursorStore ??
+    new ProposalCursorStore(config.stateDirectory, config.stateStoreOptions);
+  const missionControl =
+    dependencies.missionControl ??
+    new MissionControlClient({ baseUrl: config.mcUrl, apiKey: config.mcApiKey });
+  const extractCandidates =
+    dependencies.proposalCandidatesForTask ?? proposalCandidatesForTask;
+  const forecast = dependencies.forecastProposalRoute ?? forecastProposalRoute;
+  const log = dependencies.log ?? (() => {});
+  const cursor = await cursorStore.read();
+  const page = await missionControl.listProposalCandidates(cursor);
+  const counts = {
+    scanned: page.tasks.length,
+    created: 0,
+    duplicates: 0,
+    skipped: 0,
+  };
+
+  for (const task of page.tasks) {
+    const candidates = extractCandidates(task).slice(0, 3);
+    if (candidates.length === 0) {
+      counts.skipped += 1;
+      continue;
+    }
+
+    for (const candidate of candidates) {
+      const routeForecast = safeProposalForecast(candidate, config, forecast);
+      const proposal = {
+        ...candidate,
+        ...(routeForecast === null ? {} : { routeForecast }),
+        metadata: { source_task_id: task.id },
+      };
+      const created = proposalAcknowledgementCreated(
+        await missionControl.createProposal(proposal),
+      );
+      if (created) counts.created += 1;
+      else counts.duplicates += 1;
+    }
+  }
+
+  const committedCursor = await cursorStore.commit(page.nextCursor);
+  log({
+    event: "proposal_scan",
+    taskIds: page.tasks
+      .map((task) => (Number.isSafeInteger(task?.id) ? task.id : null))
+      .filter((taskId) => taskId !== null),
+    ...counts,
+  });
+  return {
+    outcome: "proposals_scanned",
+    ...counts,
+    cursor: committedCursor,
+  };
+}
+
+export async function runCommand(command, environment = process.env, dependencies = {}) {
   const config = configFromEnvironment(environment);
   if (command === "status") {
     return {
@@ -1972,8 +2058,11 @@ export async function runCommand(command, environment = process.env) {
   if (command === "process") {
     return { command, ...(await processOne(config)) };
   }
+  if (command === "propose") {
+    return await proposeOnce(config, dependencies);
+  }
   throw new Error(
-    "usage: run-once.mjs process|status|quota-status|verify-ledger",
+    "usage: run-once.mjs process|propose|status|quota-status|verify-ledger",
   );
 }
 

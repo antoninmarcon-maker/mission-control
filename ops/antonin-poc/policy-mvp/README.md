@@ -72,9 +72,12 @@ node ops/antonin-poc/policy-mvp/run-once.mjs status
 node ops/antonin-poc/policy-mvp/run-once.mjs quota-status
 node ops/antonin-poc/policy-mvp/run-once.mjs verify-ledger
 node ops/antonin-poc/policy-mvp/run-once.mjs process
+node ops/antonin-poc/policy-mvp/run-once.mjs propose
 ```
 
 `status` prints resolved paths and non-secret configuration. `quota-status` prints the derived state of every quota window, the effective thresholds, and the decisions still reserved to Antonin; it reads state and never mutates it. `verify-ledger` checks every JSONL hash link and fails closed on corruption. `process` handles at most one task and returns a structured JSON summary; failures return a non-zero exit status with a bounded, redacted error.
+
+`propose` reads its durable candidate cursor, scans one page of at most 200 task changes, and creates only bounded proposal records. A scheduler may invoke it repeatedly; every invocation exits after that single page. It launches no task, claims no task, calls no provider, and does not route any task: an optional local route forecast is advisory data on the proposal only. The cursor is committed only after every proposal acknowledgement in the page succeeds, so a rejected emission leaves the previous cursor for a safe idempotent retry.
 
 `process` reports one of five outcomes: `no_task`, `awaiting_owner`, `review`, `deferred`, or `contended`. A ladder that ends with Antonin — every rung tried, or the attempt ceiling reached — is `awaiting_owner` with exit 0 and a failure receipt: capacity was consumed and the audit chain says so. Only an unclassified failure exits non-zero. `contended` means another live invocation is committing — or has just committed — the same completion; this invocation posted nothing, mutated nothing, and released nothing, so it exits 0 and there is nothing to reconcile. `deferred` means nothing is wrong and the work is simply not runnable now; the task goes back to `assigned` for the policy agent with an operator-visible `deferred_until`, and the invocation exits 0.
 

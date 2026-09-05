@@ -113,6 +113,28 @@ test("proposal client fails closed on malformed candidate and proposal acknowled
   );
 });
 
+test("proposal client preserves the server's created or duplicate acknowledgement", async (t) => {
+  let posts = 0;
+  const input = proposalInput();
+  const baseUrl = await fakeHttpServer(t, async (request, response) => {
+    posts += 1;
+    await readJson(request);
+    sendJson(response, posts === 1 ? 201 : 200, {
+      proposal: { id: 12, revision: "acknowledged" },
+    });
+  });
+  const client = new MissionControlClient({ baseUrl, apiKey: "proposal-secret" });
+
+  assert.deepEqual(await client.createProposal(input), {
+    proposal: { id: 12, revision: "acknowledged" },
+    created: true,
+  });
+  assert.deepEqual(await client.createProposal(input), {
+    proposal: { id: 12, revision: "acknowledged" },
+    created: false,
+  });
+});
+
 test("proposal client retries an ambiguous idempotent POST and returns the persisted acknowledgement", async (t) => {
   const requests = [];
   const proposalsByIdempotencyKey = new Map();
@@ -159,5 +181,6 @@ test("proposal client retries an ambiguous idempotent POST and returns the persi
   assert.equal(requests[0].idempotencyKey, requests[1].idempotencyKey);
   assert.deepEqual(acknowledgement, {
     proposal: proposalsByIdempotencyKey.get(input.idempotencyKey),
+    created: false,
   });
 });

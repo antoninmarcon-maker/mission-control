@@ -24,7 +24,7 @@ import { MissionControlClient } from "../mc-client.mjs";
 import { OllamaClient } from "../ollama-client.mjs";
 import { QuotaStore } from "../quota-store.mjs";
 import { ReceiptLedger } from "../receipt-ledger.mjs";
-import { configFromEnvironment, processOne } from "../run-once.mjs";
+import { configFromEnvironment, processOne, runCommand } from "../run-once.mjs";
 
 const execFile = promisify(execFileCallback);
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -112,6 +112,66 @@ function queueResponse(task) {
   };
 }
 
+function proposalEnvironment(state) {
+  return {
+    ANTONIN_POLICY_STATE_DIR: state.stateDirectory,
+    MC_URL: "http://127.0.0.1:4318",
+    MC_API_KEY: "mc-proposal-secret",
+  };
+}
+
+function proposalTask(id, status, overrides = {}) {
+  return {
+    id,
+    updated_at: 1_788_560_000 + id,
+    status,
+    title: `Task ${id}`,
+    ...overrides,
+  };
+}
+
+function proposalDependencies({
+  cursor = { updatedAt: 1_788_560_000, id: 40 },
+  page,
+  createProposal,
+  forecastProposalRoute,
+} = {}) {
+  const calls = {
+    commits: [],
+    cursors: [],
+    proposals: [],
+    logs: [],
+  };
+  return {
+    calls,
+    dependencies: {
+      proposalCursorStore: {
+        async read() {
+          return cursor;
+        },
+        async commit(nextCursor) {
+          calls.commits.push(nextCursor);
+          return nextCursor;
+        },
+      },
+      missionControl: {
+        async listProposalCandidates(nextCursor) {
+          calls.cursors.push(nextCursor);
+          return page;
+        },
+        async createProposal(proposal) {
+          calls.proposals.push(proposal);
+          return createProposal(proposal);
+        },
+      },
+      forecastProposalRoute,
+      log(entry) {
+        calls.logs.push(entry);
+      },
+    },
+  };
+}
+
 async function assertLeaseReleased(state, taskId = "42") {
   const store = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
   await assert.rejects(
@@ -119,6 +179,165 @@ async function assertLeaseReleased(state, taskId = "42") {
     /lease is not current/,
   );
 }
+
+test("runCommand propose scans one bounded page sequentially and commits after every acknowledgement", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const page = {
+    tasks: [
+      proposalTask(41, "failed"),
+      proposalTask(42, "done", {
+        metadata: {
+          next_actions: [{
+            title: "Repair parser",
+            objective: "Repair the parser",
+            context: "The parser rejected a valid record.",
+            rationale: "A structured follow-up is required.",
+            risk: "medium",
+          }],
+        },
+      }),
+      proposalTask(43, "assigned"),
+      proposalTask(44, "awaiting_owner"),
+    ],
+    nextCursor: { updatedAt: 1_788_560_044, id: 44 },
+  };
+  const { calls, dependencies } = proposalDependencies({
+    page,
+    createProposal: async (proposal) => ({
+      proposal: { id: calls.proposals.length, revision: "ack" },
+      created: proposal.sourceRef !== "task:42",
+    }),
+    forecastProposalRoute: (proposal) =>
+      proposal.sourceRef === "task:41"
+        ? { runtime: "local", model: "qwen2.5-coder:7b", reason: "safe" }
+        : null,
+  });
+
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 4,
+    created: 2,
+    duplicates: 1,
+    skipped: 1,
+    cursor: { updatedAt: 1_788_560_044, id: 44 },
+  });
+  assert.deepEqual(calls.cursors, [{ updatedAt: 1_788_560_000, id: 40 }]);
+  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_044, id: 44 }]);
+  assert.equal(calls.proposals.length, 3);
+  assert.deepEqual(calls.proposals[0].routeForecast, {
+    runtime: "local",
+    model: "qwen2.5-coder:7b",
+    reason: "safe",
+  });
+  assert.equal(Object.hasOwn(calls.proposals[1], "routeForecast"), false);
+  assert.deepEqual(calls.logs, [
+    { event: "proposal_scan", taskIds: [41, 42, 43, 44], scanned: 4, created: 2, duplicates: 1, skipped: 1 },
+  ]);
+});
+
+test("runCommand propose does not commit a page when a proposal acknowledgement is rejected", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const oldCursor = { updatedAt: 1_788_560_000, id: 40 };
+  const { calls, dependencies } = proposalDependencies({
+    cursor: oldCursor,
+    page: {
+      tasks: [proposalTask(41, "failed")],
+      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+    },
+    createProposal: async () => {
+      throw new Error("proposal rejected");
+    },
+  });
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal rejected/,
+  );
+  assert.deepEqual(calls.commits, []);
+  assert.deepEqual(calls.cursors, [oldCursor]);
+});
+
+test("runCommand propose preserves a deterministic idempotency key across a client retry", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const postedKeys = [];
+  const { dependencies } = proposalDependencies({
+    page: {
+      tasks: [proposalTask(41, "failed")],
+      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+    },
+    createProposal: async (proposal) => {
+      postedKeys.push(proposal.idempotencyKey);
+      postedKeys.push(proposal.idempotencyKey);
+      return { proposal: { id: 1, revision: "ack" }, created: true };
+    },
+  });
+
+  await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.equal(postedKeys.length, 2);
+  assert.equal(postedKeys[0], postedKeys[1]);
+});
+
+test("runCommand propose commits an empty page with zero counts", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const { calls, dependencies } = proposalDependencies({
+    page: {
+      tasks: [],
+      nextCursor: { updatedAt: 1_788_560_000, id: 40 },
+    },
+    createProposal: async () => {
+      throw new Error("empty pages must not emit proposals");
+    },
+  });
+
+  assert.deepEqual(
+    await runCommand("propose", proposalEnvironment(state), dependencies),
+    {
+      outcome: "proposals_scanned",
+      scanned: 0,
+      created: 0,
+      duplicates: 0,
+      skipped: 0,
+      cursor: { updatedAt: 1_788_560_000, id: 40 },
+    },
+  );
+  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_000, id: 40 }]);
+});
+
+test("runCommand propose emits at most three candidates from one task", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const { calls, dependencies } = proposalDependencies({
+    page: {
+      tasks: [proposalTask(41, "done", {
+        metadata: {
+          next_actions: Array.from({ length: 4 }, (_, index) => ({
+            title: `Follow-up ${index + 1}`,
+            objective: `Complete follow-up ${index + 1}`,
+            context: `Context ${index + 1}`,
+            rationale: "Structured follow-up.",
+            risk: "medium",
+          })),
+        },
+      })],
+      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+    },
+    createProposal: async () => ({ proposal: { id: 1, revision: "ack" }, created: true }),
+  });
+
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.equal(calls.proposals.length, 3);
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 1,
+    created: 3,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_041, id: 41 },
+  });
+});
 
 test("Mission Control client uses the exact queue, task, comment, and token contracts", async (t) => {
   const apiKey = "mc-test-secret";
