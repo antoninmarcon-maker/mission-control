@@ -357,6 +357,8 @@ function localPrompt(task) {
     "",
     `Task title: ${String(task?.title ?? "")}`,
     `Task description: ${String(task?.description ?? "")}`,
+    ...(typeof task?.clarification_prompt === "string" && task.clarification_prompt
+      ? ["", task.clarification_prompt] : []),
   ].join("\n");
 }
 

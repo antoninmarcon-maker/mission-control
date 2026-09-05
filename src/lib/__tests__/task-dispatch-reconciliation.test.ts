@@ -3,6 +3,7 @@ import Database from 'better-sqlite3'
 import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { POST, PUT } from '@/app/api/tasks/[id]/clarification/route'
+import { GET as QUEUE } from '@/app/api/tasks/queue/route'
 
 const mockDbState = vi.hoisted(() => ({
   db: null as Database.Database | null,
@@ -136,7 +137,7 @@ vi.mock('../auth', () => ({
   requireRole: () => ({ user: { id: 1, role: 'operator', workspace_id: 1, username: 'antonin' } }),
 }))
 
-vi.mock('../rate-limit', () => ({ mutationLimiter: () => null }))
+vi.mock('../rate-limit', () => ({ mutationLimiter: () => null, agentTaskLimiter: () => null }))
 
 vi.mock('../config', () => ({
   config: {
@@ -193,7 +194,7 @@ vi.mock('../logger', () => ({
   },
 }))
 
-import { dispatchAssignedTasks, extractDeferredCompletionText, reconcileDeferredTaskCompletions } from '../task-dispatch'
+import { dispatchAssignedTasks, extractDeferredCompletionText, reconcileDeferredTaskCompletions, requeueStaleTasks, runAegisReviews, autoRouteInboxTasks } from '../task-dispatch'
 
 describe('deferred task completion reconciliation', () => {
   beforeEach(() => {
@@ -575,14 +576,15 @@ describe('atomic dispatch clarification claims', () => {
         priority TEXT DEFAULT 'medium', assigned_to TEXT DEFAULT 'agent-one',
         metadata TEXT DEFAULT '{}', workspace_id INTEGER DEFAULT 1,
         project_id INTEGER, project_ticket_no INTEGER, tags TEXT,
-        created_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
+        created_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, due_date INTEGER,
+        dispatch_attempts INTEGER DEFAULT 0, error_message TEXT, resolution TEXT
       );
-      CREATE TABLE agents (id INTEGER, name TEXT, config TEXT, runtime_type TEXT, workspace_id INTEGER);
+      CREATE TABLE agents (id INTEGER, name TEXT, config TEXT, runtime_type TEXT, workspace_id INTEGER, status TEXT DEFAULT 'offline', last_seen INTEGER, hidden INTEGER DEFAULT 0, role TEXT DEFAULT 'worker');
       CREATE TABLE workspaces (id INTEGER, isolation TEXT);
       CREATE TABLE projects (id INTEGER, ticket_prefix TEXT, workspace_id INTEGER);
       CREATE TABLE comments (task_id INTEGER, author TEXT, content TEXT, created_at INTEGER, workspace_id INTEGER);
       CREATE TABLE gateways (status TEXT);
-      INSERT INTO agents VALUES (7, 'agent-one', NULL, NULL, 1);
+      INSERT INTO agents (id, name, workspace_id) VALUES (7, 'agent-one', 1);
       INSERT INTO workspaces VALUES (1, 'shared');
       INSERT INTO gateways VALUES ('healthy');
       INSERT INTO tasks (id, title, created_at) VALUES (1, 'First task', 1), (2, 'Second task', 2);
@@ -654,6 +656,7 @@ describe('atomic dispatch clarification claims', () => {
   it.each([
     ['already claimed', "UPDATE tasks SET status = 'in_progress' WHERE id = 2"],
     ['moved to another workspace', 'UPDATE tasks SET workspace_id = 2 WHERE id = 2'],
+    ['externally owned', `UPDATE tasks SET metadata = '{"proposal":{"execution_owner":"external_orchestrator"}}' WHERE id = 2`],
   ])('skips a selected task that was %s before its claim', async (_reason, mutation) => {
     mockDbState.callOpenClawGateway.mockImplementationOnce(async () => {
       mockDbState.db!.exec(mutation)
@@ -663,5 +666,110 @@ describe('atomic dispatch clarification claims', () => {
     expect(await dispatchAssignedTasks()).toEqual({ ok: true, message: 'Dispatched 1/2 tasks' })
     expect(mockDbState.callOpenClawGateway).toHaveBeenCalledTimes(1)
     expect(mockDbState.broadcast).not.toHaveBeenCalledWith('task.status_changed', expect.objectContaining({ id: 2 }))
+  })
+
+  it('lets only the external queue obtain an externally owned task while ordinary internal work still runs', async () => {
+    mockDbState.db!.prepare('UPDATE tasks SET metadata = ?, assigned_to = ? WHERE id = 2')
+      .run(JSON.stringify({ proposal: { execution_owner: 'external_orchestrator' } }), 'external-agent')
+    mockDbState.db!.exec("INSERT INTO agents (id, name, workspace_id) VALUES (8, 'external-agent', 1)")
+    const internal = dispatchAssignedTasks()
+    const external = QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=external-agent'))
+    const [internalResult, externalResponse] = await Promise.all([internal, external])
+    expect(internalResult).toEqual({ ok: true, message: 'Dispatched 1/1 tasks' })
+    expect(await externalResponse.json()).toMatchObject({ reason: 'assigned', task: { id: 2, status: 'in_progress' } })
+    expect(mockDbState.callOpenClawGateway).toHaveBeenCalledTimes(1)
+    expect(mockDbState.callOpenClawGateway.mock.calls[0][1].message).toContain('First task')
+    const again = await QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=external-agent'))
+    expect(await again.json()).toMatchObject({ reason: 'continue_current', task: { id: 2 } })
+  })
+
+  it('excludes externally owned tasks before LIMIT so they do not starve ordinary dispatch', async () => {
+    mockDbState.db!.exec(`
+      UPDATE tasks SET metadata = '{"proposal":{"execution_owner":"external_orchestrator"}}' WHERE id = 1;
+      INSERT INTO tasks (id, title, priority, metadata) VALUES
+        (3, 'External 3', 'critical', '{"proposal":{"execution_owner":"external_orchestrator"}}'),
+        (4, 'External 4', 'critical', '{"proposal":{"execution_owner":"external_orchestrator"}}');
+    `)
+    expect(await dispatchAssignedTasks()).toEqual({ ok: true, message: 'Dispatched 1/1 tasks' })
+    expect(mockDbState.callOpenClawGateway.mock.calls[0][1].message).toContain('Second task')
+    expect(mockDbState.db!.prepare("SELECT id FROM tasks WHERE status = 'assigned' ORDER BY id").all()).toEqual([{ id: 1 }, { id: 3 }, { id: 4 }])
+  })
+
+  it('leaves pending clarification assigned without consuming the external queue and claims complete human answers', async () => {
+    mockDbState.db!.exec("DELETE FROM tasks WHERE id = 1")
+    const clarification = await openClarification()
+    const poll = () => QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=agent-one'))
+    expect(await (await poll()).json()).toMatchObject({ reason: 'no_tasks_available', task: null })
+    expect(mockDbState.db!.prepare('SELECT status FROM tasks WHERE id = 2').get()).toEqual({ status: 'assigned' })
+    const answer = await PUT(new NextRequest('http://localhost/api/tasks/2/clarification', {
+      method: 'PUT', body: JSON.stringify({ revision: clarification.revision, answers: [{ questionId: 'scope', selected: ['full'], text: 'Inclure les tests de migration.' }] }),
+    }), { params: Promise.resolve({ id: '2' }) })
+    expect(answer.status).toBe(200)
+    const payload = await (await poll()).json()
+    expect(payload).toMatchObject({ reason: 'assigned', task: { id: 2, metadata: { clarification: { state: 'answered' } } } })
+    expect(payload.task.clarification_prompt).toBe('## Cadrage validé\n\nQuel périmètre ?\nPérimètre complet\nInclure les tests de migration.')
+    expect(payload.task.clarification_prompt).not.toContain('Minimum')
+  })
+
+  it('queue claims the fresh row when answers change after preliminary reads and keeps workspace isolation', async () => {
+    const db = mockDbState.db!
+    db.exec("DELETE FROM tasks WHERE id = 1; INSERT INTO tasks (id, title, workspace_id, priority) VALUES (3, 'Foreign', 2, 'critical')")
+    const pending = await openClarification()
+    const prepare = db.prepare.bind(db)
+    const spy = vi.spyOn(db, 'prepare').mockImplementation(((sql: string) => {
+      if (sql.includes('UPDATE tasks') && sql.includes('RETURNING')) {
+        spy.mockRestore()
+        prepare('UPDATE tasks SET metadata = ? WHERE id = 2').run(JSON.stringify({ clarification: {
+          ...pending, state: 'answered', answers: [{ questionId: 'scope', selected: ['full'], text: 'Fresh committed answer' }],
+        } }))
+      }
+      return prepare(sql)
+    }) as typeof db.prepare)
+    const response = await QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=agent-one'))
+    expect(await response.json()).toMatchObject({ reason: 'assigned', task: { id: 2, clarification_prompt: '## Cadrage validé\n\nQuel périmètre ?\nPérimètre complet\nFresh committed answer' } })
+    expect(db.prepare('SELECT status FROM tasks WHERE id = 3').get()).toEqual({ status: 'assigned' })
+  })
+
+  it.each([null, 'null', 'invalid-json', '{}'])('keeps legacy external queue tasks compatible with metadata %s', async (metadata) => {
+    mockDbState.db!.exec('DELETE FROM tasks WHERE id = 2')
+    mockDbState.db!.prepare('UPDATE tasks SET metadata = ? WHERE id = 1').run(metadata)
+    const response = await QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=agent-one'))
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ reason: 'assigned', task: { id: 1, title: 'First task', clarification_prompt: '' } })
+  })
+
+  it('skips higher priority pending work before the queue limit and never continues a pending legacy run', async () => {
+    await openClarification()
+    mockDbState.db!.exec("UPDATE tasks SET priority = 'critical' WHERE id = 2")
+    const poll = () => QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=agent-one'))
+    expect(await (await poll()).json()).toMatchObject({ reason: 'assigned', task: { id: 1 } })
+    mockDbState.db!.exec("UPDATE tasks SET status = 'done' WHERE id = 1; UPDATE tasks SET status = 'in_progress' WHERE id = 2")
+    expect(await (await poll()).json()).toMatchObject({ reason: 'at_capacity', task: null })
+  })
+
+  it.each(['internal-first', 'external-first'])('gives only the external path an accepted task when contenders run %s', async (order) => {
+    const db = mockDbState.db!
+    db.exec(`DELETE FROM tasks WHERE id = 1; UPDATE tasks SET metadata = '{"proposal":{"execution_owner":"external_orchestrator"}}' WHERE id = 2`)
+    const queue = () => QUEUE(new NextRequest('http://localhost/api/tasks/queue?agent=agent-one'))
+    let response: Response
+    if (order === 'internal-first') { await dispatchAssignedTasks(); response = await queue() }
+    else { response = await queue(); await dispatchAssignedTasks() }
+    expect(await response.json()).toMatchObject({ reason: 'assigned', task: { id: 2 } })
+    expect(mockDbState.callOpenClawGateway).not.toHaveBeenCalled()
+    expect(await (await queue()).json()).toMatchObject({ reason: 'continue_current', task: { id: 2 } })
+  })
+
+  it.each(['stale', 'review', 'inbox'])('keeps external %s work under the external lease and review/routing policy', async (phase) => {
+    const db = mockDbState.db!
+    db.exec("DELETE FROM tasks WHERE id = 1")
+    db.prepare('UPDATE tasks SET status = ?, metadata = ?').run(phase === 'stale' ? 'in_progress' : phase, JSON.stringify({ proposal: { execution_owner: 'external_orchestrator' } }))
+    if (phase === 'inbox') db.exec("UPDATE tasks SET assigned_to = NULL; UPDATE agents SET status = 'idle'")
+    const before = db.prepare('SELECT * FROM tasks').get()
+    if (phase === 'stale') await requeueStaleTasks()
+    if (phase === 'review') await runAegisReviews()
+    if (phase === 'inbox') await autoRouteInboxTasks()
+    expect(db.prepare('SELECT * FROM tasks').get()).toEqual(before)
+    expect(mockDbState.callOpenClawGateway).not.toHaveBeenCalled()
+    expect(mockDbState.broadcast).not.toHaveBeenCalled()
   })
 })

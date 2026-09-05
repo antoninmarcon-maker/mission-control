@@ -59,7 +59,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       const taskMetadata = {
         proposal: {
           id: proposal.id, source_type: proposal.sourceType, source_ref: proposal.sourceRef,
-          accepted_by: actor, route_forecast: proposal.routeForecast,
+          accepted_by: actor, accepted_user_id: auth.user.id,
+          execution_owner: 'external_orchestrator', route_forecast: proposal.routeForecast,
         },
       }
       const taskRow = db.prepare(`
@@ -69,10 +70,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       `).get(proposal.title, description, proposal.risk, proposal.projectId, ticketNumber,
         proposal.orchestratorAgent, actor, now, now, JSON.stringify(taskMetadata), ws.workspaceId) as Task
       const accepted = db.prepare(`
-        UPDATE task_proposals SET status = 'accepted', task_id = ?, accepted_by = ?, accepted_at = ?, revision = ?, updated_at = ?
+        UPDATE task_proposals SET status = 'accepted', task_id = ?, accepted_by = ?, accepted_at = ?, revision = ?, updated_at = ?,
+          metadata = json_set(metadata, '$.accepted_user_id', ?)
         WHERE id = ? AND workspace_id = ? AND status = 'pending' AND revision = ? AND (expires_at IS NULL OR expires_at > ?)
         RETURNING *
-      `).get(taskRow.id, actor, now, randomUUID(), now, id, ws.workspaceId, parsed.data.revision, now)
+      `).get(taskRow.id, actor, now, randomUUID(), now, auth.user.id, id, ws.workspaceId, parsed.data.revision, now)
       // A lost CAS must throw so task insertion and ticket allocation roll back together.
       if (!accepted) throw new Error('Proposal acceptance conflict')
       const acceptedProposal = mapTaskProposalRow(accepted)

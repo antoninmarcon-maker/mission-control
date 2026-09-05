@@ -19,6 +19,9 @@ import { CLARIFICATION_READY_SQL, clarificationPrompt } from './task-clarificati
 import { getMiniMaxApiKey, resolveMiniMaxEndpoint } from './minimax'
 import type Database from 'better-sqlite3'
 
+// Accepted proposals use the external orchestrator's routing, lease and review policy.
+const INTERNAL_EXECUTION_SQL = "COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.proposal.execution_owner'), '') != 'external_orchestrator'"
+
 const AGENT_DISPATCH_ACCEPT_TIMEOUT_MS = 60_000
 
 /** Sync task to GitHub/GNAP and broadcast escalation if task failed */
@@ -1475,6 +1478,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'review'
       AND w.isolation = 'shared'
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
     ORDER BY t.updated_at ASC
     LIMIT 3
   `).all() as ReviewableTask[]
@@ -1659,6 +1663,7 @@ export async function requeueStaleTasks(): Promise<{ ok: boolean; message: strin
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'in_progress'
       AND t.updated_at < ?
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
   `).all(staleThreshold) as Array<{
     id: number; title: string; assigned_to: string | null; dispatch_attempts: number
     workspace_id: number; agent_status: string | null; agent_last_seen: number | null
@@ -1749,6 +1754,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       AND w.isolation = 'shared'
       AND t.assigned_to IS NOT NULL
       AND ${CLARIFICATION_READY_SQL.replaceAll('metadata', 't.metadata')}
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
     ORDER BY
       CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       t.created_at ASC
@@ -1776,7 +1782,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
     // Concurrent dispatchers receive no row if another worker claimed it first,
     // preventing double-dispatch (issue/PR #698).
     const claim = db
-      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL} RETURNING metadata`)
+      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL} AND ${INTERNAL_EXECUTION_SQL} RETURNING metadata`)
       .get('in_progress', now, task.id, task.workspace_id) as { metadata: string | null } | undefined
 
     if (!claim) {
@@ -2169,6 +2175,7 @@ export async function autoRouteInboxTasks(): Promise<{ ok: boolean; message: str
     FROM tasks
     WHERE status = 'inbox' AND assigned_to IS NULL
       AND ${CLARIFICATION_READY_SQL}
+      AND ${INTERNAL_EXECUTION_SQL}
     ORDER BY
       CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       created_at ASC

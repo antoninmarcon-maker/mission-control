@@ -438,6 +438,53 @@ test("processOne exits cleanly when Mission Control has no queued task", async (
   assert.equal(requests, 1);
 });
 
+test("processOne sends the confirmed clarification from the queue to execution without unselected choices or receipt prose", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const confirmed = "## Cadrage validé\n\nQuel ordre ?\nOrdre alphabétique\nConserver les accents.";
+  let task = queuedTask({
+    status: "in_progress", assigned_to: "antonin-policy-engine",
+    clarification_prompt: confirmed,
+    metadata: { clarification: { state: "answered", questions: [{ options: [{ label: "UNSELECTED_SECRET" }] }] } },
+  });
+  let tokenRecord;
+  let executedPrompt;
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.url.startsWith("/api/tasks/queue?")) return sendJson(response, 200, queueResponse(task));
+    if (request.url.startsWith("/api/tokens?action=")) return sendJson(response, 200, { usage: tokenRecord ? [tokenRecord] : [], total: tokenRecord ? 1 : 0 });
+    if (request.url === "/api/tokens") {
+      tokenRecord = { id: "clarified-token", ...await readJson(request) };
+      return sendJson(response, 200, { success: true, record: tokenRecord });
+    }
+    if (request.method === "PUT") task = { ...task, ...await readJson(request) };
+    sendJson(response, 200, { task });
+  });
+  const localEndpoint = await fakeHttpServer(t, async (request, response) => {
+    executedPrompt = (await readJson(request)).messages[0].content;
+    sendJson(response, 200, { choices: [{ message: { content: "alpha\nbeta" } }], usage: { prompt_tokens: 19, completion_tokens: 5 } });
+  });
+  const result = await processOne(processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }));
+  assert.equal(result.outcome, "review");
+  assert.ok(executedPrompt.includes(confirmed));
+  assert.equal(executedPrompt.includes("UNSELECTED_SECRET"), false);
+  const receipt = await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8");
+  assert.equal(receipt.includes("Conserver les accents"), false);
+  assert.equal(receipt.includes("UNSELECTED_SECRET"), false);
+});
+
+test("MissionControlClient refuses pending or untransported confirmed clarification before any executor obtains it", async (t) => {
+  let task;
+  const mcUrl = await fakeHttpServer(t, (_request, response) => sendJson(response, 200, queueResponse(task)));
+  const client = new MissionControlClient({ baseUrl: mcUrl, apiKey: "test-key" });
+  for (const invalid of [
+    { metadata: { clarification: { state: "pending" } } },
+    { metadata: { clarification: { state: "answered" } } },
+    { metadata: { clarification: { state: "answered" } }, clarification_prompt: 42 },
+  ]) {
+    task = queuedTask(invalid);
+    await assert.rejects(client.claimOne("antonin-policy-engine"), /clarification/i);
+  }
+});
+
 test("processOne moves a policy-rejected task to awaiting_owner without calling Ollama", async (t) => {
   const state = await temporaryPolicyState(t);
   const requests = [];

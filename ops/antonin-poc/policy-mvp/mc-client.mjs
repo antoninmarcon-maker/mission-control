@@ -148,6 +148,11 @@ export class MissionControlClient {
     if (typeof response.task !== "object" || Array.isArray(response.task)) {
       throw new Error("Mission Control queue returned an invalid task");
     }
+    const clarification = response.task.metadata?.clarification;
+    if (clarification?.state === "pending" || (clarification?.state === "answered" &&
+      (typeof response.task.clarification_prompt !== "string" || !response.task.clarification_prompt.trim()))) {
+      throw new Error("Mission Control queue clarification is not ready for execution");
+    }
     return response.task;
   }
 

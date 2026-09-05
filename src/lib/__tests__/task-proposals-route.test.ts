@@ -253,9 +253,12 @@ describe('proposal decisions', () => {
       expect(result.proposal).toMatchObject({ status: 'accepted', acceptedBy: 'antonin', taskId: result.task.id })
       expect(result.task).toMatchObject({ status: 'assigned', assigned_to: 'antonin-policy-engine', created_by: 'antonin', priority: 'high', workspace_id: 1, project_id: projectId, project_ticket_no: 1,
         description: 'Restore redirects\n\n## Context\nprivate-transcript-secret\n\n## Why now\nprivate-rationale-secret',
-        metadata: { proposal: { id: p.id, source_type: 'chat', source_ref: 'chat:42', accepted_by: 'antonin', route_forecast: { runtime: 'codex', reason: 'private-route-secret' } } },
+        metadata: { proposal: { id: p.id, source_type: 'chat', source_ref: 'chat:42', accepted_by: 'antonin', accepted_user_id: expect.any(Number), execution_owner: 'external_orchestrator', route_forecast: { runtime: 'codex', reason: 'private-route-secret' } } },
       })
       expect(result.task.metadata).not.toHaveProperty('token')
+      const approver = state.db.prepare("SELECT id FROM users WHERE username = 'antonin'").get() as { id: number }
+      expect(result.task.metadata.proposal.accepted_user_id).toBe(approver.id)
+      expect(result.proposal.metadata.accepted_user_id).toBe(approver.id)
       expect(taskCount()).toBe(1)
       expect(state.db.prepare(`SELECT id FROM tasks WHERE ${CLARIFICATION_READY_SQL}`).all()).toEqual([{ id: result.task.id }])
       expect((await accept(p.id, p.revision)).status).toBe(200)

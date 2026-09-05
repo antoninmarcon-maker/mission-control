@@ -12,6 +12,7 @@ import { syncTaskOutbound } from '@/lib/github-sync-engine';
 import { removeTaskFromGnap } from '@/lib/gnap-sync';
 import { config } from '@/lib/config';
 import { requireAgentTaskAccess, requireWorkspaceId } from '@/lib/enforcement/workspace-scope';
+import { CLARIFICATION_READY_SQL } from '@/lib/task-clarification';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -287,9 +288,9 @@ export async function PUT(
       updateParams.push(JSON.stringify(tags));
     }
     if (metadata !== undefined) {
-      // Reserved decision field: only /clarification may write it. Preserve the
-      // current DB value atomically, even when the edit form has stale metadata.
-      fieldsToUpdate.push("metadata = json_set(?, '$.clarification', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.clarification'))");
+      // Preserve human decisions and external execution ownership from the
+      // current DB row, even when an editor or worker sends stale metadata.
+      fieldsToUpdate.push("metadata = json_set(?, '$.clarification', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.clarification'), '$.proposal', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.proposal'))");
       updateParams.push(JSON.stringify(metadata));
     }
     
@@ -308,9 +309,12 @@ export async function PUT(
       UPDATE tasks 
       SET ${fieldsToUpdate.join(', ')}
       WHERE id = ? AND workspace_id = ?
+      ${normalizedStatus && ['in_progress', 'review', 'quality_review', 'done'].includes(normalizedStatus) ? `AND ${CLARIFICATION_READY_SQL}` : ''}
     `);
     
-    stmt.run(...updateParams);
+    if (stmt.run(...updateParams).changes === 0) {
+      return NextResponse.json({ error: 'Task changed or clarification is pending.' }, { status: 409 });
+    }
     
     // Track changes and log activities
     const changes: string[] = [];
