@@ -416,6 +416,83 @@ describe('deferred task completion reconciliation', () => {
   })
 })
 
+describe('external ownership during deferred completion reconciliation', () => {
+  beforeEach(() => {
+    mockDbState.db = new Database(':memory:')
+    mockDbState.db.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY, title TEXT, assigned_to TEXT, metadata TEXT,
+        workspace_id INTEGER, project_id INTEGER, project_ticket_no INTEGER,
+        status TEXT, updated_at INTEGER, outcome TEXT, resolution TEXT
+      );
+      CREATE TABLE workspaces (id INTEGER, isolation TEXT);
+      CREATE TABLE projects (id INTEGER, ticket_prefix TEXT, workspace_id INTEGER);
+      CREATE TABLE comments (task_id INTEGER, author TEXT, content TEXT, created_at INTEGER, workspace_id INTEGER);
+      INSERT INTO workspaces VALUES (1, 'shared');
+    `)
+    const insert = mockDbState.db.prepare(`
+      INSERT INTO tasks (id, title, assigned_to, metadata, workspace_id, status, updated_at)
+      VALUES (?, ?, 'agent-one', ?, 1, 'in_progress', ?)
+    `)
+    insert.run(1, 'External task', JSON.stringify({
+      async_state: 'pending', dispatch_run_id: 'run-external',
+      proposal: { execution_owner: 'external_orchestrator' },
+    }), 1)
+    insert.run(2, 'Ordinary task', JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-ordinary' }), 2)
+    mockDbState.broadcast.mockClear()
+    mockDbState.logActivity.mockClear()
+  })
+
+  afterEach(() => {
+    mockDbState.db?.close()
+    mockDbState.db = null
+  })
+
+  it('excludes external pending runs before the limit while reconciling ordinary runs', async () => {
+    const db = mockDbState.db!
+    const externalBefore = db.prepare('SELECT * FROM tasks WHERE id = 1').get()
+    const waitForRun = vi.fn(async () => ({ complete: true, text: 'Ordinary run finished.' }))
+
+    const result = await reconcileDeferredTaskCompletions({ workspaceId: 1, limit: 1, waitForRun })
+
+    expect(result).toMatchObject({ checked: 1, promoted: 1 })
+    expect(waitForRun).toHaveBeenCalledExactlyOnceWith('run-ordinary')
+    expect(db.prepare('SELECT * FROM tasks WHERE id = 1').get()).toEqual(externalBefore)
+    expect(db.prepare('SELECT status, outcome, resolution, metadata FROM tasks WHERE id = 2').get()).toMatchObject({
+      status: 'review', outcome: 'success', resolution: 'Ordinary run finished.',
+      metadata: expect.stringContaining('"async_state":"completed"'),
+    })
+    expect(db.prepare('SELECT task_id, content FROM comments').all()).toEqual([{ task_id: 2, content: 'Ordinary run finished.' }])
+    expect(mockDbState.broadcast.mock.calls.map(([, task]) => task.id)).toEqual([2, 2])
+    expect(mockDbState.logActivity.mock.calls.map(([, , taskId]) => taskId)).toEqual([2])
+
+    expect(await reconcileDeferredTaskCompletions({ workspaceId: 1, taskId: 1, waitForRun }))
+      .toMatchObject({ checked: 0, promoted: 0 })
+    expect(waitForRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not promote or emit when a selected run becomes externally owned while waiting', async () => {
+    const db = mockDbState.db!
+    let externalAfterTransfer: unknown
+    const waitForRun = vi.fn(async () => {
+      db.prepare('UPDATE tasks SET metadata = ? WHERE id = 2').run(JSON.stringify({
+        async_state: 'pending', dispatch_run_id: 'run-ordinary',
+        proposal: { execution_owner: 'external_orchestrator' },
+      }))
+      externalAfterTransfer = db.prepare('SELECT * FROM tasks WHERE id = 2').get()
+      return { complete: true, text: 'Must stay under external ownership.' }
+    })
+
+    const result = await reconcileDeferredTaskCompletions({ workspaceId: 1, taskId: 2, waitForRun })
+
+    expect(result).toMatchObject({ checked: 1, promoted: 0 })
+    expect(db.prepare('SELECT * FROM tasks WHERE id = 2').get()).toEqual(externalAfterTransfer)
+    expect(db.prepare('SELECT * FROM comments').all()).toEqual([])
+    expect(mockDbState.broadcast).not.toHaveBeenCalled()
+    expect(mockDbState.logActivity).not.toHaveBeenCalled()
+  })
+})
+
 describe('existing-session deferred dispatch', () => {
   beforeEach(() => {
     mockDbState.tasks = []

@@ -537,6 +537,7 @@ export async function reconcileDeferredTaskCompletions(options: {
       AND t.metadata IS NOT NULL
       AND t.metadata LIKE '%"async_state"%'
       AND t.metadata LIKE '%"pending"%'
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
   `
   if (options.taskId !== undefined) {
     query += ' AND t.id = ?'
@@ -591,6 +592,7 @@ export async function reconcileDeferredTaskCompletions(options: {
       WHERE id = ?
         AND workspace_id = ?
         AND status = 'in_progress'
+        AND ${INTERNAL_EXECUTION_SQL}
     `).run(truncated, JSON.stringify(nextMetadata), now, task.id, task.workspace_id)
 
     if (update.changes === 0) continue
