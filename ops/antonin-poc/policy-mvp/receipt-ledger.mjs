@@ -11,7 +11,7 @@ import path from "node:path";
 
 import { resolveExternalStateDirectory } from "./lease-store.mjs";
 
-export const RECEIPT_SCHEMA_VERSION = "antonin-receipt-v1";
+export const RECEIPT_SCHEMA_VERSION = "antonin-receipt-v2";
 
 const RECEIPT_FIELDS_V0 = [
   "task_id",
@@ -39,6 +39,9 @@ const RECEIPT_FIELDS_V1 = [
   "quota_snapshot_hash",
 ];
 
+const PROPOSAL_RECEIPT_FIELDS = ["proposal_id", "route_forecast", "final_route"];
+const RECEIPT_FIELDS_V2 = [...RECEIPT_FIELDS_V1, ...PROPOSAL_RECEIPT_FIELDS];
+
 /**
  * §4.7 the migration hazard, stated as a data structure. `#readAndVerify` runs
  * over the *entire* file on every append and every verify, so a naive version
@@ -50,9 +53,8 @@ const RECEIPT_FIELDS_V1 = [
 const RECEIPT_SCHEMA_FIELDS = new Map([
   ["antonin-receipt-v0", new Set(RECEIPT_FIELDS_V0)],
   ["antonin-receipt-v1", new Set(RECEIPT_FIELDS_V1)],
+  ["antonin-receipt-v2", new Set(RECEIPT_FIELDS_V2)],
 ]);
-
-const RECEIPT_FIELDS = RECEIPT_SCHEMA_FIELDS.get(RECEIPT_SCHEMA_VERSION);
 
 const RECORD_ENVELOPE_FIELDS = [
   "schema_version",
@@ -160,6 +162,24 @@ function assertSha256(value, field) {
   }
 }
 
+// These are audit descriptors, never the surrounding proposal object. Strict
+// nested fields prevent raw context/objective/rationale from entering a ledger.
+export function assertRouteDescriptor(value, field = "route") {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`invalid receipt field: ${field}`);
+  }
+  assertExactFields(value, new Set(["runtime", "model", "reason"]));
+  if (!["local", "codex", "claude"].includes(value.runtime)) {
+    throw new TypeError(`invalid receipt field: ${field}.runtime`);
+  }
+  assertBoundedString(value.reason, `${field}.reason`, 500);
+  if (!value.reason.trim()) throw new TypeError(`invalid receipt field: ${field}.reason`);
+  if (Object.hasOwn(value, "model")) {
+    assertBoundedString(value.model, `${field}.model`, 200);
+    if (!value.model.trim()) throw new TypeError(`invalid receipt field: ${field}.model`);
+  }
+}
+
 function assertReceiptValues(receipt, schemaVersion = RECEIPT_SCHEMA_VERSION) {
   assertBoundedString(receipt.task_id, "task_id", 256);
   if (receipt.task_version !== null) {
@@ -201,6 +221,11 @@ function assertReceiptValues(receipt, schemaVersion = RECEIPT_SCHEMA_VERSION) {
   }
   assertBoundedString(receipt.route_chain, "route_chain", 512);
   assertSha256(receipt.quota_snapshot_hash, "quota_snapshot_hash");
+  if (schemaVersion !== "antonin-receipt-v2") return;
+  assertNonNegativeInteger(receipt.proposal_id, "proposal_id");
+  if (receipt.proposal_id === 0) throw new TypeError("invalid receipt field: proposal_id");
+  if (receipt.route_forecast !== null) assertRouteDescriptor(receipt.route_forecast, "route_forecast");
+  assertRouteDescriptor(receipt.final_route, "final_route");
 }
 
 /**
@@ -211,6 +236,9 @@ function assertReceiptValues(receipt, schemaVersion = RECEIPT_SCHEMA_VERSION) {
  * evidence. A half-filled receipt is neither version and is refused.
  */
 function schemaVersionForInput(receipt) {
+  if (PROPOSAL_RECEIPT_FIELDS.some((field) => Object.hasOwn(receipt, field))) {
+    return "antonin-receipt-v2";
+  }
   const additions = RECEIPT_FIELDS_V1.filter(
     (field) => !RECEIPT_FIELDS_V0.includes(field),
   );

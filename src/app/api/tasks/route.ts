@@ -60,9 +60,17 @@ function hasAegisApproval(db: ReturnType<typeof getDatabase>, taskId: number, wo
   return review?.status === 'approved'
 }
 
+function parseCandidateInteger(raw: string | null, fallback: number): number | null {
+  if (raw === null) return fallback
+  if (!/^\d+$/.test(raw)) return null
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
 /**
  * GET /api/tasks - List all tasks with optional filtering
  * Query params: status, assigned_to, priority, project_id, limit, offset
+ * proposal_candidate=1 uses an ascending (updated_since, after_id) cursor instead of offset.
  */
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer');
@@ -80,8 +88,19 @@ export async function GET(request: NextRequest) {
     const assigned_to = searchParams.get('assigned_to');
     const priority = searchParams.get('priority');
     const projectIdParam = Number.parseInt(searchParams.get('project_id') || '', 10);
-    const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200);
+    let limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200);
     const offset = parseInt(searchParams.get('offset') || '0');
+    let candidateCursor: { updatedAt: number; id: number } | null = null;
+    if (searchParams.get('proposal_candidate') === '1') {
+      const updatedAt = parseCandidateInteger(searchParams.get('updated_since'), 0);
+      const id = parseCandidateInteger(searchParams.get('after_id'), 0);
+      const candidateLimit = parseCandidateInteger(searchParams.get('limit'), 50);
+      if (updatedAt === null || id === null || candidateLimit === null || candidateLimit === 0) {
+        return NextResponse.json({ error: 'Invalid proposal candidate cursor or limit' }, { status: 400 });
+      }
+      candidateCursor = { updatedAt, id };
+      limit = Math.min(candidateLimit, 200);
+    }
 
     try {
       await reconcileDeferredTaskCompletions({ workspaceId, limit: 5 })
@@ -128,14 +147,27 @@ export async function GET(request: NextRequest) {
       params.push(projectIdParam);
     }
     
-    query += ' ORDER BY t.created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    if (candidateCursor) {
+      query += ` AND t.status IN ('done','failed','awaiting_owner','review','quality_review')
+        AND (t.updated_at > ? OR (t.updated_at = ? AND t.id > ?))
+        ORDER BY t.updated_at ASC, t.id ASC LIMIT ?`;
+      params.push(candidateCursor.updatedAt, candidateCursor.updatedAt, candidateCursor.id, limit);
+    } else {
+      query += ' ORDER BY t.created_at DESC LIMIT ? OFFSET ?';
+      params.push(limit, offset);
+    }
     
     const stmt = db.prepare(query);
     const tasks = stmt.all(...params) as Task[];
     
     // Parse JSON fields
     const tasksWithParsedData = tasks.map(mapTaskRow);
+
+    if (candidateCursor) {
+      const lastTask = tasks[tasks.length - 1];
+      const nextCursor = lastTask ? { updatedAt: lastTask.updated_at, id: lastTask.id } : candidateCursor;
+      return NextResponse.json({ tasks: tasksWithParsedData, nextCursor, limit });
+    }
     
     // Get total count for pagination
     let countQuery = 'SELECT COUNT(*) as total FROM tasks WHERE workspace_id = ?';
@@ -209,6 +241,9 @@ export async function POST(request: NextRequest) {
       tags = [],
       metadata = {}
     } = body;
+    if ('clarification' in metadata) {
+      return NextResponse.json({ error: 'Utilisez /api/tasks/[id]/clarification pour créer un cadrage.' }, { status: 400 });
+    }
 
     // Auto-route unassigned tasks to the configured coordinator agent, if any
     // (issue #663). Opt-in via MC_COORDINATOR_AGENT; when unset, tasks created
@@ -400,6 +435,10 @@ export async function PUT(request: NextRequest) {
       for (const task of tasksToUpdate) {
         const oldTask = db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').get(task.id, workspaceId) as Task;
         if (!oldTask) continue;
+        const metadata = oldTask.metadata ? JSON.parse(oldTask.metadata) : {};
+        if (metadata.clarification?.state === 'pending' && ['in_progress', 'review', 'quality_review', 'done'].includes(task.status)) {
+          throw new Error(`Le cadrage doit être validé avant exécution (task ${task.id}).`);
+        }
 
         if (task.status === 'done' && !hasAegisApproval(db, task.id, workspaceId)) {
           throw new Error(`Aegis approval required for task ${task.id}`)
@@ -448,6 +487,9 @@ export async function PUT(request: NextRequest) {
   } catch (error) {
     logger.error({ err: error }, 'PUT /api/tasks error');
     const message = error instanceof Error ? error.message : 'Failed to update tasks'
+    if (message.includes('Le cadrage doit être validé')) {
+      return NextResponse.json({ error: message }, { status: 409 });
+    }
     if (message.includes('Aegis approval required')) {
       return NextResponse.json({ error: message }, { status: 403 });
     }

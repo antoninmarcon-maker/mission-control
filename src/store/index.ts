@@ -4,10 +4,35 @@ import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import { apiFetch } from '@/lib/api-client'
 import { MODEL_CATALOG } from '@/lib/models'
+import type { TaskProposal } from '@/lib/task-proposals'
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue | undefined }
 type DashboardLayoutUpdater = string[] | null | ((current: string[] | null) => string[] | null)
+
+function proposalScope(user: CurrentUser | null) {
+  return `${user?.tenant_id}:${user?.workspace_id}:${user?.id}`
+}
+
+// The rail and SSE share a reload, but each owns its lifetime. A response may
+// publish only while a caller is alive and no newer event/mutation supersedes it.
+let proposalReload: {
+  version: number
+  scope: string
+  consumers: Set<AbortSignal>
+  promise: Promise<boolean>
+} | null = null
+
+function deduplicateProposals(proposals: TaskProposal[]) {
+  return [...new Map(proposals.map((proposal) => [proposal.id, proposal])).values()]
+}
+
+function upsertProposal(proposals: TaskProposal[], proposal: TaskProposal) {
+  const deduplicated = deduplicateProposals(proposals)
+  const index = deduplicated.findIndex((current) => current.id === proposal.id)
+  if (index === -1) return [proposal, ...deduplicated]
+  return deduplicated.map((current) => current.id === proposal.id ? proposal : current)
+}
 
 // Enhanced types for Mission Control
 export interface Session {
@@ -423,6 +448,16 @@ interface MissionControlStore {
   updateTask: (taskId: number, updates: Partial<Task>) => void
   deleteTask: (taskId: number) => void
 
+  // One-click task proposal authorization queue
+  proposals: TaskProposal[]
+  proposalVersion: number
+  invalidateProposalReloads: () => void
+  reloadProposals: (signal: AbortSignal) => Promise<boolean>
+  setProposals: (proposals: TaskProposal[]) => void
+  addProposal: (proposal: TaskProposal) => void
+  updateProposal: (proposal: TaskProposal) => void
+  removeProposal: (proposalId: number) => void
+
   // Mission Control Phase 2 - Agents
   agents: Agent[]
   selectedAgent: Agent | null
@@ -818,7 +853,12 @@ export const useMissionControl = create<MissionControlStore>()(
 
     // Auth
     currentUser: null,
-    setCurrentUser: (user) => set({ currentUser: user }),
+    setCurrentUser: (user) => set((state) => ({
+      currentUser: user,
+      ...(proposalScope(user) !== proposalScope(state.currentUser)
+        ? { proposals: [], proposalVersion: state.proposalVersion + 1, tasks: [], selectedTask: null }
+        : {}),
+    })),
 
     // Tenant / Organization context
     activeTenant: (() => {
@@ -1024,6 +1064,64 @@ export const useMissionControl = create<MissionControlStore>()(
         tasks: state.tasks.filter((task) => task.id !== taskId),
         selectedTask: state.selectedTask?.id === taskId ? null : state.selectedTask
       })),
+
+    // One-click task proposal authorization queue
+    proposals: [],
+    proposalVersion: 0,
+    invalidateProposalReloads: () => set((state) => ({ proposalVersion: state.proposalVersion + 1 })),
+    reloadProposals: (signal) => {
+      if (signal.aborted) return Promise.resolve(false)
+      const { proposalVersion: version, currentUser } = get()
+      const scope = proposalScope(currentUser)
+      if (proposalReload?.version === version && proposalReload.scope === scope
+        && [...proposalReload.consumers].some((consumer) => !consumer.aborted)) {
+        proposalReload.consumers.add(signal)
+        return proposalReload.promise
+      }
+      const request = { version, scope, consumers: new Set([signal]), promise: Promise.resolve(false) }
+      const isCurrent = () => proposalReload === request
+        && get().proposalVersion === version
+        && proposalScope(get().currentUser) === scope
+        && [...request.consumers].some((consumer) => !consumer.aborted)
+      const reloadSuperseded = () => {
+        // A local mutation can invalidate the last SSE snapshot without
+        // scheduling another event. Carry its live consumers into one fresh
+        // reload; a newer request, scope change or cleanup ends this obligation.
+        if (proposalReload !== request || proposalScope(get().currentUser) !== scope
+          || get().proposalVersion === version) return false
+        const consumers = [...request.consumers].filter((consumer) => !consumer.aborted)
+        if (consumers.length === 0) return false
+        return Promise.all(consumers.map((consumer) => get().reloadProposals(consumer)))
+          .then((results) => results.some(Boolean))
+      }
+      proposalReload = request
+      request.promise = apiFetch<{ proposals?: TaskProposal[] }>('/api/task-proposals?status=pending&limit=20')
+        .then((data) => {
+          if (!isCurrent()) return reloadSuperseded()
+          set({ proposals: deduplicateProposals(data.proposals ?? []) })
+          return true
+        }, (error: unknown) => {
+          if (!isCurrent()) return reloadSuperseded()
+          throw error
+        })
+        .finally(() => { if (proposalReload === request) proposalReload = null })
+      return request.promise
+    },
+    setProposals: (proposals) => set((state) => ({
+      proposals: deduplicateProposals(proposals), proposalVersion: state.proposalVersion + 1,
+    })),
+    addProposal: (proposal) => set((state) => ({
+      proposals: upsertProposal(state.proposals, proposal),
+      proposalVersion: state.proposalVersion + 1,
+    })),
+    updateProposal: (proposal) => set((state) => ({
+      proposals: upsertProposal(state.proposals, proposal),
+      proposalVersion: state.proposalVersion + 1,
+    })),
+    removeProposal: (proposalId) => set((state) => ({
+      proposals: state.proposals.filter((proposal) => proposal.id !== proposalId),
+      proposalVersion: state.proposalVersion + 1,
+    })),
 
     // Mission Control Phase 2 - Agents
     agents: [],

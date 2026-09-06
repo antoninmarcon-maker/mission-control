@@ -6,6 +6,9 @@ All notable changes to Mission Control are documented in this file.
 
 ## [Unreleased]
 
+- Mission Control now stores orchestrator proposals separately from tasks; a
+  human-only one-click acceptance creates exactly one orchestrator-owned task.
+
 ---
 
 ## [2.3.0] - 2026-07-25

@@ -4,6 +4,7 @@ import { requireRole } from '@/lib/auth'
 import { agentTaskLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { requireWorkspaceId } from '@/lib/enforcement/workspace-scope'
+import { CLARIFICATION_READY_SQL, clarificationPrompt } from '@/lib/task-clarification'
 
 type QueueReason = 'continue_current' | 'assigned' | 'at_capacity' | 'no_tasks_available'
 
@@ -17,10 +18,12 @@ function safeParseJson<T>(raw: string | null | undefined, fallback: T): T {
 }
 
 function mapTaskRow(task: any) {
+  const metadata = safeParseJson(task.metadata, {} as Record<string, unknown>)
   return {
     ...task,
     tags: safeParseJson(task.tags, [] as string[]),
-    metadata: safeParseJson(task.metadata, {} as Record<string, unknown>),
+    metadata,
+    clarification_prompt: clarificationPrompt(metadata ?? {}),
   }
 }
 
@@ -85,6 +88,7 @@ export async function GET(request: NextRequest) {
       SELECT *
       FROM tasks
       WHERE workspace_id = ? AND assigned_to = ? AND status = 'in_progress'
+        AND ${CLARIFICATION_READY_SQL}
       ORDER BY updated_at DESC
       LIMIT 1
     `).get(workspaceId, agent) as any | undefined
@@ -122,9 +126,11 @@ export async function GET(request: NextRequest) {
         WHERE workspace_id = ?
           AND status IN ('assigned', 'inbox')
           AND (assigned_to IS NULL OR assigned_to = ?)
+          AND ${CLARIFICATION_READY_SQL}
         ORDER BY ${priorityRankSql()} ASC, due_date ASC NULLS LAST, created_at ASC
         LIMIT 1
       )
+        AND ${CLARIFICATION_READY_SQL}
       RETURNING *
     `).get(agent, now, workspaceId, agent) as any | undefined
 

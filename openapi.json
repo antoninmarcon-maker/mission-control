@@ -98,6 +98,712 @@
     }
   ],
   "paths": {
+    "/api/tasks/{id}/proposal-audit": {
+      "get": {
+        "tags": ["Tasks"],
+        "summary": "Read minimal proposal routing audit",
+        "operationId": "getTaskProposalAudit",
+        "x-required-role": "operator",
+        "description": "Workspace-scoped operator readback, available to the original agent after reviewer reassignment. No assignee check applies to this minimal projection. One SQL read requires valid metadata, an object proposal, an exact integer proposal ID and text external_orchestrator ownership. Returns only proposal ID and validated routing descriptors, never task title, context, objective, rationale or other metadata. Responses are not cached.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } },
+          { "name": "proposal_id", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Minimal proposal audit",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskProposalAudit" } } }
+          },
+          "400": { "description": "Invalid task/proposal ID or missing workspace context." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "description": "No matching externally owned proposal audit in this workspace, or malformed/missing routing descriptors." }
+        }
+      }
+    },
+    "/api/tasks/{id}/clarification": {
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Prepare task clarification",
+        "description": "Requires operator. Agent-scoped keys may only prepare their own tasks. Creates pending clarification only before execution, blocks the clarification-ready dispatcher and refuses replacement of existing decisions.",
+        "x-required-role": "operator",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskClarificationQuestions"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Clarification recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskClarificationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ID, JSON, questions or answers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, foreign agent ownership or agent answering",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found in the workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale revision, existing clarification or task state does not allow the decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Mutation rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Answer task clarification as a human",
+        "description": "Requires a human operator. Agent identities including admin/global keys cannot answer. The pending revision must match and all questions must have one complete valid answer; answering releases the clarification-ready dispatcher.",
+        "x-required-role": "operator",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskClarificationAnswers"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Clarification recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskClarificationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ID, JSON, questions or answers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, foreign agent ownership or agent answering",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found in the workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale revision, existing clarification or task state does not allow the decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Mutation rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-proposals": {
+      "get": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "List workspace task proposals",
+        "description": "Requires viewer. Expires due pending rows and emits scoped invalidation events. Filtered results are ordered by creation time then ID descending; optional summary covers the entire workspace. Proposal event payloads exclude prose, source references and metadata.",
+        "x-required-role": "viewer",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "accepted",
+                "dismissed",
+                "expired"
+              ]
+            }
+          },
+          {
+            "name": "source_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "chat",
+                "event"
+              ]
+            }
+          },
+          {
+            "name": "source_ref",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50,
+              "description": "Values above 200 are capped at 200."
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "summary",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0",
+                "1"
+              ],
+              "description": "Include workspace lifecycle, duplicate, latency and routing metrics when 1."
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProposalList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON, proposal fields, ID, filters or non-UUID revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role; agent identities cannot accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored data invalid or transaction failed; no task launched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Ingest a proposal idempotently",
+        "description": "Requires operator. Agent-scoped credentials supply the authenticated orchestrator and creator. Human sessions use the configured coordinator and their authenticated user identity; X-Agent-Name attribution cannot override either field. Human ingestion without a coordinator and global API keys without authenticated agent credentials return 409, even when X-Agent-Name is supplied. A workspace-scoped idempotency collision returns the stored row unchanged and creates a compact audit record. No task is launched.",
+        "x-required-role": "operator",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskProposalInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProposalResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Proposal created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProposalResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON, proposal fields, ID, filters or non-UUID revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role; agent identities cannot accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Proposal or project not found in this workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale UUID revision, expired/non-pending proposal or unavailable orchestrator/project/linked task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Mutation rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored data invalid or transaction failed; no task launched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-proposals/{id}": {
+      "put": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Edit or dismiss a pending proposal",
+        "x-required-role": "operator",
+        "description": "Requires operator. Atomic workspace/status/revision compare-and-swap; due pending proposals expire before mutation. Returns 409 for a valid but stale UUID or non-pending state; malformed revisions return 400.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskProposalEdit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProposalResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON, proposal fields, ID, filters or non-UUID revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role; agent identities cannot accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Proposal or project not found in this workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale UUID revision, expired/non-pending proposal or unavailable orchestrator/project/linked task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Mutation rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored data invalid or transaction failed; no task launched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-proposals/{id}/accept": {
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Accept a proposal as a human operator",
+        "x-required-role": "operator",
+        "description": "Agent identities, including admin agents and global API keys, receive 403. An immediate transaction creates one assigned task owned by the stored orchestrator, records acceptance and audit, then emits compact proposal.accepted and task.created events. A retry of an accepted proposal returns its existing same-workspace task; a missing linked task returns 409. Routing remains the external orchestrator’s decision.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskProposalDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProposalAcceptance"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON, proposal fields, ID, filters or non-UUID revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role; agent identities cannot accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Proposal or project not found in this workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale UUID revision, expired/non-pending proposal or unavailable orchestrator/project/linked task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Mutation rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored data invalid or transaction failed; no task launched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/activities": {
       "get": {
         "tags": [
@@ -7834,6 +8540,7 @@
         ],
         "summary": "Update task",
         "operationId": "updateTask",
+        "description": "proposal_final_route atomically merges only proposal.final_route for an accepted, externally owned proposal while status is assigned or in_progress. Other lifecycle states freeze the route and return 409. The status, typed proposal ID, execution owner and authenticated non-admin agent assignment are rechecked in the SQL update; malformed or changed metadata returns 409. Cannot be combined with metadata. Cloud model may be omitted when the runner does not declare it.",
         "parameters": [
           {
             "name": "id",
@@ -7880,8 +8587,20 @@
                   },
                   "metadata": {
                     "type": "object"
+                  },
+                  "proposal_final_route": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["proposal_id", "runtime", "reason"],
+                    "properties": {
+                      "proposal_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                      "runtime": { "type": "string", "enum": ["local", "codex", "claude"] },
+                      "model": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "\\S" },
+                      "reason": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" }
+                    }
                   }
-                }
+                },
+                "not": { "required": ["metadata", "proposal_final_route"] }
               }
             }
           }
@@ -7901,6 +8620,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid update payload, including blank route descriptors or combining metadata with proposal_final_route."
+          },
+          "409": {
+            "description": "Proposal metadata is invalid, its typed identity or external ownership changed, the authenticated agent no longer owns the assignment, or clarification blocks the requested transition. No update was applied."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -11820,6 +12545,933 @@
       }
     },
     "schemas": {
+      "TaskProposalTask": {
+        "type": "object",
+        "description": "The stored task returned after acceptance or on retry. A new task is assigned; retries return its current lifecycle status and nullable database fields. Tags and metadata are parsed JSON.",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "status",
+          "priority",
+          "assigned_to",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "due_date",
+          "estimated_hours",
+          "actual_hours",
+          "tags",
+          "metadata",
+          "workspace_id",
+          "project_id",
+          "project_ticket_no",
+          "outcome",
+          "error_message",
+          "resolution",
+          "feedback_rating",
+          "feedback_notes",
+          "retry_count",
+          "completed_at",
+          "github_issue_number",
+          "github_repo",
+          "github_synced_at",
+          "github_branch",
+          "github_pr_number",
+          "github_pr_state",
+          "dispatch_attempts"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "backlog",
+              "inbox",
+              "assigned",
+              "awaiting_owner",
+              "in_progress",
+              "review",
+              "quality_review",
+              "done",
+              "failed"
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "urgent"
+            ]
+          },
+          "assigned_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "due_date": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Unix seconds, or null when no due date is set."
+          },
+          "estimated_hours": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "actual_hours": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "workspace_id": {
+            "type": "integer"
+          },
+          "project_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_ticket_no": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "success",
+              "failed",
+              "partial",
+              "abandoned",
+              null
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "feedback_rating": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "feedback_notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_count": {
+            "type": "integer"
+          },
+          "completed_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_issue_number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_repo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_synced_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_pr_number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "github_pr_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dispatch_attempts": {
+            "type": "integer"
+          }
+        }
+      },
+      "TaskClarificationQuestions": {
+        "type": "object",
+        "required": [
+          "questions"
+        ],
+        "properties": {
+          "questions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "prompt",
+                "multiple",
+                "options"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                },
+                "prompt": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1000
+                },
+                "multiple": {
+                  "type": "boolean"
+                },
+                "options": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "id",
+                      "label"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                      },
+                      "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 240
+                      },
+                      "recommended": {
+                        "type": "boolean"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "maxLength": 500
+                      }
+                    },
+                    "description": "A recommended option requires a nonempty reason; option IDs must be unique within each question."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Question IDs must be unique."
+      },
+      "TaskClarificationAnswers": {
+        "type": "object",
+        "required": [
+          "revision",
+          "answers"
+        ],
+        "properties": {
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "answers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "required": [
+                "questionId",
+                "selected",
+                "text"
+              ],
+              "properties": {
+                "questionId": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                },
+                "selected": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                  }
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 2000
+                }
+              }
+            }
+          }
+        },
+        "description": "Answer every question once with a valid selection or nonempty text. Multiple selections require a multiple-choice question."
+      },
+      "TaskClarificationResponse": {
+        "type": "object",
+        "required": [
+          "clarification"
+        ],
+        "properties": {
+          "clarification": {
+            "type": "object",
+            "required": [
+              "state",
+              "revision",
+              "questions",
+              "createdBy",
+              "createdAt"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "answered"
+                ]
+              },
+              "revision": {
+                "type": "string"
+              },
+              "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "prompt",
+                    "multiple",
+                    "options"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                    },
+                    "prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1000
+                    },
+                    "multiple": {
+                      "type": "boolean"
+                    },
+                    "options": {
+                      "type": "array",
+                      "minItems": 2,
+                      "maxItems": 8,
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "label"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                          },
+                          "label": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 240
+                          },
+                          "recommended": {
+                            "type": "boolean"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "maxLength": 500
+                          }
+                        },
+                        "description": "A recommended option requires a nonempty reason; option IDs must be unique within each question."
+                      }
+                    }
+                  }
+                }
+              },
+              "createdBy": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "integer"
+              },
+              "answers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "questionId",
+                    "selected",
+                    "text"
+                  ],
+                  "properties": {
+                    "questionId": {
+                      "type": "string",
+                      "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                    },
+                    "selected": {
+                      "type": "array",
+                      "maxItems": 8,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+                      }
+                    },
+                    "text": {
+                      "type": "string",
+                      "maxLength": 2000
+                    }
+                  }
+                }
+              },
+              "answeredBy": {
+                "type": "string"
+              },
+              "answeredAt": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "TaskProposalAuditRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runtime", "reason"],
+        "properties": {
+          "runtime": { "type": "string", "enum": ["local", "codex", "claude"] },
+          "model": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "\\S" },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" }
+        }
+      },
+      "TaskProposalAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["proposal"],
+        "properties": {
+          "proposal": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "route_forecast", "final_route"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+              "route_forecast": { "anyOf": [{ "$ref": "#/components/schemas/TaskProposalAuditRoute" }, { "type": "null" }] },
+              "final_route": { "$ref": "#/components/schemas/TaskProposalAuditRoute" }
+            }
+          }
+        }
+      },
+      "TaskProposalRouteForecast": {
+        "type": "object",
+        "required": [
+          "runtime",
+          "reason"
+        ],
+        "properties": {
+          "runtime": {
+            "type": "string",
+            "enum": [
+              "local",
+              "codex",
+              "claude"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      },
+      "TaskProposalInput": {
+        "type": "object",
+        "required": [
+          "sourceType",
+          "sourceRef",
+          "idempotencyKey",
+          "title",
+          "objective",
+          "context",
+          "rationale",
+          "risk"
+        ],
+        "properties": {
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "event"
+            ]
+          },
+          "sourceRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "context": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "risk": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "routeForecast": {
+            "$ref": "#/components/schemas/TaskProposalRouteForecast"
+          },
+          "projectId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true,
+            "default": {}
+          },
+          "expiresAt": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Unix seconds; due pending proposals expire before listing or a decision."
+          }
+        }
+      },
+      "TaskProposal": {
+        "type": "object",
+        "required": [
+          "sourceType",
+          "sourceRef",
+          "idempotencyKey",
+          "title",
+          "objective",
+          "context",
+          "rationale",
+          "risk",
+          "metadata",
+          "id",
+          "workspaceId",
+          "projectId",
+          "status",
+          "revision",
+          "orchestratorAgent",
+          "createdBy",
+          "acceptedBy",
+          "acceptedAt",
+          "dismissedBy",
+          "dismissedAt",
+          "dismissalReason",
+          "taskId",
+          "expiresAt",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "event"
+            ]
+          },
+          "sourceRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "context": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "risk": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "routeForecast": {
+            "$ref": "#/components/schemas/TaskProposalRouteForecast"
+          },
+          "projectId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true,
+            "default": {}
+          },
+          "expiresAt": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "workspaceId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "accepted",
+              "dismissed",
+              "expired"
+            ]
+          },
+          "revision": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orchestratorAgent": {
+            "type": "string",
+            "minLength": 1
+          },
+          "createdBy": {
+            "type": "string",
+            "minLength": 1
+          },
+          "acceptedBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "acceptedAt": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dismissedBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dismissedAt": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dismissalReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "taskId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "updatedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "TaskProposalEdit": {
+        "type": "object",
+        "required": [
+          "action",
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "edit",
+              "dismiss"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "context": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          },
+          "dismissalReason": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        },
+        "description": "Only title, objective and context are editable. A dismiss action records the optional reason; it does not change proposal content."
+      },
+      "TaskProposalDecision": {
+        "type": "object",
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskProposalSummary": {
+        "type": "object",
+        "required": [
+          "created",
+          "pending",
+          "accepted",
+          "dismissed",
+          "expired",
+          "duplicateSuppressed",
+          "averageDecisionLatencySeconds",
+          "routeChanges"
+        ],
+        "properties": {
+          "created": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "accepted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dismissed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expired": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duplicateSuppressed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "routeChanges": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "averageDecisionLatencySeconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Mean seconds from creation to acceptance, dismissal or scheduled expiry; null without decisions."
+          }
+        },
+        "description": "Whole-workspace metrics, independent of list filters/pagination. Created counts all stored proposals. Route changes compare forecast runtime to accepted task metadata.proposal.final_route.runtime; malformed task metadata is ignored."
+      },
+      "TaskProposalResponse": {
+        "type": "object",
+        "required": [
+          "proposal"
+        ],
+        "properties": {
+          "proposal": {
+            "$ref": "#/components/schemas/TaskProposal"
+          }
+        }
+      },
+      "TaskProposalList": {
+        "type": "object",
+        "required": [
+          "proposals",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "properties": {
+          "proposals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskProposal"
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "summary": {
+            "$ref": "#/components/schemas/TaskProposalSummary"
+          }
+        }
+      },
+      "TaskProposalAcceptance": {
+        "type": "object",
+        "required": [
+          "proposal",
+          "task"
+        ],
+        "properties": {
+          "proposal": {
+            "$ref": "#/components/schemas/TaskProposal"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskProposalTask"
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "required": [

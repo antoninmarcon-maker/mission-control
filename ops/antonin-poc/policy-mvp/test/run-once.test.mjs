@@ -24,7 +24,7 @@ import { MissionControlClient } from "../mc-client.mjs";
 import { OllamaClient } from "../ollama-client.mjs";
 import { QuotaStore } from "../quota-store.mjs";
 import { ReceiptLedger } from "../receipt-ledger.mjs";
-import { configFromEnvironment, processOne } from "../run-once.mjs";
+import { configFromEnvironment, processOne, runCommand } from "../run-once.mjs";
 
 const execFile = promisify(execFileCallback);
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -112,6 +112,75 @@ function queueResponse(task) {
   };
 }
 
+function proposalEnvironment(state) {
+  return {
+    ANTONIN_POLICY_STATE_DIR: state.stateDirectory,
+    MC_URL: "http://127.0.0.1:4318",
+    MC_API_KEY: "mc-proposal-secret",
+  };
+}
+
+function proposalTask(id, status, overrides = {}) {
+  return {
+    id,
+    updated_at: 1_788_560_000 + id,
+    status,
+    title: `Task ${id}`,
+    ...overrides,
+  };
+}
+
+function proposalDependencies({
+  cursor = { updatedAt: 1_788_560_000, id: 40 },
+  page,
+  createProposal,
+  forecastProposalRoute,
+  now,
+  sleep,
+} = {}) {
+  const calls = {
+    commits: [],
+    cursors: [],
+    proposals: [],
+    logs: [],
+    waits: [],
+  };
+  let clock = 0;
+  return {
+    calls,
+    dependencies: {
+      proposalCursorStore: {
+        async read() {
+          return cursor;
+        },
+        async commit(nextCursor) {
+          calls.commits.push(nextCursor);
+          return nextCursor;
+        },
+      },
+      missionControl: {
+        async listProposalCandidates(nextCursor) {
+          calls.cursors.push(nextCursor);
+          return page;
+        },
+        async createProposal(proposal) {
+          calls.proposals.push(proposal);
+          return createProposal(proposal);
+        },
+      },
+      forecastProposalRoute,
+      now: now ?? (() => clock),
+      sleep: sleep ?? (async (milliseconds) => {
+        calls.waits.push(milliseconds);
+        clock += milliseconds;
+      }),
+      log(entry) {
+        calls.logs.push(entry);
+      },
+    },
+  };
+}
+
 async function assertLeaseReleased(state, taskId = "42") {
   const store = new LeaseStore(state.stateDirectory, state.stateStoreOptions);
   await assert.rejects(
@@ -119,6 +188,402 @@ async function assertLeaseReleased(state, taskId = "42") {
     /lease is not current/,
   );
 }
+
+test("runCommand propose scans one bounded page sequentially and commits after every acknowledgement", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const page = {
+    tasks: [
+      proposalTask(41, "failed"),
+      proposalTask(42, "done", {
+        metadata: {
+          next_actions: [{
+            title: "Repair parser",
+            objective: "Repair the parser",
+            context: "The parser rejected a valid record.",
+            rationale: "A structured follow-up is required.",
+            risk: "medium",
+          }],
+        },
+      }),
+      proposalTask(43, "assigned"),
+      proposalTask(44, "awaiting_owner"),
+    ],
+    nextCursor: { updatedAt: 1_788_560_044, id: 44 },
+  };
+  const { calls, dependencies } = proposalDependencies({
+    page,
+    createProposal: async (proposal) => ({
+      proposal: { id: calls.proposals.length, revision: "ack" },
+      created: proposal.sourceRef !== "task:42",
+    }),
+    forecastProposalRoute: (proposal) =>
+      proposal.sourceRef === "task:41"
+        ? { runtime: "local", model: "qwen2.5-coder:7b", reason: "safe" }
+        : null,
+  });
+
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 4,
+    created: 2,
+    duplicates: 1,
+    skipped: 1,
+    cursor: { updatedAt: 1_788_560_044, id: 44 },
+  });
+  assert.deepEqual(calls.cursors, [{ updatedAt: 1_788_560_000, id: 40 }]);
+  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_044, id: 44 }]);
+  assert.equal(calls.proposals.length, 3);
+  assert.deepEqual(calls.proposals[0].routeForecast, {
+    runtime: "local",
+    model: "qwen2.5-coder:7b",
+    reason: "safe",
+  });
+  assert.equal(Object.hasOwn(calls.proposals[1], "routeForecast"), false);
+  assert.deepEqual(calls.logs, [
+    { event: "proposal_scan", taskIds: [41, 42, 43, 44], scanned: 4, created: 2, duplicates: 1, skipped: 1 },
+  ]);
+});
+
+test("runCommand propose does not commit a page when a proposal acknowledgement is rejected", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const oldCursor = { updatedAt: 1_788_560_000, id: 40 };
+  const { calls, dependencies } = proposalDependencies({
+    cursor: oldCursor,
+    page: {
+      tasks: [proposalTask(41, "failed")],
+      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+    },
+    createProposal: async () => {
+      throw new Error("proposal rejected");
+    },
+  });
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal rejected/,
+  );
+  assert.deepEqual(calls.commits, []);
+  assert.deepEqual(calls.cursors, [oldCursor]);
+});
+
+test("runCommand propose spaces every retried proposal POST and commits the full page once", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let clock = 0;
+  const postAttempts = [];
+  const waits = [];
+  const commits = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, options) => {
+    if (options.method === "GET") {
+      return new Response(JSON.stringify({
+        tasks: Array.from({ length: 61 }, (_, index) =>
+          proposalTask(index + 1, "failed"),
+        ),
+        nextCursor: { updatedAt: 1_788_560_061, id: 61 },
+      }), { status: 200 });
+    }
+    const body = JSON.parse(options.body);
+    postAttempts.push({ at: clock, body });
+    const attemptsForKey = postAttempts.filter(
+      (attempt) => attempt.body.idempotencyKey === body.idempotencyKey,
+    ).length;
+    if (attemptsForKey === 1) {
+      throw new Error("synthetic ambiguous transport failure");
+    }
+    return new Response(JSON.stringify({
+      proposal: { id: postAttempts.length, revision: "ack" },
+    }), { status: 201 });
+  };
+  const dependencies = {
+    missionControl: new MissionControlClient({
+      baseUrl: "http://127.0.0.1:4318",
+      apiKey: "proposal-rate-secret",
+    }),
+    proposalCursorStore: {
+      async read() {
+        return { updatedAt: 1_788_560_000, id: 40 };
+      },
+      async commit(cursor) {
+        commits.push(cursor);
+        return cursor;
+      },
+    },
+    now: () => clock,
+    sleep: async (milliseconds) => {
+      waits.push(milliseconds);
+      clock += milliseconds;
+    },
+  };
+
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.equal(postAttempts.length, 122);
+  assert.equal(waits.length, 121);
+  assert.ok(waits.every((milliseconds) => milliseconds > 1_000));
+  assert.ok(postAttempts.slice(1).every(
+    (attempt, index) => attempt.at - postAttempts[index].at >= 1_100,
+  ));
+  for (let index = 0; index < postAttempts.length; index += 2) {
+    assert.deepEqual(postAttempts[index + 1].body, postAttempts[index].body);
+  }
+  assert.deepEqual(commits, [{ updatedAt: 1_788_560_061, id: 61 }]);
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 61,
+    created: 61,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_061, id: 61 },
+  });
+});
+
+test("runCommand propose leaves its cursor unchanged when the retry gate fails", async (t) => {
+  const state = await temporaryPolicyState(t);
+  let clock = 0;
+  const commits = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, options) => {
+    if (options.method === "GET") {
+      return new Response(JSON.stringify({
+        tasks: [proposalTask(41, "failed")],
+        nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+      }), { status: 200 });
+    }
+    throw new Error("synthetic ambiguous transport failure");
+  };
+  const dependencies = {
+    missionControl: new MissionControlClient({
+      baseUrl: "http://127.0.0.1:4318",
+      apiKey: "proposal-rate-secret",
+    }),
+    proposalCursorStore: {
+      async read() {
+        return { updatedAt: 1_788_560_000, id: 40 };
+      },
+      async commit(cursor) {
+        commits.push(cursor);
+        return cursor;
+      },
+    },
+    now: () => clock,
+    sleep: async () => {
+      throw new Error("proposal gate unavailable");
+    },
+  };
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal gate unavailable/,
+  );
+  assert.deepEqual(commits, []);
+});
+
+test("runCommand propose retries an incomplete page with the same proposal body and commits only after acknowledgements", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const oldCursor = { updatedAt: 1_788_560_000, id: 40 };
+  const nextCursor = { updatedAt: 1_788_560_042, id: 42 };
+  const posted = [];
+  const commits = [];
+  let cursor = oldCursor;
+  let postCount = 0;
+  let clock = 0;
+  const dependencies = {
+    proposalCursorStore: {
+      async read() {
+        return cursor;
+      },
+      async commit(next) {
+        commits.push(next);
+        cursor = next;
+        return next;
+      },
+    },
+    missionControl: {
+      async listProposalCandidates(receivedCursor) {
+        assert.deepEqual(receivedCursor, oldCursor);
+        return {
+          tasks: [proposalTask(41, "failed"), proposalTask(42, "awaiting_owner")],
+          nextCursor,
+        };
+      },
+      async createProposal(proposal) {
+        posted.push(proposal);
+        postCount += 1;
+        if (postCount === 2) throw new Error("proposal post rejected");
+        return {
+          proposal: { id: postCount, revision: "ack" },
+          created: postCount !== 3,
+        };
+      },
+    },
+    now: () => clock,
+    sleep: async (milliseconds) => {
+      clock += milliseconds;
+    },
+  };
+
+  await assert.rejects(
+    runCommand("propose", proposalEnvironment(state), dependencies),
+    /proposal post rejected/,
+  );
+  assert.deepEqual(commits, []);
+
+  assert.deepEqual(
+    await runCommand("propose", proposalEnvironment(state), dependencies),
+    {
+      outcome: "proposals_scanned",
+      scanned: 2,
+      created: 1,
+      duplicates: 1,
+      skipped: 0,
+      cursor: nextCursor,
+    },
+  );
+  assert.deepEqual(posted[2], posted[0]);
+  assert.deepEqual(commits, [nextCursor]);
+});
+
+test("propose CLI writes only structured scan IDs and counts to stderr", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const apiKey = "proposal-cli-secret";
+  const baseUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.method === "GET") {
+      sendJson(response, 200, {
+        tasks: [proposalTask(41, "failed", { title: "Private task title" })],
+        nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+      });
+      return;
+    }
+    await readJson(request);
+    sendJson(response, 201, { proposal: { id: 1, revision: "ack" } });
+  });
+
+  const result = await execFile(process.execPath, [runOncePath, "propose"], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      ...proposalEnvironment(state),
+      MC_URL: baseUrl,
+      MC_API_KEY: apiKey,
+    },
+  });
+
+  assert.deepEqual(JSON.parse(result.stdout), {
+    outcome: "proposals_scanned",
+    scanned: 1,
+    created: 1,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_041, id: 41 },
+  });
+  assert.deepEqual(JSON.parse(result.stderr), {
+    event: "proposal_scan",
+    taskIds: [41],
+    scanned: 1,
+    created: 1,
+    duplicates: 0,
+    skipped: 0,
+  });
+  assert.equal(result.stdout.includes(apiKey), false);
+  assert.equal(result.stderr.includes(apiKey), false);
+  assert.equal(result.stderr.includes("Private task title"), false);
+});
+
+test("propose CLI redacts rejected scan details from stderr", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const apiKey = "proposal-cli-secret";
+  const baseUrl = await fakeHttpServer(t, (_request, response) => {
+    sendJson(response, 500, {
+      error: `Private task title and ${apiKey} must not be logged`,
+    });
+  });
+
+  await assert.rejects(
+    execFile(process.execPath, [runOncePath, "propose"], {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        ...proposalEnvironment(state),
+        MC_URL: baseUrl,
+        MC_API_KEY: apiKey,
+      },
+    }),
+    (error) => {
+      assert.equal(error.stdout, "");
+      assert.deepEqual(JSON.parse(error.stderr), { error: "proposal scan failed" });
+      assert.equal(error.stderr.includes(apiKey), false);
+      assert.equal(error.stderr.includes("Private task title"), false);
+      return true;
+    },
+  );
+});
+
+test("runCommand propose commits an empty page with zero counts", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const { calls, dependencies } = proposalDependencies({
+    page: {
+      tasks: [],
+      nextCursor: { updatedAt: 1_788_560_000, id: 40 },
+    },
+    createProposal: async () => {
+      throw new Error("empty pages must not emit proposals");
+    },
+  });
+
+  assert.deepEqual(
+    await runCommand("propose", proposalEnvironment(state), dependencies),
+    {
+      outcome: "proposals_scanned",
+      scanned: 0,
+      created: 0,
+      duplicates: 0,
+      skipped: 0,
+      cursor: { updatedAt: 1_788_560_000, id: 40 },
+    },
+  );
+  assert.deepEqual(calls.commits, [{ updatedAt: 1_788_560_000, id: 40 }]);
+});
+
+test("runCommand propose emits at most three candidates from one task", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const { calls, dependencies } = proposalDependencies({
+    page: {
+      tasks: [proposalTask(41, "done", {
+        metadata: {
+          next_actions: Array.from({ length: 4 }, (_, index) => ({
+            title: `Follow-up ${index + 1}`,
+            objective: `Complete follow-up ${index + 1}`,
+            context: `Context ${index + 1}`,
+            rationale: "Structured follow-up.",
+            risk: "medium",
+          })),
+        },
+      })],
+      nextCursor: { updatedAt: 1_788_560_041, id: 41 },
+    },
+    createProposal: async () => ({ proposal: { id: 1, revision: "ack" }, created: true }),
+  });
+
+  const result = await runCommand("propose", proposalEnvironment(state), dependencies);
+
+  assert.equal(calls.proposals.length, 3);
+  assert.deepEqual(result, {
+    outcome: "proposals_scanned",
+    scanned: 1,
+    created: 3,
+    duplicates: 0,
+    skipped: 0,
+    cursor: { updatedAt: 1_788_560_041, id: 41 },
+  });
+});
 
 test("Mission Control client uses the exact queue, task, comment, and token contracts", async (t) => {
   const apiKey = "mc-test-secret";
@@ -436,6 +901,53 @@ test("processOne exits cleanly when Mission Control has no queued task", async (
 
   assert.deepEqual(result, { outcome: "no_task", processed: 0 });
   assert.equal(requests, 1);
+});
+
+test("processOne sends the confirmed clarification from the queue to execution without unselected choices or receipt prose", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const confirmed = "## Cadrage validé\n\nQuel ordre ?\nOrdre alphabétique\nConserver les accents.";
+  let task = queuedTask({
+    status: "in_progress", assigned_to: "antonin-policy-engine",
+    clarification_prompt: confirmed,
+    metadata: { clarification: { state: "answered", questions: [{ options: [{ label: "UNSELECTED_SECRET" }] }] } },
+  });
+  let tokenRecord;
+  let executedPrompt;
+  const mcUrl = await fakeHttpServer(t, async (request, response) => {
+    if (request.url.startsWith("/api/tasks/queue?")) return sendJson(response, 200, queueResponse(task));
+    if (request.url.startsWith("/api/tokens?action=")) return sendJson(response, 200, { usage: tokenRecord ? [tokenRecord] : [], total: tokenRecord ? 1 : 0 });
+    if (request.url === "/api/tokens") {
+      tokenRecord = { id: "clarified-token", ...await readJson(request) };
+      return sendJson(response, 200, { success: true, record: tokenRecord });
+    }
+    if (request.method === "PUT") task = { ...task, ...await readJson(request) };
+    sendJson(response, 200, { task });
+  });
+  const localEndpoint = await fakeHttpServer(t, async (request, response) => {
+    executedPrompt = (await readJson(request)).messages[0].content;
+    sendJson(response, 200, { choices: [{ message: { content: "alpha\nbeta" } }], usage: { prompt_tokens: 19, completion_tokens: 5 } });
+  });
+  const result = await processOne(processConfig(state, { mcUrl, localEndpoint: `${localEndpoint}/v1` }));
+  assert.equal(result.outcome, "review");
+  assert.ok(executedPrompt.includes(confirmed));
+  assert.equal(executedPrompt.includes("UNSELECTED_SECRET"), false);
+  const receipt = await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8");
+  assert.equal(receipt.includes("Conserver les accents"), false);
+  assert.equal(receipt.includes("UNSELECTED_SECRET"), false);
+});
+
+test("MissionControlClient refuses pending or untransported confirmed clarification before any executor obtains it", async (t) => {
+  let task;
+  const mcUrl = await fakeHttpServer(t, (_request, response) => sendJson(response, 200, queueResponse(task)));
+  const client = new MissionControlClient({ baseUrl: mcUrl, apiKey: "test-key" });
+  for (const invalid of [
+    { metadata: { clarification: { state: "pending" } } },
+    { metadata: { clarification: { state: "answered" } } },
+    { metadata: { clarification: { state: "answered" } }, clarification_prompt: 42 },
+  ]) {
+    task = queuedTask(invalid);
+    await assert.rejects(client.claimOne("antonin-policy-engine"), /clarification/i);
+  }
 });
 
 test("processOne moves a policy-rejected task to awaiting_owner without calling Ollama", async (t) => {
@@ -2593,10 +3105,10 @@ const CLOUD_REFUSAL = `process.stdout.write(
 );
 `;
 
-async function ladderServers(t) {
+async function ladderServers(t, options = {}) {
   const mcRequests = [];
   const tokenRecords = [];
-  let taskState = { ...queuedTask() };
+  let taskState = queuedTask(options.task);
   const mcUrl = await fakeHttpServer(t, async (request, response) => {
     const body = request.method === "GET" ? null : await readJson(request);
     mcRequests.push({ method: request.method, url: request.url, body });
@@ -2618,18 +3130,256 @@ async function ladderServers(t) {
     if (request.method === "POST" && request.url === "/api/tokens") {
       const record = { id: `token-${tokenRecords.length + 1}`, ...body };
       tokenRecords.push(record);
+      if (options.changeRouteAfterTokens) taskState.metadata.proposal.final_route = { runtime: "claude", reason: "concurrent_route" };
       sendJson(response, 200, { success: true, record });
       return;
     }
+    if (request.method === "GET" && request.url === "/api/tasks/42/proposal-audit?proposal_id=12") {
+      await options.beforeAuditRead?.();
+      const proposal = taskState.metadata.proposal;
+      sendJson(response, 200, { proposal: { id: proposal.id, route_forecast: proposal.route_forecast ?? null, final_route: proposal.final_route } });
+      return;
+    }
+    if (options.agentScoped && taskState.assigned_to !== "antonin-policy-engine") {
+      sendJson(response, 403, { error: "agent cannot access another assignee's task" });
+      return;
+    }
     if (request.method === "GET" && request.url === "/api/tasks/42") {
+      if (taskState.status === "review") await options.beforeAuditRead?.();
       sendJson(response, 200, { task: taskState });
       return;
     }
-    taskState = { ...taskState, ...body };
+    if (body?.proposal_final_route) {
+      await options.beforeRoutePut?.();
+      if (options.rejectRoute) {
+        sendJson(response, 409, { error: "proposal route changed" });
+        return;
+      }
+      const { proposal_id, ...finalRoute } = body.proposal_final_route;
+      assert.equal(proposal_id, taskState.metadata.proposal.id);
+      taskState.metadata.concurrent = "preserved";
+      if (!options.ignoreRoute) taskState.metadata.proposal.final_route = finalRoute;
+    } else {
+      taskState = { ...taskState, ...body };
+    }
     sendJson(response, 200, { task: taskState });
   });
   return { mcRequests, mcUrl, tokenRecords, task: () => taskState };
 }
+
+const acceptedProposal = {
+  id: 12,
+  execution_owner: "external_orchestrator",
+  route_forecast: { runtime: "local", model: "qwen2.5-coder:7b", reason: "low-risk" },
+  context: "PRIVATE proposal context",
+  objective: "PRIVATE proposal objective",
+  rationale: "PRIVATE proposal rationale",
+};
+
+test("accepted proposal records each admitted route before execution and the Codex fallback in its receipt", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { task: { metadata: { proposal: structuredClone(acceptedProposal), other: 42 } } });
+  const codex = await mockCloudCli(t, `
+const response = await fetch(${JSON.stringify(servers.mcUrl + "/api/tasks/42")});
+const { task } = await response.json();
+if (task.metadata.proposal.final_route?.runtime !== "codex") process.exit(1);
+process.stdout.write("alpha\\nbeta");`);
+  const quota = new QuotaStore(state.stateDirectory, state.stateStoreOptions);
+  await quota.observe({ provider: "claude-code", plan: "max", window_id: "weekly", source: "refusal_observed", observed_at: Date.now(), remaining_fraction: 0, exhausted_until: Date.now() + 3_600_000 });
+  const result = await processOne({
+    ...processConfig(state, { mcUrl: servers.mcUrl }),
+    cloudRunners: { codex: { command: codex.command, args: codex.args } },
+  }, {
+    ollama: { async complete() {
+      assert.deepEqual(servers.task().metadata.proposal.final_route, { runtime: "local", model: "qwen2.5-coder:7b", reason: "first_rung" });
+      const error = new Error("local daemon unavailable");
+      error.failureKind = "local_daemon_unreachable";
+      throw error;
+    } },
+  });
+  assert.equal(result.outcome, "review");
+  assert.equal(await codex.calls(), 1);
+  const finalRoute = { runtime: "codex", reason: "next_cloud_rung" };
+  assert.deepEqual(servers.task().metadata.proposal, { ...acceptedProposal, final_route: finalRoute });
+  assert.equal(servers.task().metadata.other, 42);
+  assert.equal(servers.task().metadata.concurrent, "preserved");
+  assert.equal(servers.task().assigned_to, "poc-aegis-cloud");
+  const raw = await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8");
+  const record = JSON.parse(raw);
+  assert.equal(record.schema_version, "antonin-receipt-v2");
+  assert.equal(record.proposal_id, 12);
+  assert.deepEqual(record.route_forecast, acceptedProposal.route_forecast);
+  assert.deepEqual(record.final_route, finalRoute);
+  assert.equal(record.route, "codex/pro");
+  assert.equal(record.route_chain, "ollama/qwen2.5-coder:7b>codex/pro");
+  assert.equal(record.attempt, 2);
+  assert.match(record.input_hash, /^[a-f0-9]{64}$/);
+  assert.equal(record.output_hash, createHash("sha256").update("alpha\nbeta").digest("hex"));
+  assert.equal(raw.includes("PRIVATE"), false);
+  assert.equal(servers.tokenRecords.length, 1);
+  assert.equal((await new ReceiptLedger(state.stateDirectory, state.stateStoreOptions).verify()).records, 1);
+  await assertLeaseReleased(state);
+});
+
+for (const failure of ["rejectRoute", "ignoreRoute", "malformed"]) {
+  test(`proposal audit fails closed before provider execution: ${failure}`, async (t) => {
+    const state = await temporaryPolicyState(t);
+    const servers = await ladderServers(t, {
+      [failure]: true,
+      task: { metadata: failure === "malformed" ? [] : { proposal: structuredClone(acceptedProposal) } },
+    });
+    let calls = 0;
+    await assert.rejects(processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+      ollama: { async complete() { calls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+    }), /proposal|metadata/);
+    assert.equal(calls, 0);
+    assert.equal(servers.tokenRecords.length, 0);
+    await assert.rejects(readFile(path.join(state.stateDirectory, "receipts.jsonl")), { code: "ENOENT" });
+    await assertLeaseReleased(state);
+  });
+}
+
+test("proposal routing changed during completion requires reconciliation without rerunning the provider", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, {
+    task: { metadata: { proposal: structuredClone(acceptedProposal) } },
+    changeRouteAfterTokens: true,
+  });
+  let calls = 0;
+  const dependencies = { ollama: { async complete() { calls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } } };
+  const config = processConfig(state, { mcUrl: servers.mcUrl });
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation/);
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation/);
+  assert.equal(calls, 1);
+  assert.equal(servers.tokenRecords.length, 1);
+  await assert.rejects(readFile(path.join(state.stateDirectory, "receipts.jsonl")), { code: "ENOENT" });
+});
+
+test("an accepted proposal without a forecast audits the actual local route with a null forecast", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const { route_forecast: _forecast, ...proposal } = acceptedProposal;
+  const servers = await ladderServers(t, { task: { metadata: { proposal } } });
+  const result = await processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+    ollama: { async complete() { return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+  });
+  assert.equal(result.outcome, "review");
+  const record = JSON.parse(await readFile(path.join(state.stateDirectory, "receipts.jsonl"), "utf8"));
+  assert.equal(record.proposal_id, 12);
+  assert.equal(record.route_forecast, null);
+  assert.deepEqual(record.final_route, { runtime: "local", model: "qwen2.5-coder:7b", reason: "first_rung" });
+  assert.equal(Object.hasOwn(servers.task().metadata.proposal, "route_forecast"), false);
+  await assertLeaseReleased(state);
+});
+
+test("a pending receipt revalidates proposal routing even after task confirmation", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { task: { metadata: { proposal: structuredClone(acceptedProposal) } } });
+  let providerCalls = 0;
+  let appendCalls = 0;
+  const ledger = new ReceiptLedger(state.stateDirectory, state.stateStoreOptions);
+  const append = ledger.append.bind(ledger);
+  ledger.append = async (receipt) => {
+    appendCalls += 1;
+    if (appendCalls === 1) throw new Error("receipt temporarily unavailable");
+    return append(receipt);
+  };
+  const dependencies = {
+    receiptLedger: ledger,
+    ollama: { async complete() { providerCalls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+  };
+  const config = processConfig(state, { mcUrl: servers.mcUrl });
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation/);
+  const journal = JSON.parse(await readFile(path.join(state.stateDirectory, "completions.json"), "utf8"));
+  assert.equal(Object.values(journal.entries)[0].phases.task_confirmed, true);
+  assert.equal(Object.values(journal.entries)[0].phases.receipt_confirmed, false);
+  servers.task().metadata.proposal.final_route = { runtime: "codex", reason: "concurrent_route" };
+  await assert.rejects(processOne(config, dependencies), /completion pending reconciliation.*proposal routing/);
+  assert.equal(providerCalls, 1);
+  assert.equal(appendCalls, 1);
+  assert.equal(servers.tokenRecords.length, 1);
+  assert.equal((await ledger.verify()).records, 0);
+  servers.task().metadata.proposal.final_route = { runtime: "local", model: "qwen2.5-coder:7b", reason: "first_rung" };
+  assert.equal((await processOne(config, dependencies)).outcome, "review");
+  assert.equal(providerCalls, 1);
+  assert.equal((await ledger.verify()).records, 1);
+});
+
+test("an agent-scoped policy run completes its receipt after handing the task to a distinct reviewer", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { agentScoped: true, task: {
+    status: "in_progress", assigned_to: "antonin-policy-engine", metadata: { proposal: structuredClone(acceptedProposal) },
+  } });
+  const result = await processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+    ollama: { async complete() { return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+  });
+  assert.equal(result.outcome, "review");
+  assert.equal(servers.task().assigned_to, "poc-aegis-cloud");
+  assert.equal((await new ReceiptLedger(state.stateDirectory, state.stateStoreOptions).verify()).records, 1);
+  assert.equal(servers.mcRequests.filter((request) => request.url?.includes("proposal-audit")).length, 1);
+});
+
+for (const boundary of ["beforeRoutePut", "beforeAuditRead"]) {
+  for (const stale of [false, true]) {
+    test(`proposal network ${boundary} does not hold the global lease lock; stale=${stale}`, async (t) => {
+      const state = await temporaryPolicyState(t);
+      let instant = Date.now();
+      const options = { ...state.stateStoreOptions, now: () => instant, lockMaxAttempts: 2, lockRetryMs: 1 };
+      const leaseStore = new LeaseStore(state.stateDirectory, options);
+      const peerStore = new LeaseStore(state.stateDirectory, options);
+      let started;
+      const reached = new Promise((resolve) => { started = resolve; });
+      let release;
+      const suspended = new Promise((resolve) => { release = resolve; });
+      const servers = await ladderServers(t, {
+        task: { metadata: { proposal: structuredClone(acceptedProposal) } },
+        [boundary]: async () => { started(); await suspended; },
+      });
+      let calls = 0;
+      const processing = processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+        leaseStore,
+        ollama: { async complete() { calls += 1; return { text: "answer", inputTokens: 1, outputTokens: 1 }; } },
+      });
+      // Attach rejection handling while network work is deliberately suspended.
+      const settled = processing.then((value) => ({ value }), (error) => ({ error }));
+      try {
+        await Promise.race([reached, settled.then(() => { throw new Error("network boundary not reached"); })]);
+        const independent = await peerStore.acquire("independent", "peer", { ttlMs: 10000 });
+        assert.equal(independent.fencing_token, 1);
+        await peerStore.renew("independent", "peer", 1, 10000);
+        if (stale) {
+          instant += 1_000_000;
+          assert.equal((await peerStore.acquire("42", "new-owner", { ttlMs: 10000 })).fencing_token, 2);
+        }
+      } finally {
+        release();
+        await settled;
+      }
+      const outcome = await settled;
+      if (stale) {
+        assert.match(outcome.error?.message ?? "", /lease is not current/);
+        assert.equal(calls, boundary === "beforeRoutePut" ? 0 : 1);
+        assert.equal((await new ReceiptLedger(state.stateDirectory, state.stateStoreOptions).verify()).records, 0);
+      } else {
+        assert.equal(outcome.error, undefined);
+        assert.equal(outcome.value.outcome, "review");
+      }
+    });
+  }
+}
+
+test("a proposal forecast cannot override the current risk policy", async (t) => {
+  const state = await temporaryPolicyState(t);
+  const servers = await ladderServers(t, { task: { priority: "high", metadata: { proposal: structuredClone(acceptedProposal) } } });
+  let calls = 0;
+  const result = await processOne(processConfig(state, { mcUrl: servers.mcUrl }), {
+    ollama: { async complete() { calls += 1; throw new Error("must not execute"); } },
+  });
+  assert.equal(result.outcome, "awaiting_owner");
+  assert.equal(calls, 0);
+  assert.equal(servers.mcRequests.some((request) => request.body?.proposal_final_route), false);
+  assert.equal(Object.hasOwn(servers.task().metadata.proposal, "final_route"), false);
+  await assert.rejects(readFile(path.join(state.stateDirectory, "receipts.jsonl")), { code: "ENOENT" });
+});
 
 test("an unreachable local daemon falls back to a cloud rung and leaves exactly one completion", async (t) => {
   const state = await temporaryPolicyState(t);

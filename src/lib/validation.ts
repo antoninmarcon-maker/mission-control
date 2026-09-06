@@ -101,6 +101,15 @@ export const updateTaskSchema = z.object({
   completed_at: taskFields.completed_at.optional(),
   tags: taskFields.tags.optional(),
   metadata: taskFields.metadata.optional(),
+  proposal_final_route: z.object({
+    proposal_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    runtime: z.enum(['local', 'codex', 'claude']),
+    model: z.string().trim().min(1).max(200).optional(),
+    reason: z.string().trim().min(1).max(500),
+  }).strict().optional(),
+}).refine((value) => value.proposal_final_route === undefined || value.metadata === undefined, {
+  message: 'proposal_final_route cannot be combined with metadata',
+  path: ['proposal_final_route'],
 })
 
 export const createAgentSchema = z.object({

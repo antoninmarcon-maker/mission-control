@@ -193,6 +193,20 @@ Note: Moving a task to `done` via PUT requires an Aegis quality review approval.
 }
 ```
 
+### Task proposals — `/api/task-proposals`
+
+| Method | Min Role | Description |
+|--------|----------|-------------|
+| GET | viewer | List proposals. Filters: `status`, `source_type`, `source_ref`, `project_id`, `limit`, `offset`, and `summary=1`. |
+| POST | operator | Ingest one idempotent `TaskProposalInput`; this creates no runnable task. |
+
+The MCP server exposes `task_proposals_create` and `task_proposals_list`. Both tools use the same proposal contract as the API; there is deliberately no MCP acceptance tool. The CLI equivalents are `pnpm mc proposals list --status pending --source-type chat --json` and `pnpm mc proposals create --json-file /absolute/path/to/proposal.json`. The create command requires an absolute JSON file no larger than 64 KiB and rejects malformed or unknown fields before making a request.
+
+Create zero to three proposals only when each describes a concrete follow-up.
+Use sourceType=chat and a sourceRef containing the conversation and message IDs.
+Do not accept your own proposal. A human operator must use Validate and launch.
+The displayed route is a forecast; the external policy engine re-routes after approval.
+
 ### Skills — `/api/skills`
 
 | Method | Min Role | Description |

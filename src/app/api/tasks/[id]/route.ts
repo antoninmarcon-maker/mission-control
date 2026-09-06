@@ -12,6 +12,7 @@ import { syncTaskOutbound } from '@/lib/github-sync-engine';
 import { removeTaskFromGnap } from '@/lib/gnap-sync';
 import { config } from '@/lib/config';
 import { requireAgentTaskAccess, requireWorkspaceId } from '@/lib/enforcement/workspace-scope';
+import { CLARIFICATION_READY_SQL } from '@/lib/task-clarification';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -152,8 +153,25 @@ export async function PUT(
       retry_count,
       completed_at,
       tags,
-      metadata
+      metadata,
+      proposal_final_route
     } = body;
+    if (proposal_final_route !== undefined) {
+      let storedMetadata;
+      try { storedMetadata = JSON.parse(currentTask.metadata || 'null'); } catch { /* refused below */ }
+      if (
+        !['assigned', 'in_progress'].includes(currentTask.status) ||
+        storedMetadata === null || typeof storedMetadata !== 'object' || Array.isArray(storedMetadata) ||
+        storedMetadata.proposal?.id !== proposal_final_route.proposal_id ||
+        storedMetadata.proposal?.execution_owner !== 'external_orchestrator'
+      ) {
+        return NextResponse.json({ error: 'Proposal metadata changed or is not externally owned.' }, { status: 409 });
+      }
+    }
+    const currentMetadata = currentTask.metadata ? JSON.parse(currentTask.metadata) : {};
+    if (currentMetadata.clarification?.state === 'pending' && requestedStatus && ['in_progress', 'review', 'quality_review', 'done'].includes(requestedStatus)) {
+      return NextResponse.json({ error: 'Le cadrage doit être validé avant exécution.' }, { status: 409 });
+    }
     const normalizedStatus = normalizeTaskUpdateStatus({
       currentStatus: currentTask.status,
       requestedStatus,
@@ -283,13 +301,25 @@ export async function PUT(
       updateParams.push(JSON.stringify(tags));
     }
     if (metadata !== undefined) {
-      fieldsToUpdate.push('metadata = ?');
+      // Preserve human decisions and external execution ownership from the
+      // current DB row, even when an editor or worker sends stale metadata.
+      fieldsToUpdate.push("metadata = json_set(?, '$.clarification', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.clarification'), '$.proposal', json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.proposal'))");
       updateParams.push(JSON.stringify(metadata));
+    }
+    if (proposal_final_route !== undefined) {
+      const { proposal_id: _proposalId, ...finalRoute } = proposal_final_route;
+      fieldsToUpdate.push("metadata = json_set(metadata, '$.proposal.final_route', json(?))");
+      updateParams.push(JSON.stringify(finalRoute));
     }
     
     fieldsToUpdate.push('updated_at = ?');
     updateParams.push(now);
     updateParams.push(taskId, workspaceId);
+    if (proposal_final_route !== undefined) updateParams.push(proposal_final_route.proposal_id);
+    const routeAgentName = proposal_final_route !== undefined && auth.user.role !== 'admin'
+      ? auth.user.agent_name || null
+      : null;
+    if (routeAgentName !== null) updateParams.push(routeAgentName);
     
     if (fieldsToUpdate.length === 1) { // Only updated_at
       return NextResponse.json({
@@ -302,9 +332,22 @@ export async function PUT(
       UPDATE tasks 
       SET ${fieldsToUpdate.join(', ')}
       WHERE id = ? AND workspace_id = ?
+      ${proposal_final_route !== undefined ? `AND CASE WHEN json_valid(metadata) THEN
+        status IN ('assigned', 'in_progress')
+        AND json_type(metadata) = 'object'
+        AND json_type(metadata, '$.proposal') = 'object'
+        AND json_type(metadata, '$.proposal.id') = 'integer'
+        AND json_extract(metadata, '$.proposal.id') = ?
+        AND json_type(metadata, '$.proposal.execution_owner') = 'text'
+        AND json_extract(metadata, '$.proposal.execution_owner') = 'external_orchestrator'
+        ELSE 0 END` : ''}
+      ${routeAgentName !== null ? 'AND assigned_to = ?' : ''}
+      ${normalizedStatus && ['in_progress', 'review', 'quality_review', 'done'].includes(normalizedStatus) ? `AND ${CLARIFICATION_READY_SQL}` : ''}
     `);
     
-    stmt.run(...updateParams);
+    if (stmt.run(...updateParams).changes === 0) {
+      return NextResponse.json({ error: 'Task changed or clarification is pending.' }, { status: 409 });
+    }
     
     // Track changes and log activities
     const changes: string[] = [];

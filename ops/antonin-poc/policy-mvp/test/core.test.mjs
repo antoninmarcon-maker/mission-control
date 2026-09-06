@@ -24,6 +24,8 @@ import {
   classifyFailure,
   completionIdentityFields,
   evaluateTask,
+  forecastProposalRoute,
+  forecastRouteForProposal,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
@@ -78,6 +80,46 @@ test("policy routes a medium-priority simple local sort to Ollama and a distinct
   assert.equal(
     riskClassOfDecision({ status: "awaiting_owner" }),
     "sensitive",
+  );
+});
+
+test("proposal route forecast reflects the policy result without a provider guess", () => {
+  assert.deepEqual(
+    forecastProposalRoute({
+      title: "Simple local sort",
+      objective: "Sort harmless labels.",
+      context: "Routine mechanical cleanup.",
+      risk: "medium",
+    }),
+    {
+      runtime: "local",
+      model: "qwen2.5-coder:7b",
+      reason: "eligible_mechanical_task",
+    },
+  );
+  assert.equal(
+    forecastProposalRoute({
+      title: "Deploy preview",
+      objective: "Deploy the preview.",
+      context: "Routine deployment.",
+      risk: "medium",
+    }),
+    null,
+  );
+});
+
+test("forecastRouteForProposal is the public alias of the canonical forecaster", () => {
+  const proposal = {
+    title: "Simple local sort",
+    objective: "Sort harmless labels.",
+    context: "Routine mechanical cleanup.",
+    risk: "medium",
+  };
+
+  assert.equal(forecastRouteForProposal, forecastProposalRoute);
+  assert.deepEqual(
+    forecastRouteForProposal(proposal),
+    forecastProposalRoute(proposal),
   );
 });
 
@@ -419,6 +461,32 @@ function receipt(overrides = {}) {
   };
 }
 
+test("proposal receipts extend mixed legacy chains without carrying proposal prose", async (t) => {
+  const ledger = new ReceiptLedger(await temporaryStateDirectory(t));
+  await ledger.append(v0Receipt());
+  await ledger.append(receipt());
+  const audit = {
+    proposal_id: 12,
+    route_forecast: { runtime: "local", model: "qwen2.5-coder:7b", reason: "low-risk" },
+    final_route: { runtime: "codex", reason: "next_cloud_rung" },
+  };
+  const appended = await ledger.append(receipt(audit));
+  assert.equal(appended.schema_version, "antonin-receipt-v2");
+  assert.equal((await ledger.verify()).records, 3);
+  for (const invalid of [
+    { proposal_id: 0 },
+    { route_forecast: { ...audit.route_forecast, context: "private" } },
+    { final_route: { runtime: "codex", reason: "", objective: "private" } },
+    { final_route: { runtime: "unknown", reason: "rationale" } },
+    { final_route: { runtime: "local", model: "x".repeat(201), reason: "route" } },
+  ]) {
+    await assert.rejects(ledger.append(receipt({ ...audit, ...invalid })), /invalid|unsupported/);
+  }
+  await assert.rejects(ledger.append(receipt({ proposal_id: 12 })), /missing required field/);
+  await ledger.append(receipt({ ...audit, route_forecast: null }));
+  assert.equal((await ledger.verify()).records, 4);
+});
+
 test("receipt genesis append is canonical, hash-linked, compact, and mode 600", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   const ledger = new ReceiptLedger(stateDirectory, {
@@ -432,7 +500,7 @@ test("receipt genesis append is canonical, hash-linked, compact, and mode 600", 
     .update(canonicalWithoutHash)
     .digest("hex");
 
-  assert.equal(RECEIPT_SCHEMA_VERSION, "antonin-receipt-v1");
+  assert.equal(RECEIPT_SCHEMA_VERSION, "antonin-receipt-v2");
   assert.equal(record.previous_hash, null);
   assert.equal(record.record_hash, expectedHash);
   assert.equal((await stat(ledger.filePath)).mode & 0o777, 0o600);

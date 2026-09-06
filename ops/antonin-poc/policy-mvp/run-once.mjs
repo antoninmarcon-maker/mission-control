@@ -24,6 +24,7 @@ import {
   classifyFailure,
   completionIdentityFields,
   evaluateTask,
+  forecastProposalRoute,
   isFallbackEligible,
   percentile90,
   resolveNextAttempt,
@@ -47,7 +48,13 @@ import {
   resolveQuotaPolicy,
 } from "./quota-config.mjs";
 import { QuotaStore } from "./quota-store.mjs";
-import { ReceiptLedger } from "./receipt-ledger.mjs";
+import {
+  ReceiptLedger,
+  assertRouteDescriptor,
+  canonicalJson,
+} from "./receipt-ledger.mjs";
+import { ProposalCursorStore } from "./proposal-cursor-store.mjs";
+import { proposalCandidatesForTask } from "./proposal-engine.mjs";
 
 const DEFAULT_AGENT = "antonin-policy-engine";
 const DEFAULT_REVIEWER = "poc-aegis-cloud";
@@ -61,6 +68,7 @@ const MAX_RESOLUTION_LENGTH = 5_000;
 const DEFAULT_NETWORK_TIMEOUT_MS = 120_000;
 const NETWORK_LEASE_MARGIN_MS = 1_000;
 const MAX_ERROR_LENGTH = 320;
+const PROPOSAL_POST_INTERVAL_MS = 1_100;
 const COMPLETION_JOURNAL_VERSION = 1;
 const COMPLETION_METADATA_FIELDS = [
   "completion_id",
@@ -76,6 +84,9 @@ const STABLE_RECEIPT_FIELDS = [
   "input_hash",
   "output_hash",
   "outcome",
+  "proposal_id",
+  "route_forecast",
+  "final_route",
 ];
 
 class CompletionPendingError extends Error {
@@ -357,6 +368,8 @@ function localPrompt(task) {
     "",
     `Task title: ${String(task?.title ?? "")}`,
     `Task description: ${String(task?.description ?? "")}`,
+    ...(typeof task?.clarification_prompt === "string" && task.clarification_prompt
+      ? ["", task.clarification_prompt] : []),
   ].join("\n");
 }
 
@@ -389,6 +402,7 @@ function receiptInput({
     attempt: attempt.number,
     route_chain: attempt.routeChain,
     quota_snapshot_hash: attempt.quotaSnapshotHash,
+    ...(attempt.proposalAudit ?? {}),
   };
 }
 
@@ -520,10 +534,24 @@ function resolutionLimitError(provider) {
   return error;
 }
 
+function taskConfirmsProposalAudit(task, receipt) {
+  if (receipt.proposal_id === undefined) return true;
+  const proposal = task?.metadata?.proposal;
+  return proposal?.execution_owner === "external_orchestrator" &&
+    proposalAuditMatches(proposal, receipt);
+}
+
+function proposalAuditMatches(proposal, receipt) {
+  return proposal?.id === receipt.proposal_id &&
+    canonicalJson(proposal.route_forecast ?? null) === canonicalJson(receipt.route_forecast) &&
+    canonicalJson(proposal.final_route) === canonicalJson(receipt.final_route);
+}
+
 function taskConfirmsCompletion(task, entry) {
   const expectedPolicyMetadata = entry.task_update.metadata?.policy_mvp;
   const actualPolicyMetadata = task?.metadata?.policy_mvp;
   return (
+    taskConfirmsProposalAudit(task, entry.receipt) &&
     task?.status === entry.task_update.status &&
     task?.assigned_to === entry.task_update.assigned_to &&
     task?.resolution === entry.task_update.resolution &&
@@ -538,6 +566,9 @@ function taskConfirmsCompletion(task, entry) {
 }
 
 function taskUpdateWithFreshMetadata(entry, task) {
+  if (!taskConfirmsProposalAudit(task, entry.receipt)) {
+    throw new Error("Mission Control proposal routing changed during completion");
+  }
   const freshMetadata =
     task?.metadata !== null &&
     typeof task?.metadata === "object" &&
@@ -581,7 +612,7 @@ async function receiptAlreadyStored(receiptLedger, expectedReceipt) {
     if (line === "") continue;
     const record = JSON.parse(line);
     if (STABLE_RECEIPT_FIELDS.every(
-      (field) => record[field] === expectedReceipt[field],
+      (field) => canonicalJson(record[field]) === canonicalJson(expectedReceipt[field]),
     )) {
       return record;
     }
@@ -744,6 +775,17 @@ async function reconcileCompletion({
   }
 
   if (!current.phases.receipt_confirmed) {
+    if (current.receipt.proposal_id !== undefined) {
+      await renewForNetwork(leaseStore, current, recoveryLeaseTtlMs);
+      // Task confirmation can predate a crashed/failed receipt append. Its
+      // durable flag does not prove that the remote proposal is still current.
+      const proposal = await missionControl.getProposalAudit(current.task_api_id, current.receipt.proposal_id);
+      if (!proposalAuditMatches(proposal, current.receipt)) {
+        throw new Error("Mission Control proposal routing changed before receipt confirmation");
+      }
+    }
+    // Network work never holds the state-wide lock. Revalidate fencing after
+    // readback before touching the local ledger or confirming the journal.
     current = await withLocalCompletionGuard(leaseStore, current, async () => {
       let storedReceipt = await receiptAlreadyStored(
         receiptLedger,
@@ -1353,6 +1395,57 @@ async function runnerForRoute(route, normalized, dependencies) {
   });
 }
 
+async function persistProposalRoute({
+  task,
+  plan,
+  missionControl,
+  leaseStore,
+  lease,
+  owner,
+  recoveryLeaseTtlMs,
+}) {
+  const metadata = task.metadata;
+  if (metadata == null) return null;
+  if (typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new Error("invalid task metadata for proposal audit");
+  }
+  if (!Object.hasOwn(metadata, "proposal") || metadata.proposal === null) return null;
+  const proposal = metadata.proposal;
+  if (
+    typeof proposal !== "object" || Array.isArray(proposal) ||
+    !Number.isSafeInteger(proposal.id) || proposal.id <= 0 ||
+    proposal.execution_owner !== "external_orchestrator"
+  ) {
+    throw new Error("invalid externally owned proposal metadata");
+  }
+  const forecast = proposal.route_forecast ?? null;
+  if (forecast !== null) assertRouteDescriptor(forecast, "proposal.route_forecast");
+  const parsed = parseRoute(plan.route);
+  const finalRoute = {
+    runtime: parsed.provider === "ollama" ? "local" : parsed.provider === "claude-code" ? "claude" : "codex",
+    ...(parsed.provider === "ollama" ? { model: parsed.detail } : {}),
+    reason: plan.reasonCode,
+  };
+  assertRouteDescriptor(finalRoute, "proposal.final_route");
+  const leaseEntry = { task_id: String(task.id), owner, fencing_token: lease.fencing_token };
+  await renewForNetwork(leaseStore, leaseEntry, recoveryLeaseTtlMs);
+  const response = await missionControl.updateTask(task.id, {
+    proposal_final_route: { proposal_id: proposal.id, ...finalRoute },
+  });
+  return withLocalCompletionGuard(leaseStore, leaseEntry, () => {
+    const confirmed = response?.task?.metadata?.proposal;
+    if (
+      confirmed?.id !== proposal.id || confirmed?.execution_owner !== "external_orchestrator" ||
+      canonicalJson(confirmed.final_route) !== canonicalJson(finalRoute) ||
+      canonicalJson(confirmed.route_forecast ?? null) !== canonicalJson(forecast)
+    ) {
+      throw new Error("Mission Control did not confirm exact proposal routing metadata");
+    }
+    task.metadata = response.task.metadata;
+    return { proposal_id: proposal.id, route_forecast: forecast, final_route: finalRoute };
+  });
+}
+
 /**
  * §2.9 the passive sources, read once per invocation and only when Antonin has
  * turned them on. Their single job (§2.6) is to skip a provider we already
@@ -1767,6 +1860,18 @@ export async function processOne(config, dependencies = {}) {
         });
       }
 
+      // Audit writes are outside the provider fallback boundary: a refused or
+      // ambiguous acknowledgement must never spend a provider attempt.
+      let proposalAudit;
+      try {
+        proposalAudit = await persistProposalRoute({
+          task, plan, missionControl, leaseStore, lease,
+          owner: normalized.agent, recoveryLeaseTtlMs,
+        });
+      } catch (error) {
+        await releaseLeaseForCleanup(leaseStore, taskId, normalized.agent, lease.fencing_token);
+        throw new AttemptHandoffError(error);
+      }
       const provider = parseRoute(plan.route).provider;
       attempt = {
         number: plan.attempt,
@@ -1776,6 +1881,7 @@ export async function processOne(config, dependencies = {}) {
           plan.route,
         ]),
         quotaSnapshotHash: plan.snapshotId,
+        proposalAudit,
       };
       try {
         const runner = await runnerForRoute(plan.route, normalized, dependencies);
@@ -1913,7 +2019,114 @@ export async function processOne(config, dependencies = {}) {
   };
 }
 
-export async function runCommand(command, environment = process.env) {
+function proposalAcknowledgementCreated(acknowledgement) {
+  if (
+    acknowledgement === null ||
+    typeof acknowledgement !== "object" ||
+    Array.isArray(acknowledgement) ||
+    acknowledgement.proposal === null ||
+    typeof acknowledgement.proposal !== "object" ||
+    Array.isArray(acknowledgement.proposal) ||
+    typeof acknowledgement.created !== "boolean"
+  ) {
+    throw new Error("Mission Control returned an invalid proposal acknowledgement");
+  }
+  return acknowledgement.created;
+}
+
+function safeProposalForecast(proposal, config, forecaster) {
+  try {
+    return forecaster(proposal, {
+      localModel: config.localModel,
+      reviewer: config.reviewer,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function waitForProposalPostSlot(lastStartedAt, now, sleep) {
+  while (true) {
+    const startedAt = now();
+    if (
+      lastStartedAt === null ||
+      startedAt - lastStartedAt >= PROPOSAL_POST_INTERVAL_MS
+    ) {
+      return startedAt;
+    }
+    await sleep(PROPOSAL_POST_INTERVAL_MS - (startedAt - lastStartedAt));
+  }
+}
+
+export async function proposeOnce(config, dependencies = {}) {
+  const cursorStore =
+    dependencies.proposalCursorStore ??
+    new ProposalCursorStore(config.stateDirectory, config.stateStoreOptions);
+  const missionControl =
+    dependencies.missionControl ??
+    new MissionControlClient({ baseUrl: config.mcUrl, apiKey: config.mcApiKey });
+  const extractCandidates =
+    dependencies.proposalCandidatesForTask ?? proposalCandidatesForTask;
+  const forecast = dependencies.forecastProposalRoute ?? forecastProposalRoute;
+  const log = dependencies.log ?? (() => {});
+  const now = dependencies.now ?? Date.now;
+  const sleep = dependencies.sleep ?? ((milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let lastProposalPostStartedAt = null;
+  const beforeProposalAttempt = async () => {
+    lastProposalPostStartedAt = await waitForProposalPostSlot(
+      lastProposalPostStartedAt,
+      now,
+      sleep,
+    );
+  };
+  const cursor = await cursorStore.read();
+  const page = await missionControl.listProposalCandidates(cursor);
+  const counts = {
+    scanned: page.tasks.length,
+    created: 0,
+    duplicates: 0,
+    skipped: 0,
+  };
+
+  for (const task of page.tasks) {
+    const candidates = extractCandidates(task).slice(0, 3);
+    if (candidates.length === 0) {
+      counts.skipped += 1;
+      continue;
+    }
+
+    for (const candidate of candidates) {
+      const routeForecast = safeProposalForecast(candidate, config, forecast);
+      const proposal = {
+        ...candidate,
+        ...(routeForecast === null ? {} : { routeForecast }),
+        metadata: { source_task_id: task.id },
+      };
+      const created = proposalAcknowledgementCreated(
+        await missionControl.createProposal(proposal, { beforeAttempt: beforeProposalAttempt }),
+      );
+      if (created) counts.created += 1;
+      else counts.duplicates += 1;
+    }
+  }
+
+  const committedCursor = await cursorStore.commit(page.nextCursor);
+  log({
+    event: "proposal_scan",
+    taskIds: page.tasks
+      .map((task) => (Number.isSafeInteger(task?.id) ? task.id : null))
+      .filter((taskId) => taskId !== null),
+    ...counts,
+  });
+  return {
+    outcome: "proposals_scanned",
+    ...counts,
+    cursor: committedCursor,
+  };
+}
+
+export async function runCommand(command, environment = process.env, dependencies = {}) {
   const config = configFromEnvironment(environment);
   if (command === "status") {
     return {
@@ -1970,18 +2183,29 @@ export async function runCommand(command, environment = process.env) {
   if (command === "process") {
     return { command, ...(await processOne(config)) };
   }
+  if (command === "propose") {
+    return await proposeOnce(config, dependencies);
+  }
   throw new Error(
-    "usage: run-once.mjs process|status|quota-status|verify-ledger",
+    "usage: run-once.mjs process|propose|status|quota-status|verify-ledger",
   );
 }
 
 async function main() {
+  const command = process.argv[2];
   try {
-    const result = await runCommand(process.argv[2]);
+    const result = await runCommand(command, process.env, {
+      log: (entry) => process.stderr.write(`${JSON.stringify(entry)}\n`),
+    });
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     process.stderr.write(
-      `${JSON.stringify({ error: safeErrorMessage(error, process.env.MC_API_KEY ?? "") })}\n`,
+      `${JSON.stringify({
+        error:
+          command === "propose"
+            ? "proposal scan failed"
+            : safeErrorMessage(error, process.env.MC_API_KEY ?? ""),
+      })}\n`,
     );
     process.exitCode = 1;
   }

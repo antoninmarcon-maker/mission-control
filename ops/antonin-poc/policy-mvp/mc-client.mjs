@@ -1,4 +1,5 @@
 import { validateLoopbackHttpUrl } from "./policy-core.mjs";
+import { assertRouteDescriptor } from "./receipt-ledger.mjs";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -9,6 +10,7 @@ const TASK_UPDATE_FIELDS = new Set([
   "assigned_to",
   "resolution",
   "metadata",
+  "proposal_final_route",
   "error_message",
 ]);
 
@@ -22,6 +24,30 @@ function requirePositiveInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${name} must be a positive integer`);
   }
+}
+
+function requireProposalCursor(cursor) {
+  if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
+    throw new TypeError("proposal cursor must be an object");
+  }
+  for (const field of ["updatedAt", "id"]) {
+    if (!Number.isSafeInteger(cursor[field]) || cursor[field] < 0) {
+      throw new TypeError(`proposal cursor ${field} must be a non-negative safe integer`);
+    }
+  }
+  return cursor;
+}
+
+function isProposalCursor(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Number.isSafeInteger(value.updatedAt) &&
+    value.updatedAt >= 0 &&
+    Number.isSafeInteger(value.id) &&
+    value.id >= 0
+  );
 }
 
 async function readBoundedText(response, maximumBytes) {
@@ -148,6 +174,11 @@ export class MissionControlClient {
     if (typeof response.task !== "object" || Array.isArray(response.task)) {
       throw new Error("Mission Control queue returned an invalid task");
     }
+    const clarification = response.task.metadata?.clarification;
+    if (clarification?.state === "pending" || (clarification?.state === "answered" &&
+      (typeof response.task.clarification_prompt !== "string" || !response.task.clarification_prompt.trim()))) {
+      throw new Error("Mission Control queue clarification is not ready for execution");
+    }
     return response.task;
   }
 
@@ -159,6 +190,14 @@ export class MissionControlClient {
       if (!TASK_UPDATE_FIELDS.has(field)) {
         throw new TypeError(`unsupported task update field: ${field}`);
       }
+    }
+    if (update.proposal_final_route !== undefined) {
+      if (update.metadata !== undefined) {
+        throw new TypeError("proposal_final_route cannot be combined with metadata");
+      }
+      const { proposal_id: proposalId, ...route } = update.proposal_final_route;
+      requirePositiveInteger(proposalId, "proposal_id");
+      assertRouteDescriptor(route, "proposal_final_route");
     }
     const response = await this.#request(taskPath(taskId), {
       method: "PUT",
@@ -205,6 +244,16 @@ export class MissionControlClient {
         "Mission Control did not confirm completion metadata",
       );
     }
+    if (update.proposal_final_route !== undefined) {
+      const { proposal_id: proposalId, ...route } = update.proposal_final_route;
+      const proposal = response.task.metadata?.proposal;
+      if (
+        proposal?.id !== proposalId || proposal?.execution_owner !== "external_orchestrator" ||
+        !sameJsonValue(proposal.final_route, route)
+      ) {
+        throw mutationResponseError("Mission Control did not confirm proposal final route");
+      }
+    }
     return response;
   }
 
@@ -218,6 +267,20 @@ export class MissionControlClient {
       throw new Error("Mission Control returned an invalid task response");
     }
     return response.task;
+  }
+
+  async getProposalAudit(taskId, proposalId) {
+    requirePositiveInteger(proposalId, "proposal_id");
+    const response = await this.#request(taskPath(taskId, `/proposal-audit?proposal_id=${proposalId}`));
+    const proposal = response?.proposal;
+    if (proposal === null || typeof proposal !== "object" || Array.isArray(proposal) ||
+      proposal.id !== proposalId || !Object.hasOwn(proposal, "route_forecast") ||
+      Object.keys(proposal).some((key) => !["id", "route_forecast", "final_route"].includes(key))) {
+      throw new Error("Mission Control returned an invalid proposal audit");
+    }
+    if (proposal.route_forecast !== null) assertRouteDescriptor(proposal.route_forecast, "proposal.route_forecast");
+    assertRouteDescriptor(proposal.final_route, "proposal.final_route");
+    return proposal;
   }
 
   async addComment(taskId, content) {
@@ -276,6 +339,83 @@ export class MissionControlClient {
     );
   }
 
+  async listProposalCandidates(cursor) {
+    const { updatedAt, id } = requireProposalCursor(cursor);
+    const query = new URLSearchParams({
+      proposal_candidate: "1",
+      updated_since: String(updatedAt),
+      after_id: String(id),
+      limit: "200",
+    });
+    const response = await this.#request(`/api/tasks?${query}`);
+    if (
+      response === null ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      !Array.isArray(response.tasks) ||
+      !isProposalCursor(response.nextCursor)
+    ) {
+      throw new Error("Mission Control returned an invalid proposal candidate response");
+    }
+    return { tasks: response.tasks, nextCursor: response.nextCursor };
+  }
+
+  async createProposal(input, options = {}) {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("proposal input must be an object");
+    }
+    requireNonEmptyString(input.idempotencyKey, "proposal idempotencyKey");
+    if (
+      options.beforeAttempt !== undefined &&
+      typeof options.beforeAttempt !== "function"
+    ) {
+      throw new TypeError("proposal beforeAttempt must be a function");
+    }
+    const createAttempt = async () => {
+      if (options.beforeAttempt !== undefined) {
+        await options.beforeAttempt();
+      }
+      return this.#createProposal(input);
+    };
+
+    try {
+      return await createAttempt();
+    } catch (error) {
+      if (!(error instanceof MissionControlRequestError) || !error.ambiguous) {
+        throw error;
+      }
+      return createAttempt();
+    }
+  }
+
+  async #createProposal(input) {
+    const acknowledgement = await this.#request("/api/task-proposals", {
+      method: "POST",
+      body: input,
+      includeStatus: true,
+    });
+    const { data: response, status } = acknowledgement;
+    if (
+      response?.proposal === null ||
+      typeof response?.proposal !== "object" ||
+      Array.isArray(response.proposal) ||
+      !Number.isSafeInteger(response.proposal.id) ||
+      response.proposal.id <= 0 ||
+      typeof response.proposal.revision !== "string" ||
+      response.proposal.revision.trim() === ""
+    ) {
+      throw mutationResponseError(
+        "Mission Control returned an invalid proposal mutation response",
+      );
+    }
+    if (status !== 201 && status !== 200) {
+      throw mutationResponseError(
+        "Mission Control returned an invalid proposal acknowledgement status",
+      );
+    }
+    return { ...response, created: status === 201 };
+  }
+
   async #request(pathname, options = {}) {
     const url = new URL(pathname, this.baseUrl);
     const method = options.method ?? "GET";
@@ -304,7 +444,9 @@ export class MissionControlClient {
     }
 
     if (response.status === 204) {
-      return null;
+      return options.includeStatus === true
+        ? { data: null, status: response.status }
+        : null;
     }
 
     const maximumBytes = response.ok
@@ -337,6 +479,6 @@ export class MissionControlClient {
         { ambiguous: false, status: response.status },
       );
     }
-    return data;
+    return options.includeStatus === true ? { data, status: response.status } : data;
   }
 }

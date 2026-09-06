@@ -15,8 +15,12 @@ import { getAllGatewaySessions } from './sessions'
 import { parseJsonlTranscript, readSessionJsonl, type TranscriptMessage } from './transcript-parser'
 import { syncTaskOutbound } from './github-sync-engine'
 import { classifyModelProvider, getDispatchModelId, getModelByAlias } from './models'
+import { CLARIFICATION_READY_SQL, clarificationPrompt } from './task-clarification'
 import { getMiniMaxApiKey, resolveMiniMaxEndpoint } from './minimax'
 import type Database from 'better-sqlite3'
+
+// Accepted proposals use the external orchestrator's routing, lease and review policy.
+const INTERNAL_EXECUTION_SQL = "COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.proposal.execution_owner'), '') != 'external_orchestrator'"
 
 const AGENT_DISPATCH_ACCEPT_TIMEOUT_MS = 60_000
 
@@ -284,6 +288,8 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
   if (task.description) {
     lines.push('', task.description)
   }
+  const confirmedScope = clarificationPrompt(safeParseMetadata(task.metadata))
+  if (confirmedScope) lines.push('', confirmedScope)
 
   if (rejectionFeedback) {
     lines.push('', '## Previous Review Feedback', rejectionFeedback, '', 'Please address this feedback in your response.')
@@ -531,6 +537,7 @@ export async function reconcileDeferredTaskCompletions(options: {
       AND t.metadata IS NOT NULL
       AND t.metadata LIKE '%"async_state"%'
       AND t.metadata LIKE '%"pending"%'
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
   `
   if (options.taskId !== undefined) {
     query += ' AND t.id = ?'
@@ -585,6 +592,7 @@ export async function reconcileDeferredTaskCompletions(options: {
       WHERE id = ?
         AND workspace_id = ?
         AND status = 'in_progress'
+        AND ${INTERNAL_EXECUTION_SQL}
     `).run(truncated, JSON.stringify(nextMetadata), now, task.id, task.workspace_id)
 
     if (update.changes === 0) continue
@@ -1472,6 +1480,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'review'
       AND w.isolation = 'shared'
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
     ORDER BY t.updated_at ASC
     LIMIT 3
   `).all() as ReviewableTask[]
@@ -1656,6 +1665,7 @@ export async function requeueStaleTasks(): Promise<{ ok: boolean; message: strin
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'in_progress'
       AND t.updated_at < ?
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
   `).all(staleThreshold) as Array<{
     id: number; title: string; assigned_to: string | null; dispatch_attempts: number
     workspace_id: number; agent_status: string | null; agent_last_seen: number | null
@@ -1745,6 +1755,8 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
     WHERE t.status = 'assigned'
       AND w.isolation = 'shared'
       AND t.assigned_to IS NOT NULL
+      AND ${CLARIFICATION_READY_SQL.replaceAll('metadata', 't.metadata')}
+      AND ${INTERNAL_EXECUTION_SQL.replaceAll('metadata', 't.metadata')}
     ORDER BY
       CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       t.created_at ASC
@@ -1767,18 +1779,20 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
   for (const task of tasks) {
     // Atomically claim the task: only flip to in_progress if it is still
-    // 'assigned'. If two dispatchers race (e.g. concurrent scheduler ticks or
-    // multiple workers polling), exactly one UPDATE reports changes=1 and the
-    // loser skips this task — preventing double-dispatch (issue/PR #698).
+    // 'assigned' and clarification-ready. RETURNING captures metadata from the
+    // same atomic update, including human answers saved since the initial SELECT.
+    // Concurrent dispatchers receive no row if another worker claimed it first,
+    // preventing double-dispatch (issue/PR #698).
     const claim = db
-      .prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?")
-      .run('in_progress', now, task.id, task.workspace_id)
+      .prepare(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ? AND ${CLARIFICATION_READY_SQL} AND ${INTERNAL_EXECUTION_SQL} RETURNING metadata`)
+      .get('in_progress', now, task.id, task.workspace_id) as { metadata: string | null } | undefined
 
-    if (claim.changes === 0) {
+    if (!claim) {
       // Another dispatcher won the race (or the task was cancelled between
       // SELECT and UPDATE). Skip silently — no event, no activity, no work.
       continue
     }
+    task.metadata = claim.metadata
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
@@ -2162,6 +2176,8 @@ export async function autoRouteInboxTasks(): Promise<{ ok: boolean; message: str
     SELECT id, title, description, priority, tags, workspace_id
     FROM tasks
     WHERE status = 'inbox' AND assigned_to IS NULL
+      AND ${CLARIFICATION_READY_SQL}
+      AND ${INTERNAL_EXECUTION_SQL}
     ORDER BY
       CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
       created_at ASC

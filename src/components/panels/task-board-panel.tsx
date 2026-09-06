@@ -15,6 +15,8 @@ import { useFocusTrap } from '@/lib/use-focus-trap'
 import { AgentAvatar } from '@/components/ui/agent-avatar'
 import { MarkdownRenderer } from '@/components/markdown-renderer'
 import { Button } from '@/components/ui/button'
+import { TaskClarification } from './task-clarification'
+import { ProposalRail } from '@/components/task-proposals/proposal-rail'
 import { ProjectManagerModal } from '@/components/modals/project-manager-modal'
 import { SessionMessage, shouldShowTimestamp, type SessionTranscriptMessage } from '@/components/chat/session-message'
 
@@ -937,6 +939,8 @@ export function TaskBoardPanel() {
         </div>
       )}
 
+      <ProposalRail />
+
       {/* Kanban Board */}
       <div className="flex-1 min-h-0 flex gap-4 p-4 overflow-x-auto" role="region" aria-label={t('taskBoard')}>
         {statusColumns.map(column => (
@@ -997,6 +1001,7 @@ export function TaskBoardPanel() {
                           {task.title}
                         </h4>
                         <div className="flex items-center gap-1.5 shrink-0">
+                          {task.metadata?.clarification?.state === 'pending' && <span className="text-xs px-2 py-1 rounded border border-primary/40 text-primary">À préciser</span>}
                           {task.metadata?.recurrence?.enabled && (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 font-mono" title={task.metadata.recurrence.natural_text || task.metadata.recurrence.cron_expr}>
                               {t('recurring')}
@@ -1588,6 +1593,7 @@ function TaskDetailModal({
 
           {activeTab === 'details' && (
             <div id="tabpanel-details" role="tabpanel" aria-label={t('tabDetails')} className="space-y-4">
+              <TaskClarification key={`${task.id}-${task.metadata?.clarification?.revision ?? 'new'}-${task.metadata?.clarification?.state ?? ''}`} taskId={task.id} value={task.metadata?.clarification} canEdit={!!currentUser && currentUser.role !== 'viewer'} canCreate={['backlog', 'inbox', 'assigned', 'awaiting_owner'].includes(task.status)} onUpdate={onUpdate} />
               {/* Assignment row */}
               <div className="flex items-center gap-3 p-3 rounded-lg bg-secondary/30 border border-border/30">
                 <span className="text-xs text-muted-foreground shrink-0">{t('assignedTo')}</span>
